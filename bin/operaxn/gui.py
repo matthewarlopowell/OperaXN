@@ -745,9 +745,9 @@ class PlotControls(BaseUIComponent):
         """Update the data source indicator."""
         if hasattr(self, 'source_label'):
             source_map = {
-                DataSourceType.INHOUSE: ("In-House", OPERAXNTheme.COLORS['text_primary']),
-                DataSourceType.SYNCHROTRON: ("Synchrotron", OPERAXNTheme.COLORS['accent_primary']),
-                DataSourceType.NEUTRON: ("Neutron", OPERAXNTheme.COLORS['danger'])
+                DataSourceType.INHOUSE: ("Laboratory X-ray diffraction", OPERAXNTheme.COLORS['text_primary']),
+                DataSourceType.SYNCHROTRON: ("Synchrotron X-ray diffraction", OPERAXNTheme.COLORS['accent_primary']),
+                DataSourceType.NEUTRON: ("Time-of-flight neutron diffraction", OPERAXNTheme.COLORS['danger'])
             }
             text, color = source_map.get(source_type, ("Unknown", OPERAXNTheme.COLORS['text_primary']))
             self.source_label.config(text=text, fg=color)
