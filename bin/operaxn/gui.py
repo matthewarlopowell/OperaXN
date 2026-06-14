@@ -324,6 +324,7 @@ class StyledButton(tk.Button):
             command=command,
             bg=style_config["bg"],
             fg=style_config["fg"],
+            disabledforeground=OPERAXNTheme.COLORS['disabled_text'],
             font=OPERAXNTheme.FONTS['button'],
             relief=tk.FLAT,
             cursor='hand2',
