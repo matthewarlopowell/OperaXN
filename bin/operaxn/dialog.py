@@ -322,9 +322,9 @@ class DataSourceSelectionDialog(BaseDialog):
 
         # Data source options
         sources = [
-            ("inhouse", "In-House XRD", OPERAXNTheme.COLORS['text_primary']),
-            ("synchrotron", "Synchrotron XRD", OPERAXNTheme.COLORS['accent_primary']),
-            ("neutron", "Neutron Diffraction", OPERAXNTheme.COLORS['danger'])
+            ("inhouse", "Laboratory X-ray diffraction", OPERAXNTheme.COLORS['text_primary']),
+            ("synchrotron", "Synchrotron X-ray diffraction", OPERAXNTheme.COLORS['accent_primary']),
+            ("neutron", "Time-of-flight neutron diffraction", OPERAXNTheme.COLORS['danger'])
         ]
 
         for value, label, color in sources:
