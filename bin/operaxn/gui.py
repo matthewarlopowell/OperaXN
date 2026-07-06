@@ -54,7 +54,8 @@ from .dialog import (
 )
 from .input import (
     process_paths, make_oned_arrays, make_twod_arrays,
-    make_echem_arrays, get_correlated_data, make_neutron_arrays
+    make_echem_arrays, get_correlated_data, make_neutron_arrays,
+    NeutronFileGrouper
 )
 from .output import (
     plot_oned_data, plot_twod_data, plot_echem_data,
@@ -1249,15 +1250,16 @@ class OPERAXN(tk.Frame):
 
     def _format_neutron_scan(self, scan: Dict[str, Any], text: str) -> str:
         """Format neutron scan text."""
-        # Extract scan ID if available
+        # Extract scan ID if available (same rule as file grouping, so the
+        # displayed ID always matches the ID used for logbook correlation)
         if scan.get("neutron_files"):
             for measurement_num, files in scan["neutron_files"].items():
                 if files:
                     for file_type, file_path in files.items():
                         basename = os.path.basename(file_path)
-                        match = re.search(r'(\d{5})', basename)
-                        if match:
-                            text += f" - ID: {match.group(1)}"
+                        scan_id = NeutronFileGrouper.extract_scan_id(basename)
+                        if scan_id:
+                            text += f" - ID: {scan_id}"
                             break
                     break
 

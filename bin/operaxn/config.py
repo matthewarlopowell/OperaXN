@@ -118,7 +118,6 @@ TARGET_DISPLAY_PIXELS = 2048 * 2048  # target pixel count for downsampling
 PARALLEL_PROCESSING_THRESHOLD = 20  # min files to trigger parallel processing
 LRU_CACHE_MAXSIZE = 128
 MAX_EXPOSURE_TIME = 3600  # seconds, reject entries above this
-TIME_MATCH_TOLERANCE = 60  # seconds, for echem-to-scan matching
 SECONDS_PER_HOUR = 3600.0
 FILE_READ_RETRIES = 2
 FILE_READ_RETRY_DELAY = 0.5  # seconds

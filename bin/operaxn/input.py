@@ -37,7 +37,6 @@ from .config import (
     PARALLEL_PROCESSING_THRESHOLD,
     SYNCHROTRON_MAX_DISPLAY_SIZE,
     TARGET_DISPLAY_PIXELS,
-    TIME_MATCH_TOLERANCE,
     WINDOW_SIZES,
 )
 
@@ -115,7 +114,6 @@ class FileRecord:
     neutron_files: Optional[Dict[str, Dict[str, str]]] = None
     timestamp: Optional[str] = None
     exposure_time: Optional[float] = None
-    file_hash: Optional[str] = None
 
 
 @dataclass
@@ -1037,6 +1035,12 @@ class NeutronFileGrouper:
         return groups
 
     @staticmethod
+    def extract_scan_id(filename: str) -> Optional[str]:
+        """Return the 5-7 digit scan ID for a neutron filename, or None."""
+        info = NeutronFileGrouper._extract_neutron_file_info(filename)
+        return info['scan_id'] if info else None
+
+    @staticmethod
     def _extract_neutron_file_info(filename: str) -> Optional[Dict[str, str]]:
         """Parse scan ID, measurement number, and type from filename."""
         name_no_ext = filename[:-4] if filename.endswith('.dat') else filename
@@ -1052,15 +1056,18 @@ class NeutronFileGrouper:
                 scan_id = pol_match.group(1)
                 measurement_num = pol_match.group(2)
 
-                if 1 <= int(measurement_num) <= 5:
+                # Same 5-7 digit rule as the logbook parser, or the group
+                # could never match a logbook entry
+                if 5 <= len(scan_id) <= 7 and 1 <= int(measurement_num) <= 5:
                     return {
                         'scan_id': scan_id,
                         'measurement': measurement_num,
                         'type': 'd' if is_dspacing else 'tof'
                     }
 
-            # Pattern: 12345-1-d.dat or 1234567-1-d.dat (5-7 digit scan IDs)
-            pattern = r'(\d{5,7})-(\d)'
+            # Pattern: 12345-1-d.dat or 1234567-1-d.dat (5-7 digit scan IDs).
+            # Lookbehind stops an 8+ digit run number matching by its last 7 digits.
+            pattern = r'(?<!\d)(\d{5,7})-(\d)'
             match = re.search(pattern, name_no_ext)
 
             if match:
@@ -1118,7 +1125,7 @@ class EchemParser:
                 return None
 
             has_header = any(h in lines[0].lower() for h in
-                             ["time", "ecell", "voltage", "current", "i"])
+                             ["time", "date", "ecell", "ewe", "voltage", "current", "i/", "v/"])
 
             if has_header:
                 columns = self._detect_columns(lines[0])
@@ -1179,11 +1186,16 @@ class EchemParser:
 
     def _parse_data_lines(self, lines: List[str], columns: Dict[str, int]) -> List[Dict[str, Any]]:
         """Convert tab-delimited lines to dicts of timestamp, voltage, current."""
+        # A disabled time/voltage column (-1) would silently index parts[-1]
+        if columns["time"] < 0 or columns["voltage"] < 0:
+            logger.warning("Echem time/voltage column could not be resolved; skipping file")
+            return []
+
         data = []
+        max_idx = max(columns.values())
 
         for line in lines:
             parts = line.strip().split("\t")
-            max_idx = max(columns.values())
 
             if len(parts) <= max_idx:
                 continue
@@ -2183,80 +2195,7 @@ def get_correlated_data(scans: List[Dict[str, Any]],
         if neutron_data:
             result["neutron"] = neutron_data
 
-    # Find nearest echem
-    if echem_df is not None and not echem_df.empty and scan.get("timestamp"):
-        result["echem_nearest"] = _find_nearest_echem(scan, echem_df)
-    else:
-        result["echem_nearest"] = None
-
     return result
-
-
-def _find_nearest_echem(scan: Dict[str, Any],
-                        echem_df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """Return nearest echem point within tolerance of scan timestamp."""
-    if echem_df.empty:
-        return None
-
-    scan_timestamp = scan.get("timestamp")
-    if not scan_timestamp:
-        return None
-
-    # Check if this is relative time format (HH:MM:SS)
-    if ":" in str(scan_timestamp) and "-" not in str(scan_timestamp):
-        # Relative time format
-        try:
-            scan_parts = scan_timestamp.split(":")
-            if len(scan_parts) == 3:
-                scan_seconds = int(scan_parts[0]) * 3600 + int(scan_parts[1]) * 60 + int(scan_parts[2])
-
-                echem_seconds = []
-                for ts in echem_df["timestamp"]:
-                    if isinstance(ts, str) and ":" in ts and "-" not in ts:
-                        parts = ts.split(":")
-                        if len(parts) == 3:
-                            seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-                            echem_seconds.append(seconds)
-                        else:
-                            echem_seconds.append(float('inf'))
-                    else:
-                        echem_seconds.append(float('inf'))
-
-                echem_seconds = np.array(echem_seconds)
-                time_diffs = np.abs(echem_seconds - scan_seconds)
-                nearest_idx = time_diffs.argmin()
-
-                if time_diffs[nearest_idx] <= TIME_MATCH_TOLERANCE:
-                    row = echem_df.iloc[nearest_idx]
-                    return {
-                        "timestamp": row["timestamp"],
-                        "value": row["echem_data"],
-                        "current": row.get("current") if "current" in echem_df.columns else None
-                    }
-        except (ValueError, IndexError) as e:
-            logger.error(f"Error parsing relative time: {e}")
-            return None
-    else:
-        # Absolute time format
-        try:
-            scan_time = pd.to_datetime(scan_timestamp)
-            echem_timestamps = pd.to_datetime(echem_df["timestamp"])
-
-            time_diffs = abs(echem_timestamps - scan_time)
-            nearest_idx = time_diffs.argmin()
-
-            if time_diffs.iloc[nearest_idx].total_seconds() <= TIME_MATCH_TOLERANCE:
-                row = echem_df.iloc[nearest_idx]
-                return {
-                    "timestamp": row["timestamp"],
-                    "value": row["echem_data"],
-                    "current": row.get("current") if "current" in echem_df.columns else None
-                }
-        except Exception as e:
-            logger.error(f"Error parsing absolute time: {e}")
-            return None
-
-    return None
 
 
 # ============================================================================

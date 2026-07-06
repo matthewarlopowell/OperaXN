@@ -1064,15 +1064,18 @@ class NeutronFileGrouper:
                 scan_id = pol_match.group(1)
                 measurement_num = pol_match.group(2)
 
-                if 1 <= int(measurement_num) <= 5:
+                # Same 5-7 digit rule as the logbook parser, or the group
+                # could never match a logbook entry
+                if 5 <= len(scan_id) <= 7 and 1 <= int(measurement_num) <= 5:
                     return {
                         'scan_id': scan_id,
                         'measurement': measurement_num,
                         'type': 'd' if is_dspacing else 'tof'
                     }
 
-            # Pattern: 12345-1-d.dat
-            pattern = r'(\d{5,7})-(\d)'
+            # Pattern: 12345-1-d.dat (5-7 digit scan IDs).
+            # Lookbehind stops an 8+ digit run number matching by its last 7 digits.
+            pattern = r'(?<!\d)(\d{5,7})-(\d)'
             match = re.search(pattern, name_no_ext)
 
             if match:
@@ -1127,7 +1130,7 @@ class EchemParser:
                 return None
 
             has_header = any(h in lines[0].lower() for h in
-                             ["time", "ecell", "voltage", "current", "i"])
+                             ["time", "date", "ecell", "ewe", "voltage", "current", "i/", "v/"])
 
             if has_header:
                 columns = self._detect_columns(lines[0])
@@ -1187,11 +1190,16 @@ class EchemParser:
 
     @staticmethod
     def _parse_data_lines(lines: List[str], columns: Dict[str, int]) -> List[Dict[str, Any]]:
+        # A disabled time/voltage column (-1) would silently index parts[-1]
+        if columns["time"] < 0 or columns["voltage"] < 0:
+            logger.warning("Echem time/voltage column could not be resolved; skipping file")
+            return []
+
         data = []
+        max_idx = max(columns.values())
 
         for line in lines:
             parts = line.strip().split("\t")
-            max_idx = max(columns.values())
 
             if len(parts) <= max_idx:
                 continue

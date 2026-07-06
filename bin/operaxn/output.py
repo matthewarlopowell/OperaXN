@@ -1198,8 +1198,12 @@ def get_scan_time_positions(scans: List[Dict[str, Any]],
         echem_start = pd.to_datetime(echem_df["timestamp"].min())
         for scan in scans:
             if scan.get("timestamp"):
-                scan_time = pd.to_datetime(scan["timestamp"])
-                time_diff = (scan_time - echem_start).total_seconds()
+                # Prefer the midpoint-adjusted timestamp so the marker lands on
+                # the echem point the scan was correlated against
+                scan_time = scan.get("timestamp_for_correlation")
+                if scan_time is None:
+                    scan_time = pd.to_datetime(scan["timestamp"])
+                time_diff = (pd.to_datetime(scan_time) - echem_start).total_seconds()
                 scan_times.append(time_diff)
 
     return scan_times
