@@ -1,0 +1,79 @@
+"""
+OperaXN core - shared pipeline for the visualiser and the NeXus generator.
+
+Architecture: every raw-data upload is first generated into a canonical .nxs
+file (`generate`), and the GUI runs purely by interpreting that file
+(`nxs_reader.load`). Uploading a .nxs directly skips generation. One read path.
+"""
+
+from .config import ECHEM_TIME_TOLERANCE
+from .model import (
+    DataSourceType,
+    DataType,
+    ExperimentModel,
+    FileRecord,
+    FileType,
+    Scan,
+    ScanData,
+    TimeMethod,
+)
+from .readers import (
+    DataReaderFactory,
+    DATReader,
+    EDFReader,
+    HDFReader,
+    XYReader,
+    FABIO_AVAILABLE,
+    clear_global_cache,
+    get_cache_stats,
+)
+from .classify import (
+    DATClassifier,
+    EDFClassifier,
+    FileClassificationManager,
+    NeutronFileGrouper,
+    NeutronMetadataParser,
+    NexusMetadataExtractor,
+    SynchrotronFileGrouper,
+    TXTClassifier,
+    extract_edf_scan_fields,
+    parse_mantid_header,
+)
+from .profiles import get_profile
+from .correlate import (
+    EchemParser,
+    ScanProcessor,
+    format_relative_time,
+    parse_relative_time,
+)
+from .nxs_writer import NXSWriter
+from .nxs_reader import is_canonical_nxs, load
+from .generate import (
+    FileProcessor,
+    default_cache_path,
+    generate,
+    process_raw,
+    validate,
+)
+
+__all__ = [
+    # Model
+    'DataSourceType', 'DataType', 'ExperimentModel', 'FileRecord', 'FileType',
+    'Scan', 'ScanData', 'TimeMethod',
+    # Readers
+    'DataReaderFactory', 'DATReader', 'EDFReader', 'HDFReader', 'XYReader',
+    'FABIO_AVAILABLE', 'clear_global_cache', 'get_cache_stats',
+    # Classification / harvesting
+    'DATClassifier', 'EDFClassifier', 'FileClassificationManager',
+    'NeutronFileGrouper', 'NeutronMetadataParser', 'NexusMetadataExtractor',
+    'SynchrotronFileGrouper', 'TXTClassifier',
+    'extract_edf_scan_fields', 'parse_mantid_header', 'get_profile',
+    # Correlation
+    'EchemParser', 'ScanProcessor', 'format_relative_time', 'parse_relative_time',
+    # NeXus I/O
+    'NXSWriter', 'is_canonical_nxs', 'load',
+    # Pipeline
+    'FileProcessor', 'default_cache_path', 'generate', 'process_raw', 'validate',
+    # Config
+    'ECHEM_TIME_TOLERANCE',
+]
