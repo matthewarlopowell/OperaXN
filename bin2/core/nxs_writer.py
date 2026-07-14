@@ -220,6 +220,7 @@ class NXSWriter:
 
     def write(self, output_path: str, scans: List[Scan], echem_df: pd.DataFrame,
               standard_echem_files: Optional[List[str]] = None) -> None:
+        """Write the full canonical file: metadata, scans, and echem layers."""
         reader_factory = DataReaderFactory()
         harvest = self._harvest_experiment_metadata(scans)
 
@@ -295,6 +296,7 @@ class NXSWriter:
 
     def _write_entry_fields(self, entry: h5py.Group, scans: List[Scan],
                             harvest: Dict[str, Any]) -> None:
+        """Entry title, time window, and identifier (user values win)."""
         title = (self.title or harvest.get('run_title') or harvest.get('title')
                  or 'operando diffraction experiment')
         entry.create_dataset('title', data=str(title))
@@ -311,6 +313,7 @@ class NXSWriter:
 
     def _write_instrument(self, entry: h5py.Group, scans: List[Scan],
                           harvest: Dict[str, Any]) -> None:
+        """NXinstrument: source, crystal, detector, and raw-harvest collections."""
         inst = entry.create_group('instrument')
         inst.attrs['NX_class'] = 'NXinstrument'
         inst.create_dataset('name', data=str(harvest.get('instrument_name', 'unknown')))
@@ -369,6 +372,7 @@ class NXSWriter:
                         logger.debug(f"Could not write harvested field '{k}': {e}")
 
     def _write_sample(self, entry: h5py.Group, harvest: Dict[str, Any]) -> None:
+        """NXsample; the dialog's sample field overrides harvested names."""
         sample = entry.create_group('sample')
         sample.attrs['NX_class'] = 'NXsample'
         # Harvested values (e.g. the EDF Comment header) are stored verbatim,
@@ -379,6 +383,7 @@ class NXSWriter:
 
     @staticmethod
     def _write_user(entry: h5py.Group, harvest: Dict[str, Any]) -> None:
+        """NXuser, only when a name was harvestable."""
         user_name = harvest.get('users') or harvest.get('user')
         if user_name:
             user = entry.create_group('user')
@@ -390,6 +395,7 @@ class NXSWriter:
     def _write_scan(self, entry: h5py.Group, scan: Scan,
                     reader_factory: DataReaderFactory,
                     harvest: Dict[str, Any]) -> None:
+        """One scan_N NXsubentry with environment, monitor, and data groups."""
         sub = entry.create_group(f'scan_{scan.scan_num:06d}')
         sub.attrs['NX_class'] = 'NXsubentry'
         sub.attrs['scan_number'] = scan.scan_num
@@ -479,6 +485,7 @@ class NXSWriter:
 
     def _write_xrd_data(self, sub: h5py.Group, scan: Scan,
                         reader_factory: DataReaderFactory) -> None:
+        """NXdata with the 1D pattern (plus errors) and the 2D image layer."""
         data_group = sub.create_group('data')
         data_group.attrs['NX_class'] = 'NXdata'
 
@@ -580,6 +587,7 @@ class NXSWriter:
 
     @staticmethod
     def _write_operando_echem(entry: h5py.Group, echem_df: pd.DataFrame) -> None:
+        """Full cycling protocol as parallel timestamp/voltage/current arrays."""
         if echem_df is None or echem_df.empty:
             return
 
@@ -598,6 +606,7 @@ class NXSWriter:
 
     def _write_standard_echem(self, entry: h5py.Group,
                               standard_echem_files: Optional[List[str]]) -> None:
+        """Parse and store each additional echem file as a file_N dataset."""
         if not standard_echem_files:
             return
 

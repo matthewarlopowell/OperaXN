@@ -14,12 +14,14 @@ import pandas as pd
 
 
 class DataSourceType(Enum):
+    """Instrument family an experiment was collected on."""
     INHOUSE = "inhouse"
     SYNCHROTRON = "synchrotron"
     NEUTRON = "neutron"
 
 
 class FileType(Enum):
+    """Supported input file extensions."""
     DAT = ".dat"
     EDF = ".edf"
     TXT = ".txt"
@@ -35,6 +37,7 @@ SUPPORTED_EXTENSIONS = {ft.value for ft in FileType}
 
 
 class DataType(Enum):
+    """What a classified file contains (also the FileRecord column it fills)."""
     ONED = "oned"
     TWOD = "twod"
     ECHEM = "echem"

@@ -53,6 +53,7 @@ class FileCache:
         self.access_count: Dict[str, int] = {}
 
     def get(self, key: str) -> Optional[Any]:
+        """Cached value for key (bumping its access count), or None."""
         with self.lock:
             if key in self.cache:
                 self.access_count[key] = self.access_count.get(key, 0) + 1
@@ -60,6 +61,7 @@ class FileCache:
         return None
 
     def put(self, key: str, value: Any, size_bytes: Optional[int] = None) -> None:
+        """Store value, evicting least-accessed entries to stay within budget."""
         with self.lock:
             if size_bytes is None:
                 size_bytes = sys.getsizeof(value)
@@ -72,6 +74,7 @@ class FileCache:
             self.access_count[key] = 1
 
     def _evict_lru(self) -> None:
+        """Drop the entry with the lowest access count."""
         if not self.cache:
             return
         lru_key = min(self.access_count.keys(), key=lambda k: self.access_count.get(k, 0))
@@ -81,6 +84,7 @@ class FileCache:
             self.access_count.pop(lru_key, None)
 
     def clear(self) -> None:
+        """Empty the cache and reset accounting."""
         with self.lock:
             self.cache.clear()
             self.access_count.clear()
@@ -91,10 +95,12 @@ _file_cache = FileCache()
 
 
 def clear_global_cache() -> None:
+    """Empty the module-wide file cache (e.g. between sessions)."""
     _file_cache.clear()
 
 
 def get_cache_stats() -> Dict[str, Any]:
+    """Current size and occupancy of the module-wide file cache."""
     return {
         "size_bytes": _file_cache.current_size,
         "size_mb": _file_cache.current_size / (1024 * 1024),
@@ -112,9 +118,10 @@ class DataReader(ABC):
 
     @abstractmethod
     def _read_impl(self, path: str) -> np.ndarray:
-        pass
+        """Read the file into an array; raise IOError on failure."""
 
     def read(self, path: str, *, use_cache: bool = True) -> np.ndarray:
+        """Read the file, serving from / storing to the global cache."""
         if not use_cache or not CACHE_ENABLED:
             return self._read_impl(path)
 
@@ -142,6 +149,7 @@ class DATReader(DataReader):
         self.data_type = data_type
 
     def _read_impl(self, path: str) -> np.ndarray:
+        """Bulk numpy load with a tolerant line-parse fallback (keeps errors)."""
         try:
             # Fast path: numpy bulk load
             try:
@@ -201,6 +209,7 @@ class EDFReader(DataReader):
     """Reads .edf detector images as 2D arrays with floor clipping."""
 
     def _read_impl(self, path: str) -> np.ndarray:
+        """Load the image via fabio, clipping to the minimum positive value."""
         if not FABIO_AVAILABLE:
             raise ImportError("fabio is required to read EDF files")
 
@@ -217,6 +226,7 @@ class XYReader(DataReader):
     """Reads .xy integrated diffraction data as two-column arrays."""
 
     def _read_impl(self, path: str) -> np.ndarray:
+        """Load whitespace-delimited columns via numpy."""
         try:
             data = np.loadtxt(path)
             if data.ndim == 1:
@@ -256,10 +266,11 @@ class HDFReader(DataReader):
         self.original_shape: Optional[Tuple[int, ...]] = None
 
     def _get_cache_key(self, path: str) -> str:
-        # Downsampling setting is part of the identity of the cached result
+        """Base key plus the downsampling setting (part of the result identity)."""
         return f"{super()._get_cache_key(path)}_{self.max_display_size}"
 
     def _read_impl(self, path: str) -> np.ndarray:
+        """Locate the detector image, normalise to 2D, clip, and downsample."""
         try:
             with h5py.File(path, 'r', swmr=True) as f:
                 data = self._find_data_array(f)
@@ -362,6 +373,7 @@ class HDFReader(DataReader):
         return data
 
     def _downsample_if_needed(self, data: np.ndarray) -> np.ndarray:
+        """Apply the per-instance display-size cap (0 disables)."""
         if self.max_display_size <= 0:
             return data
 
@@ -405,6 +417,7 @@ class DataReaderFactory:
 
     @classmethod
     def get_reader(cls, file_path: str, *, is_neutron: bool = False) -> DataReader:
+        """Reader instance for the file's extension; ValueError if unsupported."""
         if is_neutron and file_path.endswith('.dat'):
             return cls.NEUTRON_READER
 
@@ -419,5 +432,6 @@ class DataReaderFactory:
     @classmethod
     def read_file(cls, file_path: str, *, use_cache: bool = True,
                   is_neutron: bool = False) -> np.ndarray:
+        """Read a data file with the appropriate reader."""
         reader = cls.get_reader(file_path, is_neutron=is_neutron)
         return reader.read(file_path, use_cache=use_cache)

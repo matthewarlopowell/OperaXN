@@ -91,14 +91,18 @@ class FileProcessor:
         self.nexus_extractor = NexusMetadataExtractor()
 
     def __enter__(self) -> 'FileProcessor':
+        """Create the ZIP-extraction tempdir for the processing session."""
         self.tempdir = tempfile.mkdtemp()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Delete the extraction tempdir (all reads, including the NeXus
+        write, must happen inside the context)."""
         if self.tempdir and os.path.exists(self.tempdir):
             shutil.rmtree(self.tempdir, ignore_errors=True)
 
     def _progress(self, message: str) -> None:
+        """Forward a status message to the progress callback, if any."""
         if self.progress_callback:
             self.progress_callback(message)
 

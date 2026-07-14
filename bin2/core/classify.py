@@ -138,13 +138,14 @@ class FileClassifierBase(ABC):
 
     @abstractmethod
     def classify(self, path: str) -> Tuple[Optional[str], Optional[str], Optional[float]]:
-        pass
+        """Return (data_type, timestamp, exposure_time), Nones when unrecognised."""
 
 
 class DATClassifier(FileClassifierBase):
     """Extracts 1D type, timestamp, and exposure from .dat headers."""
 
     def classify(self, path: str) -> Tuple[Optional[str], Optional[str], Optional[float]]:
+        """Read '# Date' and exposure comment lines from the .dat header."""
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 lines = [f.readline() for _ in range(30)]
@@ -182,6 +183,7 @@ class EDFClassifier(FileClassifierBase):
     """Extracts 2D type, timestamp, and exposure from .edf headers."""
 
     def classify(self, path: str) -> Tuple[Optional[str], Optional[str], Optional[float]]:
+        """Read Date and exposure fields from the EDF header via fabio."""
         if not FABIO_AVAILABLE:
             return None, None, None
 
@@ -215,6 +217,7 @@ class TXTClassifier(FileClassifierBase):
     ECHEM_KEYWORDS = ["time", "absolute", "ecell", "voltage", "current", "i/", "ewe", "v/"]
 
     def classify(self, path: str) -> Tuple[Optional[str], Optional[str], Optional[float]]:
+        """Distinguish echem tables from neutron logbooks by header content."""
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 lines = []
@@ -261,6 +264,8 @@ class FileClassificationManager:
         }
 
     def classify_files(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Classify unclassified rows into the type/timestamp/exposure columns;
+        returns a copy (neutron mode classifies .txt files only)."""
         df = df.copy()
 
         # Ensure all classification columns exist
@@ -320,6 +325,7 @@ class NeutronMetadataParser:
 
     @staticmethod
     def parse(path: str) -> Optional[pd.DataFrame]:
+        """Parse a logbook into a scans DataFrame; None when no valid entries."""
         try:
             logger.debug(f"Parsing neutron metadata file: {path}")
 
@@ -419,6 +425,7 @@ class NeutronFileGrouper:
     _POL_PATTERN = re.compile(r'POL(\d+)-b_(\d)')
 
     def group_neutron_files(self, file_list: List[str]) -> Dict[str, Dict[str, Dict[str, str]]]:
+        """Group .dat paths as {scan_id: {measurement: {'tof'|'d': path}}}."""
         groups: Dict[str, Dict[str, Dict[str, str]]] = {}
 
         logger.debug(f"Processing {len(file_list)} neutron files")
@@ -515,6 +522,7 @@ class SynchrotronFileGrouper:
     """Groups related .nxs, .hdf, and .xy files by scan ID."""
 
     def group_files(self, file_dict: Dict[str, str]) -> Dict[str, Dict[str, str]]:
+        """Group paths as {scan_id: {'nxs'|'hdf'|'xy': path}}; a .nxs anchors each group."""
         groups: Dict[str, Dict[str, str]] = {}
         nxs_to_id: Dict[str, str] = {}
 
@@ -603,6 +611,7 @@ class NexusMetadataExtractor:
     ]
 
     def extract(self, nxs_path: str) -> Optional[Dict[str, Any]]:
+        """Timestamp/exposure/midpoint metadata of a scan .nxs; None if empty."""
         try:
             with h5py.File(nxs_path, 'r') as f:
                 metadata: Dict[str, Any] = {}
@@ -626,6 +635,7 @@ class NexusMetadataExtractor:
             return None
 
     def _extract_timestamp(self, h5file: h5py.File) -> Optional[str]:
+        """First timestamp found among the known NeXus dataset paths."""
         for ts_path in self.TIMESTAMP_PATHS:
             if ts_path in h5file:
                 timestamp_str = self._decode_value(h5file[ts_path][()])
@@ -662,6 +672,7 @@ class NexusMetadataExtractor:
         return None
 
     def _calculate_midpoint_timestamp(self, h5file: h5py.File) -> Optional[str]:
+        """Midpoint of the start/end acquisition window (used for correlation)."""
         for start_path, end_path in self.TIME_PATH_PAIRS:
             if start_path in h5file and end_path in h5file:
                 start_str = self._decode_value(h5file[start_path][()])
@@ -683,6 +694,7 @@ class NexusMetadataExtractor:
 
     @staticmethod
     def _decode_value(value: Any) -> str:
+        """h5py scalar (bytes or otherwise) as str."""
         if isinstance(value, bytes):
             return value.decode()
         return str(value)

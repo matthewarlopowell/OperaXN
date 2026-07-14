@@ -7,6 +7,7 @@ RELATIVE mode is retained for compatibility during migration.
 """
 
 import logging
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -47,6 +48,8 @@ class EchemParser:
     HEADER_KEYWORDS = ["time", "date", "ecell", "ewe", "voltage", "current", "i/", "v/"]
 
     def parse(self, path: str) -> Optional[pd.DataFrame]:
+        """Parse one echem file into a timestamp/echem_data/current DataFrame;
+        None when nothing parses. Dates are read day-first (UK convention)."""
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
@@ -115,6 +118,8 @@ class EchemParser:
 
     @staticmethod
     def _parse_data_lines(lines: List[str], columns: Dict[str, int]) -> List[Dict[str, Any]]:
+        """Rows as dicts, skipping unparseable lines and placeholder rows;
+        ambiguous dates are read day-first (UK convention, by design)."""
         # A disabled time/voltage column (-1) would silently index parts[-1]
         if columns["time"] < 0 or columns["voltage"] < 0:
             logger.warning("Echem time/voltage column could not be resolved; skipping file")
@@ -123,39 +128,44 @@ class EchemParser:
         data = []
         max_idx = max(columns.values())
 
-        for line in lines:
-            parts = line.strip().split("\t")
+        with warnings.catch_warnings():
+            # pandas warns when a value can only be month-first (e.g. 05/13);
+            # day-first stays the intended reading, so the warning is noise
+            warnings.filterwarnings("ignore", message=".*dayfirst.*")
 
-            if len(parts) <= max_idx:
-                continue
+            for line in lines:
+                parts = line.strip().split("\t")
 
-            # Skip epoch-zero placeholder rows
-            ts_str = parts[columns["time"]]
-            if ts_str.startswith("1970/01/01"):
-                continue
+                if len(parts) <= max_idx:
+                    continue
 
-            try:
-                timestamp = pd.to_datetime(ts_str, dayfirst=True)
-            except (ValueError, TypeError):
-                continue
+                # Skip epoch-zero placeholder rows
+                ts_str = parts[columns["time"]]
+                if ts_str.startswith("1970/01/01"):
+                    continue
 
-            try:
-                voltage = float(parts[columns["voltage"]])
-            except (ValueError, IndexError):
-                continue
-
-            current = None
-            if 0 <= columns["current"] < len(parts):
                 try:
-                    current = float(parts[columns["current"]])
-                except (ValueError, IndexError):
-                    pass
+                    timestamp = pd.to_datetime(ts_str, dayfirst=True)
+                except (ValueError, TypeError):
+                    continue
 
-            data.append({
-                "timestamp": timestamp,
-                "echem_data": voltage,
-                "current": current
-            })
+                try:
+                    voltage = float(parts[columns["voltage"]])
+                except (ValueError, IndexError):
+                    continue
+
+                current = None
+                if 0 <= columns["current"] < len(parts):
+                    try:
+                        current = float(parts[columns["current"]])
+                    except (ValueError, IndexError):
+                        pass
+
+                data.append({
+                    "timestamp": timestamp,
+                    "echem_data": voltage,
+                    "current": current
+                })
 
         return data
 
@@ -214,6 +224,7 @@ class ScanProcessor:
         return scan_list, combined_echem_df
 
     def _process_neutron_metadata(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """Parse and concatenate every logbook file; None when none parse."""
         neutron_meta_paths = df[df["neutron_meta"].notna()]["neutron_meta"].tolist()
 
         logger.info(f"Found {len(neutron_meta_paths)} neutron metadata files")
@@ -466,6 +477,7 @@ class ScanProcessor:
         return None
 
     def _correlate_with_echem(self, scan_list: List[Scan], echem_df: pd.DataFrame) -> None:
+        """Dispatch to relative or absolute correlation per time_method."""
         if self.time_method == TimeMethod.RELATIVE:
             self._correlate_relative_time(scan_list, echem_df)
         else:

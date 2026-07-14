@@ -34,12 +34,23 @@ from .config import (
 
 from .gui import OPERAXN, UIState, VisualiserConfig
 
+from .capacity import (
+    classify_phases,
+    assign_cycles,
+    compute_capacity,
+    plot_capacity_vs_voltage,
+    plot_time_vs_voltage
+)
+
+from .ici import ICIWindow
+
 from .input import (
     process_paths,
     make_oned_arrays,
     make_twod_arrays,
     make_echem_arrays,
     get_correlated_data,
+    add_standard_echem_files,
     FileType,
     DataType,
     TimeMethod
@@ -81,6 +92,7 @@ __all__ = [
     'make_twod_arrays',
     'make_echem_arrays',
     'get_correlated_data',
+    'add_standard_echem_files',
     'get_scan_time_positions',
 
     # Plotting
@@ -91,6 +103,14 @@ __all__ = [
     'create_figure_layout',
     'export_single_scan',
     'clear_plot_cache',
+
+    # Echem analysis
+    'classify_phases',
+    'assign_cycles',
+    'compute_capacity',
+    'plot_capacity_vs_voltage',
+    'plot_time_vs_voltage',
+    'ICIWindow',
 
     # Dialogs
     'UploadOptionsDialog',

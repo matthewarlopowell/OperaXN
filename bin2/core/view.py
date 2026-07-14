@@ -24,6 +24,7 @@ INDENT = "    "
 
 
 def _decode(v):
+    """Decode HDF5 bytes/numpy scalars to native Python values."""
     if isinstance(v, bytes):
         return v.decode("utf-8", errors="ignore")
     if isinstance(v, np.bytes_):
@@ -34,6 +35,7 @@ def _decode(v):
 
 
 def _fmt_attrs(obj) -> str:
+    """All attributes of a node as one '@key=value, ...' suffix."""
     parts = []
     for k, v in obj.attrs.items():
         v = _decode(v)
@@ -61,12 +63,14 @@ def _fmt_value(ds: h5py.Dataset) -> str:
 
 
 def _print_dataset(name: str, ds: h5py.Dataset, depth: int) -> None:
+    """Print one dataset line: name, shape/dtype, value preview, attrs."""
     shape = "scalar" if ds.shape == () else "x".join(map(str, ds.shape))
     print(f"{INDENT * depth}{name}  [{shape} {ds.dtype}] "
           f"{_fmt_value(ds)}{_fmt_attrs(ds)}")
 
 
 def _print_group(group: h5py.Group, depth: int, max_scans: int) -> None:
+    """Recursively print a group, capping scan_N subgroups at max_scans."""
     scan_names = sorted(k for k in group.keys() if _SCAN_RE.fullmatch(k))
     shown_scans = 0
 
@@ -97,6 +101,7 @@ def _print_group(group: h5py.Group, depth: int, max_scans: int) -> None:
 
 
 def main() -> None:
+    """CLI entry point: print the raw stored tree of a canonical .nxs."""
     ap = argparse.ArgumentParser(
         description="Print the raw stored structure of a canonical .nxs file.")
     ap.add_argument("nxs_file", help="Path to a .nxs file")

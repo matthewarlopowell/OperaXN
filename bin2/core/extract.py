@@ -31,10 +31,12 @@ MAX_SCANS_DEFAULT = 5
 
 
 def ensure_dir(p: str) -> None:
+    """Create the directory (and parents) if it does not exist."""
     os.makedirs(p, exist_ok=True)
 
 
 def write_xy_csv(path: str, x, y, e=None, x_name="x", y_name="y") -> None:
+    """Write x/y (and optional error) columns as a CSV."""
     cols = {x_name: x, y_name: y}
     if e is not None:
         cols["error"] = e
@@ -42,6 +44,7 @@ def write_xy_csv(path: str, x, y, e=None, x_name="x", y_name="y") -> None:
 
 
 def extract_scan(scan: ScanData, outdir_scan: str) -> Dict[str, Any]:
+    """Write one scan's 1D/2D/bank data files and return its summary dict."""
     s: Dict[str, Any] = {
         "scan_num": scan.scan_num,
         "timestamp": scan.timestamp,
@@ -95,6 +98,7 @@ def extract_scan(scan: ScanData, outdir_scan: str) -> Dict[str, Any]:
 
 
 def write_echem_csv(outdir: str, name: str, df: pd.DataFrame) -> int:
+    """Write an echem DataFrame as CSV; returns the number of rows."""
     out = pd.DataFrame({"timestamp": df["timestamp"].astype(str),
                         "voltage_V": df["echem_data"]})
     if "current" in df.columns:
@@ -104,6 +108,7 @@ def write_echem_csv(outdir: str, name: str, df: pd.DataFrame) -> int:
 
 
 def print_summary(model: ExperimentModel, summary: Dict[str, Any]) -> None:
+    """Print the experiment metadata and a one-line digest per scan."""
     gm = model.global_metadata or {}
     print(f"     data_source: {model.data_source}")
     for key in ("title", "start_time", "end_time", "experiment_identifier",
@@ -138,6 +143,7 @@ def print_summary(model: ExperimentModel, summary: Dict[str, Any]) -> None:
 
 
 def main() -> None:
+    """CLI entry point: extract a canonical .nxs into CSVs plus summary.json."""
     ap = argparse.ArgumentParser(
         description="Extract scans and echem from a canonical OperaXN .nxs file.")
     ap.add_argument("nxs_file", help="Path to a .nxs file")

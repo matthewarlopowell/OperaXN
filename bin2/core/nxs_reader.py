@@ -66,6 +66,7 @@ def load(path: str) -> ExperimentModel:
 
 
 def _scan_groups(parent: h5py.Group):
+    """Yield (name, group) for scan_N children in numeric order."""
     names = sorted(
         (k for k in parent.keys() if _SCAN_GROUP_RE.fullmatch(k)),
         key=lambda n: int(_SCAN_GROUP_RE.fullmatch(n).group(1))
@@ -79,6 +80,7 @@ def _scan_groups(parent: h5py.Group):
 # ============================================================================
 
 def _load_v3(entry: h5py.Group, model: ExperimentModel) -> None:
+    """Populate the model from a /entry NXentry (schema 3.0 layout)."""
     _read_global_metadata_v3(entry, model)
     _read_operando_echem(entry, model)
     _read_standard_echem(entry, model)
@@ -88,6 +90,7 @@ def _load_v3(entry: h5py.Group, model: ExperimentModel) -> None:
 
 
 def _read_global_metadata_v3(entry: h5py.Group, model: ExperimentModel) -> None:
+    """Entry attrs, top-level fields, and instrument/sample/user groups."""
     out: Dict[str, Any] = {}
 
     for attr_name, attr_val in entry.attrs.items():
@@ -123,6 +126,7 @@ def _flatten_group(grp: h5py.Group, max_depth: int = 3) -> Dict[str, Any]:
 
 
 def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
+    """One scan_N NXsubentry -> ScanData (environment, monitor, data, banks)."""
     scan_num = int(_SCAN_GROUP_RE.fullmatch(name).group(1))
     scan = ScanData(scan_num=int(sub.attrs.get('scan_number', scan_num)))
 
@@ -177,6 +181,7 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
 
 
 def _read_xrd_v3(grp: h5py.Group, scan: ScanData) -> None:
+    """1D pattern (with errors) plus the 2D image or its source reference."""
     x = _dataset_1d(grp, 'polar_angle')
     y = _dataset_1d(grp, 'data')
     if x is not None and y is not None and len(x) == len(y):
@@ -200,6 +205,7 @@ def _read_xrd_v3(grp: h5py.Group, scan: ScanData) -> None:
 
 
 def _read_bank_v3(b: h5py.Group) -> Dict[str, Dict[str, Any]]:
+    """TOF and d-spacing traces of one detector bank as {'tof'|'d': arrays}."""
     bank: Dict[str, Dict[str, Any]] = {}
 
     for key, (x_name, y_name, e_name) in {
@@ -225,6 +231,7 @@ def _read_bank_v3(b: h5py.Group) -> Dict[str, Dict[str, Any]]:
 # ============================================================================
 
 def _load_legacy(f: h5py.File, model: ExperimentModel) -> None:
+    """Populate the model from root-level scan groups (schema 2.0 / v1)."""
     _read_global_metadata_legacy(f, model)
     _read_operando_echem(f, model)
     _read_standard_echem(f, model)
@@ -234,6 +241,7 @@ def _load_legacy(f: h5py.File, model: ExperimentModel) -> None:
 
 
 def _read_global_metadata_legacy(f: h5py.File, model: ExperimentModel) -> None:
+    """Contents of the root global_metadata group, when present."""
     if 'global_metadata' not in f:
         return
 
@@ -255,6 +263,7 @@ def _read_global_metadata_legacy(f: h5py.File, model: ExperimentModel) -> None:
 
 
 def _read_scan_legacy(scan_grp: h5py.Group, name: str) -> ScanData:
+    """One legacy scan group -> ScanData (metadata/xrd_data/neutron_data)."""
     scan_num = int(_SCAN_GROUP_RE.fullmatch(name).group(1))
     scan = ScanData(scan_num=int(scan_grp.attrs.get('scan_number', scan_num)))
 
@@ -327,6 +336,7 @@ def _read_scan_legacy(scan_grp: h5py.Group, name: str) -> ScanData:
 # ============================================================================
 
 def _read_operando_echem(parent: h5py.Group, model: ExperimentModel) -> None:
+    """Cycling protocol -> model.echem_df (empty frame when absent/invalid)."""
     if 'operando_electrochemistry' not in parent:
         model.echem_df = pd.DataFrame(columns=["timestamp", "echem_data", "current"])
         return
@@ -351,6 +361,7 @@ def _read_operando_echem(parent: h5py.Group, model: ExperimentModel) -> None:
 
 
 def _read_standard_echem(parent: h5py.Group, model: ExperimentModel) -> None:
+    """Each stored file_N dataset -> model.standard_echem entry."""
     if 'standard_electrochemistry' not in parent:
         return
 
@@ -383,6 +394,7 @@ def _read_standard_echem(parent: h5py.Group, model: ExperimentModel) -> None:
 # ============================================================================
 
 def _dataset_scalar(grp: h5py.Group, name: str) -> Optional[Any]:
+    """Raw value of a scalar dataset, or None when absent/unreadable."""
     try:
         if name in grp:
             return grp[name][()]
@@ -392,6 +404,7 @@ def _dataset_scalar(grp: h5py.Group, name: str) -> Optional[Any]:
 
 
 def _dataset_1d(grp: h5py.Group, name: str) -> Optional[np.ndarray]:
+    """Dataset flattened to 1D, or None when absent/unreadable."""
     try:
         if name in grp:
             return np.array(grp[name][()]).reshape(-1)
@@ -401,6 +414,7 @@ def _dataset_1d(grp: h5py.Group, name: str) -> Optional[np.ndarray]:
 
 
 def _float_or_none(value: Any) -> Optional[float]:
+    """Value as float, or None when missing or non-numeric."""
     if value is None:
         return None
     try:

@@ -17,6 +17,7 @@ import os
 import shutil
 from typing import Any, Callable, Dict, List, Optional, Union
 
+import h5py
 import numpy as np
 import pandas as pd
 
@@ -25,8 +26,10 @@ from core.classify import (  # noqa: F401  (GUI scan labels)
     NeutronFileGrouper,
     SynchrotronFileGrouper,
 )
-from core.correlate import format_relative_time, parse_relative_time
-from core.generate import cache_dir, default_cache_path, generate
+from core.correlate import EchemParser, format_relative_time, parse_relative_time
+from core.generate import (
+    cache_dir, convert_tabular_to_txt, default_cache_path, generate,
+)
 from core.model import (  # noqa: F401  (re-exported for package API)
     DataSourceType,
     DataType,
@@ -51,6 +54,7 @@ _session: Dict[str, Any] = {
     "nxs_path": None,
     "input_paths": None,  # None = opened a .nxs directly (user's own file)
     "exported": False,
+    "standard_echem": [],
 }
 
 
@@ -236,6 +240,7 @@ def process_paths(selected_paths: List[str],
 
     model = load(nxs_path)
     _session["global_metadata"] = dict(model.global_metadata or {})
+    _session["standard_echem"] = [dict(item) for item in model.standard_echem]
 
     if model.data_source and model.data_source != data_source.value:
         logger.warning(
@@ -269,6 +274,103 @@ def get_experiment_metadata() -> Dict[str, Any]:
     return dict(_session.get("global_metadata") or {})
 
 
+def get_standard_echem() -> List[Dict[str, Any]]:
+    """Standard (non-operando) echem datasets stored in the loaded .nxs.
+
+    Each entry has 'name', 'source_file', and 'data' (a DataFrame with
+    timestamp/echem_data and, when present in the file, current columns)."""
+    return list(_session.get("standard_echem") or [])
+
+
+def _write_standard_echem_group(nxs_path: str,
+                                datasets: List[Dict[str, Any]]) -> None:
+    """Replace the standard-echem collection in a canonical NeXus file."""
+    with h5py.File(nxs_path, "a") as nxs:
+        parent = nxs["entry"] if "entry" in nxs else nxs
+        if "standard_electrochemistry" in parent:
+            del parent["standard_electrochemistry"]
+        container = parent.create_group("standard_electrochemistry")
+        container.attrs["NX_class"] = "NXcollection"
+        container.attrs["num_files"] = len(datasets)
+        string_type = h5py.string_dtype(encoding="utf-8")
+
+        for index, item in enumerate(datasets, start=1):
+            data = item["data"]
+            group = container.create_group(f"file_{index:03d}")
+            group.attrs["NX_class"] = "NXdata"
+            group.attrs["source_file"] = str(item.get("source_file") or "echem")
+            timestamps = data["timestamp"].astype(str).to_numpy(dtype=object)
+            group.create_dataset("timestamps", data=timestamps, dtype=string_type)
+            group.create_dataset(
+                "voltage (V)", data=data["echem_data"].to_numpy(dtype=float))
+            if "current" in data.columns:
+                current = data["current"].to_numpy(dtype=float)
+                if not np.all(np.isnan(current)):
+                    group.create_dataset("current (mA)", data=current)
+
+
+def add_standard_echem_files(paths: List[str]) -> List[Dict[str, Any]]:
+    """Append echem files to the loaded experiment without replacing its data.
+
+    The backing cache is updated for subsequent NeXus export. A directly
+    opened user NeXus file is copied into the cache before it is modified.
+    Returns the successfully parsed additions.
+    """
+    if not _session.get("nxs_path"):
+        raise RuntimeError("Load experiment data before adding electrochemistry")
+
+    parser = EchemParser()
+    additions = []
+    for path in paths:
+        source_path = str(path)
+        parse_path = convert_tabular_to_txt(source_path)
+        try:
+            data = parser.parse(parse_path)
+        finally:
+            if parse_path != source_path:
+                try:
+                    os.remove(parse_path)
+                except OSError:
+                    pass
+        if data is None or data.empty:
+            logger.warning("No electrochemistry data found in %s", source_path)
+            continue
+        additions.append({
+            "source_file": os.path.basename(source_path),
+            "data": data,
+        })
+
+    if not additions:
+        return []
+
+    combined = list(_session.get("standard_echem") or [])
+    positions = {
+        str(item.get("source_file", "")).casefold(): index
+        for index, item in enumerate(combined)
+    }
+    for addition in additions:
+        key = addition["source_file"].casefold()
+        if key in positions:
+            combined[positions[key]] = addition
+        else:
+            positions[key] = len(combined)
+            combined.append(addition)
+
+    nxs_path = os.path.abspath(_session["nxs_path"])
+    if _session.get("input_paths") is None:
+        stem = os.path.splitext(os.path.basename(nxs_path))[0]
+        working_path = os.path.join(cache_dir(), f"{stem}_working.nxs")
+        shutil.copy2(nxs_path, working_path)
+        nxs_path = working_path
+        _session["nxs_path"] = nxs_path
+        _session["input_paths"] = [os.path.abspath(paths[0])]
+
+    _write_standard_echem_group(nxs_path, combined)
+    _session["standard_echem"] = combined
+    _session["exported"] = False
+    return additions
+
+
 def export_nxs(destination: str,
                progress_callback: Optional[Callable] = None) -> tuple:
     """Save the loaded experiment's canonical .nxs to `destination`.
@@ -292,6 +394,7 @@ def export_nxs(destination: str,
 # ============================================================================
 
 def _scan_data(scan: Dict[str, Any]) -> Optional[ScanData]:
+    """The ScanData carried on a GUI scan dict (None for synthetic entries)."""
     return scan.get("_data")
 
 

@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 import psutil
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 from .config import (
     APP_VERSION,
@@ -47,16 +48,24 @@ from .config import (
     SYNCHROTRON_MAX_DISPLAY_SIZE,
 )
 
+from .capacity import (
+    assign_cycles, compute_capacity,
+    plot_capacity_vs_voltage, plot_time_vs_voltage
+)
 from .dialog import (
     PlotSettingsDialog, ExportOptionsDialog, ExportOptions,
     GIFSettingsDialog, GIFSettings, ProgressDialog,
     UploadOptionsDialog, UploadOptions
 )
+from .ici import (
+    ICIWindow, echem_source_button, embed_figure, maximise_window,
+    sync_figure_to_widget
+)
 from .input import (
     process_paths, make_oned_arrays, make_twod_arrays,
     make_echem_arrays, get_correlated_data, make_neutron_arrays,
     NeutronFileGrouper, SynchrotronFileGrouper, export_nxs, get_loaded_nxs_path,
-    get_experiment_metadata
+    add_standard_echem_files, get_experiment_metadata, get_standard_echem
 )
 from .output import (
     plot_oned_data, plot_twod_data, plot_echem_data,
@@ -296,10 +305,13 @@ class ButtonPanel(BaseUIComponent):
     BUTTON_CONFIGS = [
         ("upload_files", "📁 Upload", "normal", "primary"),
         ("plot_data", "📊 Plot", "disabled", "primary"),
-        ("export_plots", "💾 Export", "disabled", "secondary"),
-        ("create_gif", "🎬 GIF", "disabled", "secondary"),
-        ("export_data", "📄 Excel", "disabled", "secondary"),
-        ("export_nxs", "📦 NeXus", "disabled", "secondary"),
+        ("capacity_plot", "Capacity", "disabled", "primary"),
+        ("ici_analysis", "ICI", "disabled", "primary"),
+        ("heatmap", "Heatmap", "disabled", "primary"),
+        ("export_plots", "Image", "disabled", "secondary"),
+        ("create_gif", "GIF", "disabled", "secondary"),
+        ("export_data", "Excel", "disabled", "secondary"),
+        ("export_nxs", "📄 NeXus", "disabled", "danger"),
         ("clear_all", "🗑 Clear", "normal", "danger"),
     ]
 
@@ -415,7 +427,9 @@ class FileListPanel(BaseUIComponent):
             self._items_cache = items.copy()
 
     def show_progress(self, message: str) -> None:
-        """Show progress message."""
+        """Show transient progress only before persistent scan rows exist."""
+        if self._items_cache:
+            return
         count = self.listbox.size()
         if count > 0:
             self.listbox.delete(count - 1)
@@ -893,6 +907,9 @@ class OPERAXN(tk.Frame):
             "upload_files": self._upload_files,
             "plot_data": self._plot_data,
             "export_plots": self._export_data,
+            "capacity_plot": self._open_capacity_window,
+            "ici_analysis": self._open_ici_window,
+            "heatmap": self._open_heatmap,
             "create_gif": self._create_gif,
             "export_data": self._export_to_excel,
             "export_nxs": self._export_nxs,
@@ -1027,10 +1044,15 @@ class OPERAXN(tk.Frame):
             except tk.TclError:
                 pass
 
-        self._upload_dialog = UploadOptionsDialog(self.master)
+        self._upload_dialog = UploadOptionsDialog(
+            self.master, has_loaded_data=bool(self.state.scans))
         options = self._upload_dialog.get_result()
         self._upload_dialog = None
         if options is None:
+            return
+
+        if not options.paths and options.standard_echem_files:
+            self._append_standard_echem_async(options.standard_echem_files)
             return
 
         self._clear_all()
@@ -1050,6 +1072,75 @@ class OPERAXN(tk.Frame):
         self.file_list.show_progress(f"Processing {source_name} data...")
 
         self._process_files_async(options)
+
+    def _append_standard_echem_async(self, paths: List[str]) -> None:
+        """Add analysis-only echem to the current session without reloading it."""
+        self.state.ui_state = UIState.LOADING
+        self.file_list.show_progress("Adding electrochemistry data...")
+
+        def process() -> None:
+            try:
+                added = add_standard_echem_files(paths)
+                if not added:
+                    self.after(0, lambda: self._show_message(
+                        "No echem data",
+                        "No valid electrochemistry data was found in the selected files.",
+                        "warning"))
+                    return
+
+                def complete() -> None:
+                    self.file_list.show_progress(
+                        f"Added {len(added)} electrochemistry file(s)")
+                    self.button_panel.update_states({
+                        "capacity_plot": "normal",
+                        "ici_analysis": "normal",
+                        "export_nxs": "normal",
+                    })
+                    sources = self._echem_sources()
+                    for attr in ("_ici_window", "_capacity_window"):
+                        analysis_window = getattr(self, attr, None)
+                        try:
+                            if analysis_window is not None and analysis_window.winfo_exists():
+                                refresh = getattr(analysis_window, "refresh_sources", None)
+                                if refresh is not None:
+                                    refresh(sources)
+                        except tk.TclError:
+                            pass
+                    usable = [item for item in added
+                              if self._has_analysis_current(item.get("data"))]
+                    if not usable:
+                        self._show_message(
+                            "Echem added without current",
+                            "The selected file was loaded, but it has no usable current "
+                            "column and therefore cannot be used for ICI or Capacity analysis.",
+                            "warning")
+                    else:
+                        self._show_message(
+                            "Electrochemistry added",
+                            f"Added {len(usable)} analysis source(s) to the current experiment.",
+                            "info")
+
+                self.after(0, complete)
+            except Exception as exc:
+                logger.debug("Additional echem error: %s", traceback.format_exc())
+                self.after(0, lambda error=str(exc): self._show_message(
+                    "Error", f"Failed to add electrochemistry: {error}", "error"))
+            finally:
+                self.state.ui_state = UIState.IDLE
+
+        threading.Thread(target=process, daemon=True).start()
+
+    def _choose_additional_echem(self) -> None:
+        """Choose analysis echem and append it to the active experiment."""
+        focused = self.master.focus_get()
+        parent = focused.winfo_toplevel() if focused is not None else self.master
+        paths = filedialog.askopenfilenames(
+            parent=parent,
+            title="Add Electrochemistry",
+            filetypes=[("Supported files", "*.txt *.xlsx *.csv"),
+                       ("All files", "*.*")])
+        if paths:
+            self._append_standard_echem_async(list(paths))
 
     def _process_files_async(self, options: UploadOptions) -> None:
         """Process files asynchronously."""
@@ -1257,10 +1348,13 @@ class OPERAXN(tk.Frame):
         self.scan_selector.set_value(1)
         self.state.intensity_limits.clear()
 
+        echem_state = "normal" if self._echem_sources() else "disabled"
         self.button_panel.update_states({
             "plot_data": "normal",
             "export_data": "normal",
-            "export_nxs": "normal"
+            "export_nxs": "normal",
+            "capacity_plot": echem_state,
+            "ici_analysis": echem_state
         })
 
         # Recreate controls
@@ -1659,6 +1753,389 @@ class OPERAXN(tk.Frame):
         """Handle plot settings update."""
         clear_plot_cache()
         self._update_plots()
+
+    # ========================================================================
+    # Echem Analysis Windows
+    # ========================================================================
+
+    @staticmethod
+    def _has_analysis_current(df: Optional[pd.DataFrame]) -> bool:
+        """True when df has current values, as capacity/ICI analysis needs."""
+        return (df is not None and not df.empty
+                and "current" in df.columns
+                and bool(df["current"].notna().any()))
+
+    def _echem_sources(self) -> Dict[str, pd.DataFrame]:
+        """Echem datasets usable for capacity/ICI analysis, keyed by label.
+
+        The operando echem comes first, followed by any standard echem files
+        stored in the loaded .nxs; datasets without current values are
+        excluded (nothing to classify or integrate)."""
+        sources: Dict[str, pd.DataFrame] = {}
+        if self._has_analysis_current(self.state.echem_df):
+            sources["Operando echem"] = self.state.echem_df
+        for item in get_standard_echem():
+            data = item.get("data")
+            if not self._has_analysis_current(data):
+                continue
+            base = (os.path.basename(str(item.get("source_file") or ""))
+                    or str(item.get("name") or "standard echem"))
+            label = base
+            suffix = 2
+            while label in sources:
+                label = f"{base} ({suffix})"
+                suffix += 1
+            sources[label] = data
+        return sources
+
+    def _open_heatmap(self) -> None:
+        """Placeholder: heatmap view is not implemented yet."""
+        self._show_message("Heatmap", "The heatmap view is coming in a future update.", "info")
+
+    def _open_ici_window(self) -> None:
+        """Open the ICI (intermittent current interruption) analysis window."""
+        if self._lift_existing_dialog('_ici_window'):
+            return
+        sources = self._echem_sources()
+        if not sources:
+            self._show_message(
+                "No echem data",
+                "Load echem data with current values before opening ICI Analysis.",
+                "warning")
+            return
+
+        win = ICIWindow(
+            self.master, echem_sources=sources,
+            on_add_source=self._choose_additional_echem)
+        self._ici_window = win
+        self.state.dialog_windows.append(win)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_dialog(win))
+
+    def _open_capacity_window(self) -> None:
+        """Open the capacity analysis window (voltage vs time, capacity vs voltage)."""
+        if self._lift_existing_dialog('_capacity_window'):
+            return
+        sources = self._echem_sources()
+        if not sources:
+            self._show_message(
+                "No echem data",
+                "Load echem data with current values before opening Capacity Analysis.",
+                "warning")
+            return
+
+        # Mutable so the source dropdown can swap datasets inside the closures
+        current = {
+            "name": next(iter(sources)),
+            "df": next(iter(sources.values())),
+            "available": [],
+        }
+
+        win = tk.Toplevel(self.master)
+        win.title("OperaXN — Capacity Analysis")
+        win.configure(bg=OPERAXNTheme.COLORS['bg_primary'])
+        win.minsize(900, 500)
+        maximise_window(win)
+        win.lift()
+        win.focus_force()
+
+        # Compact single-line toolbar matching the main window.
+        controls_wrapper = tk.Frame(
+            win,
+            bg=OPERAXNTheme.COLORS['bg_secondary'],
+            highlightbackground=OPERAXNTheme.COLORS['border'],
+            highlightthickness=1
+        )
+        controls_wrapper.pack(side="top", fill="x",
+                              padx=OPERAXNTheme.PADDING['small'],
+                              pady=(OPERAXNTheme.PADDING['small'], 2))
+        controls = tk.Frame(controls_wrapper, bg=OPERAXNTheme.COLORS['bg_secondary'])
+        controls.pack(fill="x", padx=OPERAXNTheme.PADDING['small'], pady=4)
+
+        def _label(parent: tk.Widget, text: str, dim: bool = False) -> tk.Label:
+            return tk.Label(
+                parent, text=text,
+                bg=OPERAXNTheme.COLORS['bg_secondary'],
+                fg=(OPERAXNTheme.COLORS['text_dim'] if dim
+                    else OPERAXNTheme.COLORS['text_primary']),
+                font=OPERAXNTheme.FONTS['small'])
+
+        def _nav_button(parent: tk.Widget, text: str, command) -> tk.Button:
+            return tk.Button(
+                parent, text=text, command=command, width=1,
+                bg=OPERAXNTheme.COLORS['bg_tertiary'],
+                fg=OPERAXNTheme.COLORS['text_primary'],
+                activebackground=OPERAXNTheme.COLORS['bg_secondary'],
+                activeforeground=OPERAXNTheme.COLORS['text_primary'],
+                disabledforeground=OPERAXNTheme.COLORS['text_dim'],
+                font=OPERAXNTheme.FONTS['button'], relief=tk.FLAT,
+                cursor='hand2', padx=2, pady=3)
+
+        source_var = tk.StringVar(value=next(iter(sources)))
+        source_button = echem_source_button(
+            controls,
+            source_var,
+            list(sources),
+            command=lambda name: win.after_idle(_on_source_change, name),
+            on_add=self._choose_additional_echem,
+        )
+        source_button.pack(side="left", padx=(2, OPERAXNTheme.PADDING['small']))
+
+        _label(controls, "Mass (mg):").pack(side="left")
+        mass_var = tk.StringVar(value="0")
+        mass_entry = tk.Spinbox(
+            controls, textvariable=mass_var, from_=0.0, to=99999.0,
+            increment=0.1, format="%.2f", width=7,
+            command=lambda: _queue_mass_replot(),
+            bg=OPERAXNTheme.COLORS['input_bg'],
+            fg=OPERAXNTheme.COLORS['text_primary'],
+            buttonbackground=OPERAXNTheme.COLORS['bg_secondary'],
+            relief=tk.FLAT, font=OPERAXNTheme.FONTS['small'],
+            highlightbackground=OPERAXNTheme.COLORS['border'],
+            highlightthickness=1)
+        mass_entry.pack(side="left", padx=(2, OPERAXNTheme.PADDING['small']))
+
+        _label(controls, "Cycle:").pack(side="left")
+        cycle_frame = tk.Frame(controls, bg=OPERAXNTheme.COLORS['bg_secondary'])
+        cycle_frame.pack(side="left", padx=(2, OPERAXNTheme.PADDING['small']))
+        cycle_var = tk.IntVar(value=1)
+        prev_cycle = _nav_button(
+            cycle_frame, '◀', lambda: _step_cycle(-1))
+        prev_cycle.pack(side="left", padx=1)
+        cycle_spin = tk.Spinbox(
+            cycle_frame, textvariable=cycle_var, from_=1, to=1, width=4,
+            command=lambda: _replot(),
+            bg=OPERAXNTheme.COLORS['input_bg'],
+            fg=OPERAXNTheme.COLORS['text_primary'],
+            buttonbackground=OPERAXNTheme.COLORS['bg_secondary'],
+            relief=tk.FLAT, font=OPERAXNTheme.FONTS['small'],
+            highlightbackground=OPERAXNTheme.COLORS['border'],
+            highlightthickness=1)
+        cycle_spin.pack(side="left", padx=2)
+        next_cycle = _nav_button(
+            cycle_frame, '▶', lambda: _step_cycle(1))
+        next_cycle.pack(side="left", padx=1)
+
+        all_cycles_var = tk.BooleanVar(value=True)
+        all_cycles_check = tk.Checkbutton(
+            controls, text="All cycles", variable=all_cycles_var,
+            command=lambda: _toggle_all_cycles(),
+            bg=OPERAXNTheme.COLORS['bg_secondary'],
+            fg=OPERAXNTheme.COLORS['text_dim'],
+            activebackground=OPERAXNTheme.COLORS['bg_secondary'],
+            activeforeground=OPERAXNTheme.COLORS['text_primary'],
+            selectcolor=OPERAXNTheme.COLORS['bg_tertiary'],
+            font=OPERAXNTheme.FONTS['small'])
+        all_cycles_check.pack(side="left", padx=(0, OPERAXNTheme.PADDING['small']))
+
+        cycles_label = _label(controls, "", dim=True)
+        cycles_label.pack(side="left", padx=(0, OPERAXNTheme.PADDING['small']))
+
+        def _refresh_available() -> None:
+            try:
+                current["available"] = sorted(
+                    c for c in assign_cycles(current["df"])["cycle"].unique() if c > 0)
+            except Exception:
+                logger.debug("Cycle detection failed: %s", traceback.format_exc())
+                current["available"] = []
+            cycles_label.config(text=f"({len(current['available'])} available)")
+            maximum = max(current["available"], default=1)
+            cycle_spin.config(to=maximum)
+            if cycle_var.get() not in current["available"]:
+                cycle_var.set(current["available"][0] if current["available"] else 1)
+
+        _refresh_available()
+
+        def _get_mass() -> float:
+            try:
+                return float(mass_var.get())
+            except (ValueError, tk.TclError):
+                return 0.0
+
+        def _get_cycles() -> List[int]:
+            if all_cycles_var.get():
+                return list(current["available"])
+            selected = cycle_var.get()
+            return [selected] if selected in current["available"] else []
+
+        # Plot area, bordered like the main-window plot container. The figure
+        # has no fixed size — fractional margins keep the layout correct at
+        # any window size, unlike a one-shot tight_layout.
+        plot_frame = tk.Frame(
+            win,
+            bg=OPERAXNTheme.COLORS['canvas_bg'],
+            relief=tk.FLAT,
+            highlightbackground=OPERAXNTheme.COLORS['border'],
+            highlightcolor=OPERAXNTheme.COLORS['accent_primary'],
+            highlightthickness=2
+        )
+        plot_frame.pack(fill="both", expand=True,
+                        padx=OPERAXNTheme.PADDING['small'],
+                        pady=(2, OPERAXNTheme.PADDING['small']))
+        plot_frame.pack_propagate(False)
+
+        fig = Figure(facecolor=OPERAXNTheme.COLORS['bg_primary'], dpi=FIGURE_DPI)
+        fig.subplots_adjust(left=0.08, right=0.97, top=0.93, bottom=0.12, wspace=0.24)
+        ax_time, ax_cap = fig.subplots(1, 2)
+
+        def _style_live_axes() -> None:
+            for ax in (ax_time, ax_cap):
+                ax.set_facecolor(OPERAXNTheme.COLORS['canvas_bg'])
+                ax.tick_params(colors=OPERAXNTheme.COLORS['text_dim'], labelsize=8)
+                ax.xaxis.label.set_color(OPERAXNTheme.COLORS['text_dim'])
+                ax.yaxis.label.set_color(OPERAXNTheme.COLORS['text_dim'])
+                for spine in ax.spines.values():
+                    spine.set_color(OPERAXNTheme.COLORS['border'])
+                legend = ax.get_legend()
+                if legend is not None:
+                    legend.get_frame().set_facecolor(OPERAXNTheme.COLORS['bg_secondary'])
+                    legend.get_frame().set_edgecolor(OPERAXNTheme.COLORS['border'])
+                    for text in legend.get_texts():
+                        text.set_color(OPERAXNTheme.COLORS['text_primary'])
+
+        plot_time_vs_voltage(ax_time, current["df"])
+        plot_capacity_vs_voltage(ax_cap, current["df"], mass_mg=0.0)
+        _style_live_axes()
+
+        canvas = embed_figure(fig, plot_frame)
+
+        # Watch until the initial layout and DPI adjustment have both settled;
+        # their event order is not deterministic, so one-shot timers can miss.
+        sync_state = {"attempts": 0}
+
+        def _sync_watchdog() -> None:
+            if not win.winfo_exists():
+                return
+            sync_figure_to_widget(canvas)
+            sync_state["attempts"] += 1
+            if sync_state["attempts"] < 12:
+                win.after(200, _sync_watchdog)
+
+        win.after(150, _sync_watchdog)
+
+        def _replot(*_args) -> None:
+            selected = _get_cycles()
+            plot_time_vs_voltage(ax_time, current["df"], cycles_to_plot=selected)
+            plot_capacity_vs_voltage(ax_cap, current["df"], mass_mg=_get_mass(),
+                                     cycles_to_plot=selected)
+            _style_live_axes()
+            canvas.draw()
+
+        mass_replot_job = {"id": None}
+
+        def _queue_mass_replot(*_args) -> None:
+            """Debounce typing while keeping mass changes live."""
+            if mass_replot_job["id"] is not None:
+                try:
+                    win.after_cancel(mass_replot_job["id"])
+                except tk.TclError:
+                    pass
+
+            def update() -> None:
+                mass_replot_job["id"] = None
+                _replot()
+
+            mass_replot_job["id"] = win.after(150, update)
+
+        def _step_cycle(delta: int) -> None:
+            available = current["available"]
+            if not available:
+                return
+            all_cycles_var.set(False)
+            selected = cycle_var.get()
+            try:
+                index = available.index(selected)
+            except ValueError:
+                index = 0
+            cycle_var.set(available[max(0, min(len(available) - 1, index + delta))])
+            _toggle_all_cycles(replot=False)
+            _replot()
+
+        def _toggle_all_cycles(replot: bool = True) -> None:
+            state = "disabled" if all_cycles_var.get() else "normal"
+            for widget in (prev_cycle, cycle_spin, next_cycle):
+                widget.config(state=state)
+            if replot:
+                _replot()
+
+        def _on_source_change(name: str) -> None:
+            if name == current["name"] or name not in sources:
+                return
+            win.configure(cursor="watch")
+            win.update_idletasks()
+            try:
+                current["name"] = name
+                current["df"] = sources[name]
+                cycle_var.set(1)
+                all_cycles_var.set(True)
+                _refresh_available()
+                _toggle_all_cycles(replot=False)
+                _replot()
+            finally:
+                win.configure(cursor="")
+
+        def _refresh_sources(updated_sources: Dict[str, pd.DataFrame]) -> None:
+            sources.clear()
+            sources.update(updated_sources)
+            source_button.set_values(sources)
+            if current["name"] not in sources and sources:
+                name = next(iter(sources))
+                source_var.set(name)
+                _on_source_change(name)
+
+        win.refresh_sources = _refresh_sources
+
+        def _export_csv() -> None:
+            selected = _get_cycles()
+            if not selected:
+                messagebox.showwarning("No cycles", "No cycles selected to export.",
+                                       parent=win)
+                return
+            path = filedialog.asksaveasfilename(
+                parent=win, defaultextension=".csv",
+                filetypes=[("CSV", "*.csv")], initialfile="capacity_vs_voltage.csv")
+            if not path:
+                return
+            mass = _get_mass()
+            df_full = assign_cycles(current["df"])
+            rows = []
+            for cycle_num in selected:
+                cycle_df = df_full[df_full["cycle"] == cycle_num]
+                for phase in ("charge", "discharge"):
+                    phase_df = cycle_df[cycle_df["phase"] == phase]
+                    if phase_df.empty:
+                        continue
+                    cap = compute_capacity(phase_df)
+                    spec_cap = (cap / (mass / 1000.0) if mass > 0
+                                else np.full_like(cap, np.nan))
+                    for t, v, c, sc in zip(phase_df["t_s"].values,
+                                           phase_df["echem_data"].values,
+                                           cap, spec_cap):
+                        rows.append({
+                            "Cycle": cycle_num,
+                            "Phase": phase,
+                            "Time (s)": t,
+                            "Voltage (V)": v,
+                            "Capacity (mAh)": c,
+                            "Specific Capacity (mAh/g)": sc,
+                        })
+            pd.DataFrame(rows).to_csv(path, index=False, encoding=CSV_ENCODING)
+            messagebox.showinfo("Export complete", f"Saved data to:\n{path}", parent=win)
+
+        export_button = StyledButton(controls, text="Export CSV", command=_export_csv,
+                                     style="secondary", width=11)
+        export_button.pack(side="left", padx=2)
+
+        mass_entry.bind("<Return>", _replot)
+        mass_entry.bind("<FocusOut>", _queue_mass_replot)
+        mass_var.trace_add("write", _queue_mass_replot)
+        cycle_spin.bind("<Return>", _replot)
+
+        # Opens showing every cycle, so start with the stepper disabled
+        _toggle_all_cycles(replot=False)
+
+        self._capacity_window = win
+        self.state.dialog_windows.append(win)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_dialog(win))
 
     # ========================================================================
     # Export Operations
@@ -2365,6 +2842,8 @@ class OPERAXN(tk.Frame):
         self.button_panel.update_states({
             "plot_data": "disabled",
             "export_plots": "disabled",
+            "capacity_plot": "disabled",
+            "ici_analysis": "disabled",
             "create_gif": "disabled",
             "export_data": "disabled",
             "export_nxs": "disabled"

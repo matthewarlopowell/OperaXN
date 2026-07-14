@@ -990,8 +990,9 @@ class UploadOptionsDialog(BaseDialog):
         ("neutron", "Time-of-flight neutron diffraction"),
     ]
 
-    def __init__(self, master: tk.Misc) -> None:
+    def __init__(self, master: tk.Misc, has_loaded_data: bool = False) -> None:
         super().__init__(master, "Load Data", "540x700")
+        self._has_loaded_data = has_loaded_data
         self._paths: List[str] = []
         self._std_echem: List[str] = []
         self._create_widgets()
@@ -1001,6 +1002,7 @@ class UploadOptionsDialog(BaseDialog):
     # --- layout ---
 
     def _create_widgets(self) -> None:
+        """Build all sections of the combined upload dialog."""
         # --- Input selection ---
         self.create_themed_label(text="Input data:", font_type="heading", pady=(14, 4))
         input_frame = self._block()
@@ -1122,6 +1124,7 @@ class UploadOptionsDialog(BaseDialog):
 
     def _entry(self, parent: tk.Widget, var: tk.StringVar, width: int,
                readonly: bool = False) -> tk.Entry:
+        """Themed entry, optionally read-only (for picker-filled fields)."""
         kwargs = ({"state": "readonly",
                    "readonlybackground": OPERAXNTheme.COLORS['bg_tertiary']}
                   if readonly else {})
@@ -1129,6 +1132,7 @@ class UploadOptionsDialog(BaseDialog):
 
     @staticmethod
     def _small_button(parent: tk.Widget, text: str, command) -> tk.Button:
+        """Compact themed picker button, packed to the left."""
         btn = tk.Button(parent, text=text, command=command, width=9,
                         bg=OPERAXNTheme.COLORS['button_bg'],
                         fg=OPERAXNTheme.COLORS['button_text'],
@@ -1142,6 +1146,7 @@ class UploadOptionsDialog(BaseDialog):
     # --- selection handlers ---
 
     def _select_files(self) -> None:
+        """Pick input data files and refresh the option states."""
         files = filedialog.askopenfilenames(
             parent=self, title="Select Files",
             filetypes=[
@@ -1160,6 +1165,7 @@ class UploadOptionsDialog(BaseDialog):
             self._update_option_states()
 
     def _select_directory(self) -> None:
+        """Pick an input directory and refresh the option states."""
         directory = filedialog.askdirectory(parent=self, title="Select Directory")
         if directory:
             self._paths = [directory]
@@ -1167,6 +1173,7 @@ class UploadOptionsDialog(BaseDialog):
             self._update_option_states()
 
     def _select_std_echem(self) -> None:
+        """Pick standard (non-operando) echem files to store in the .nxs."""
         files = filedialog.askopenfilenames(
             parent=self, title="Select Standard Electrochemistry Files",
             filetypes=[("Supported files", "*.txt *.xlsx *.csv"),
@@ -1176,15 +1183,18 @@ class UploadOptionsDialog(BaseDialog):
             self.std_echem_var.set(f"{len(files)} file(s)")
 
     def _clear_std_echem(self) -> None:
+        """Drop the selected standard echem files."""
         self._std_echem = []
         self.std_echem_var.set("None")
 
     # --- dynamic enabling ---
 
     def _is_direct_nxs(self) -> bool:
+        """True when the selection is a single .nxs opened directly."""
         return len(self._paths) == 1 and self._paths[0].lower().endswith(".nxs")
 
     def _update_option_states(self) -> None:
+        """Enable/disable generation-only options to match the selection."""
         direct_nxs = self._is_direct_nxs()
         source = self.source_var.get()
 
@@ -1209,10 +1219,13 @@ class UploadOptionsDialog(BaseDialog):
     # --- result ---
 
     def _confirm(self) -> None:
+        """Build the UploadOptions result and close; an empty selection is
+        valid only to append standard echem to already-loaded data."""
         if not self._paths:
-            messagebox.showerror("Error", "Please select files or a directory",
-                                 parent=self)
-            return
+            if not (self._has_loaded_data and self._std_echem):
+                messagebox.showerror("Error", "Please select files or a directory",
+                                     parent=self)
+                return
 
         size_val = self.size_var.get()
         display_size = 0 if size_val == "No downsampling" else int(size_val)
