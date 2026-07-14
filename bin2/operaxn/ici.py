@@ -44,10 +44,16 @@ DIM = _C['text_dim']
 BORDER = _C['border']
 INPUT = _C['input_bg']
 
-CHARGE_COLOR = '#00d4ff'
-DISCHARGE_COLOR = '#ff6b6b'
-CURRENT_COLOR = '#ffd43b'
-HIGHLIGHT_COLOR = '#ffffff'
+PLOT_BG = '#ffffff'
+PLOT_TEXT = '#20242c'
+PLOT_DIM = '#4b5563'
+PLOT_BORDER = '#9ca3af'
+PLOT_GRID = '#d8dde6'
+
+CHARGE_COLOR = '#008fb3'
+DISCHARGE_COLOR = '#d84b4b'
+CURRENT_COLOR = '#9a7400'
+HIGHLIGHT_COLOR = '#4b5563'
 
 _FONT = OPERAXNTheme.FONTS['small']
 _FONT_BTN = OPERAXNTheme.FONTS['button']
@@ -299,7 +305,7 @@ def _canvas_frame(master):
     """Styled border frame that matches the main window's plot container."""
     return tk.Frame(
         master,
-        bg=CANVAS,
+        bg=PLOT_BG,
         relief=tk.FLAT,
         highlightbackground=BORDER,
         highlightcolor=ACCENT,
@@ -471,8 +477,9 @@ class _SelectorStrip(tk.Frame):
             row, text='All cycles',
             variable=self.show_all_var,
             command=self._on_change,
-            bg=BG2, fg=DIM,
+            bg=BG2, fg=TEXT,
             activebackground=BG2, activeforeground=TEXT,
+            disabledforeground=TEXT,
             selectcolor=BG3,
             font=_FONT,
         ).pack(side='left', padx=2)
@@ -645,23 +652,23 @@ class _RKAxisBar(tk.Frame):
 # ============================================================================
 
 def _style_ax(ax, xlabel='', ylabel='', title=''):
-    """Apply the dark theme to an axes."""
-    ax.set_facecolor(CANVAS)
+    """Apply the light analysis-figure theme to an axes."""
+    ax.set_facecolor(PLOT_BG)
     for spine in ax.spines.values():
-        spine.set_color(BORDER)
-    ax.tick_params(colors=DIM, labelsize=8)
-    ax.xaxis.label.set_color(DIM)
-    ax.yaxis.label.set_color(DIM)
+        spine.set_color(PLOT_BORDER)
+    ax.tick_params(colors=PLOT_DIM, labelsize=8)
+    ax.xaxis.label.set_color(PLOT_DIM)
+    ax.yaxis.label.set_color(PLOT_DIM)
     ax.set_xlabel(xlabel, fontsize=9)
     ax.set_ylabel(ylabel, fontsize=9)
     if title:
-        ax.set_title(title, color=DIM, fontsize=9, pad=4)
-    ax.grid(True, color=BORDER, alpha=0.4, linewidth=0.5)
+        ax.set_title(title, color=PLOT_TEXT, fontsize=9, pad=4)
+    ax.grid(True, color=PLOT_GRID, alpha=0.75, linewidth=0.5)
 
 
 def _stub(ax, msg='No data'):
     """Centred placeholder message on an empty axes."""
-    ax.text(0.5, 0.5, msg, color=DIM, fontsize=9,
+    ax.text(0.5, 0.5, msg, color=PLOT_DIM, fontsize=9,
             ha='center', va='center', transform=ax.transAxes, style='italic')
 
 
@@ -821,7 +828,7 @@ class ICIWindow(tk.Toplevel):
         self._primary_canvas_frame = top_frame
         top_frame.grid(row=0, column=0, sticky='nsew', padx=_PAD_S, pady=(_PAD_S, 2))
         top_frame.pack_propagate(False)
-        self._fig_top = Figure(facecolor=BG, dpi=FIGURE_DPI)
+        self._fig_top = Figure(facecolor=PLOT_BG, dpi=FIGURE_DPI)
         self._build_top_axes()
         self._canvas_top = embed_figure(self._fig_top, top_frame)
         self._canvas_top.get_tk_widget().bind(
@@ -843,7 +850,7 @@ class ICIWindow(tk.Toplevel):
         bottom_frame = _canvas_frame(left)
         bottom_frame.grid(row=2, column=0, sticky='nsew', padx=_PAD_S, pady=(2, _PAD_S))
         bottom_frame.pack_propagate(False)
-        self._fig_bot = Figure(facecolor=BG, dpi=FIGURE_DPI)
+        self._fig_bot = Figure(facecolor=PLOT_BG, dpi=FIGURE_DPI)
         self._build_bot_axes()
         self._canvas_bot = embed_figure(self._fig_bot, bottom_frame)
 
@@ -851,7 +858,7 @@ class ICIWindow(tk.Toplevel):
         right_frame = _canvas_frame(right)
         right_frame.pack(fill='both', expand=True, padx=_PAD_S, pady=(2, _PAD_S))
         right_frame.pack_propagate(False)
-        self._fig_right = Figure(figsize=(5.0, 10), facecolor=BG, dpi=FIGURE_DPI)
+        self._fig_right = Figure(figsize=(5.0, 10), facecolor=PLOT_BG, dpi=FIGURE_DPI)
         self._build_right_axes()
         self._canvas_right = embed_figure(self._fig_right, right_frame)
 
@@ -997,7 +1004,7 @@ class ICIWindow(tk.Toplevel):
         if self.selector.show_all_var.get():
             for c in sorted(df[df['cycle'] > 0]['cycle'].unique()):
                 mask = df['cycle'] == c
-                ax.plot(t_h[mask], voltage[mask], color=BORDER, lw=0.8, zorder=1)
+                ax.plot(t_h[mask], voltage[mask], color=PLOT_BORDER, lw=0.8, zorder=1)
 
         cycle_mask = df['cycle'] == cycle
         for ph, colour in (('charge', CHARGE_COLOR), ('discharge', DISCHARGE_COLOR)):
@@ -1015,7 +1022,7 @@ class ICIWindow(tk.Toplevel):
             ax.axvline(t0, color=HIGHLIGHT_COLOR, lw=1.0, ls='--', zorder=4)
 
         ax.legend(fontsize=7, loc='best',
-                  labelcolor=TEXT, facecolor=BG2, edgecolor=BORDER)
+                  labelcolor=PLOT_TEXT, facecolor=PLOT_BG, edgecolor=PLOT_BORDER)
 
     def _plot_pulse_zoom(self, cycle, pulse_idx, phase):
         """Voltage and current for the selected pulse and its relaxation."""
@@ -1071,10 +1078,10 @@ class ICIWindow(tk.Toplevel):
         ax2 = self._ax_pulse_twin
         ax2.plot(t_h, current, color=CURRENT_COLOR, lw=1.2, ls='--',
                  label='Current', alpha=0.8, zorder=2)
-        ax2.set_ylabel('Current (mA)', color=DIM, fontsize=9)
-        ax2.tick_params(colors=DIM, labelsize=8)
+        ax2.set_ylabel('Current (mA)', color=PLOT_DIM, fontsize=9)
+        ax2.tick_params(colors=PLOT_DIM, labelsize=8)
         for spine in ax2.spines.values():
-            spine.set_color(BORDER)
+            spine.set_color(PLOT_BORDER)
         ax2.set_facecolor('none')
 
         # Only include lines with real labels (avoids _child1 artifact)
@@ -1086,12 +1093,13 @@ class ICIWindow(tk.Toplevel):
             else dict(loc='upper center', bbox_to_anchor=(0.5, 0.98))
         )
         ax.legend(lines_v + lines_i, [ln.get_label() for ln in lines_v + lines_i],
-                  fontsize=7, labelcolor=TEXT, facecolor=BG2, edgecolor=BORDER,
+                  fontsize=7, labelcolor=PLOT_TEXT, facecolor=PLOT_BG,
+                  edgecolor=PLOT_BORDER,
                   **legend_position)
         ax.set_title(
             f'Cycle {cycle}  |  {phase.capitalize()}  |  '
             f'Pulse {pulse_idx}/{len(pulses)}',
-            color=DIM, fontsize=9, pad=4,
+            color=PLOT_TEXT, fontsize=9, pad=4,
         )
 
     # ------------------------------------------------------------------
@@ -1144,16 +1152,16 @@ class ICIWindow(tk.Toplevel):
                    color=colour, s=12, alpha=0.7, zorder=3, label='ΔV')
 
         ax.plot(fit['X_fit'], fit['y_fit'],
-                color=ACCENT, lw=2, zorder=4,
+                color=CHARGE_COLOR, lw=2, zorder=4,
                 label=f'fit  R²={fit["r2"]:.3f}')
 
         ax.legend(fontsize=7, loc='best',
-                  labelcolor=TEXT, facecolor=BG2, edgecolor=BORDER)
+                  labelcolor=PLOT_TEXT, facecolor=PLOT_BG, edgecolor=PLOT_BORDER)
 
         ax.set_title(
             f'ICI fit  |  C{cycle}  {phase[:3]}  |  Pulse {pulse_idx}  '
             f'|  R={fit["R"]:.4f} Ω  k={fit["k"]:.4f} Ω·s⁻¹ᐟ²',
-            color=DIM, fontsize=9, pad=4)
+            color=PLOT_TEXT, fontsize=9, pad=4)
 
     def _plot_r2_panel(self, cycle: int, pulse_idx: int, phase: str, scope: str):
         """R² of every fit in the selected scope, star on the current pulse."""
@@ -1194,7 +1202,8 @@ class ICIWindow(tk.Toplevel):
 
         if any(results for results, _, _, _ in datasets):
             ax.legend(fontsize=7, loc='best',
-                      labelcolor=TEXT, facecolor=BG2, edgecolor=BORDER)
+                      labelcolor=PLOT_TEXT, facecolor=PLOT_BG,
+                      edgecolor=PLOT_BORDER)
 
     # ------------------------------------------------------------------
     # Plots: R and k vs Voltage / Capacity / Specific Capacity
@@ -1279,7 +1288,8 @@ class ICIWindow(tk.Toplevel):
         for ax, _, _ in panels:
             if ax.get_lines() or ax.collections:
                 ax.legend(fontsize=7, loc='best',
-                          labelcolor=TEXT, facecolor=BG2, edgecolor=BORDER)
+                          labelcolor=PLOT_TEXT, facecolor=PLOT_BG,
+                          edgecolor=PLOT_BORDER)
             else:
                 _stub(ax, 'No data')
 

@@ -42,6 +42,7 @@ from .capacity import (
     plot_time_vs_voltage
 )
 
+from .heatmap import HeatmapWindow
 from .ici import ICIWindow
 
 from .input import (
@@ -111,6 +112,7 @@ __all__ = [
     'plot_capacity_vs_voltage',
     'plot_time_vs_voltage',
     'ICIWindow',
+    'HeatmapWindow',
 
     # Dialogs
     'UploadOptionsDialog',

@@ -57,6 +57,7 @@ from .dialog import (
     GIFSettingsDialog, GIFSettings, ProgressDialog,
     UploadOptionsDialog, UploadOptions
 )
+from .heatmap import HeatmapWindow
 from .ici import (
     ICIWindow, echem_source_button, embed_figure, maximise_window,
     sync_figure_to_widget
@@ -1349,12 +1350,15 @@ class OPERAXN(tk.Frame):
         self.state.intensity_limits.clear()
 
         echem_state = "normal" if self._echem_sources() else "disabled"
+        # XRD-only view: stays disabled for neutron data
+        heatmap_state = "normal" if self.state.oned_arrays else "disabled"
         self.button_panel.update_states({
             "plot_data": "normal",
             "export_data": "normal",
             "export_nxs": "normal",
             "capacity_plot": echem_state,
-            "ici_analysis": echem_state
+            "ici_analysis": echem_state,
+            "heatmap": heatmap_state
         })
 
         # Recreate controls
@@ -1789,8 +1793,25 @@ class OPERAXN(tk.Frame):
         return sources
 
     def _open_heatmap(self) -> None:
-        """Placeholder: heatmap view is not implemented yet."""
-        self._show_message("Heatmap", "The heatmap view is coming in a future update.", "info")
+        """Open the operando heatmap window (stacked XRD patterns + voltage)."""
+        if self._lift_existing_dialog('_heatmap_window'):
+            return
+        if not self.state.oned_arrays:
+            self._show_message(
+                "No data",
+                "Load 1D XRD data before opening the heatmap.",
+                "warning")
+            return
+
+        win = HeatmapWindow(
+            self.master,
+            scans=self.state.scans,
+            oned_arrays=self.state.oned_arrays,
+            echem_arrays=self.state.echem_arrays,
+            time_method=self.state.time_method)
+        self._heatmap_window = win
+        self.state.dialog_windows.append(win)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_dialog(win))
 
     def _open_ici_window(self) -> None:
         """Open the ICI (intermittent current interruption) analysis window."""
@@ -1920,9 +1941,10 @@ class OPERAXN(tk.Frame):
             controls, text="All cycles", variable=all_cycles_var,
             command=lambda: _toggle_all_cycles(),
             bg=OPERAXNTheme.COLORS['bg_secondary'],
-            fg=OPERAXNTheme.COLORS['text_dim'],
+            fg=OPERAXNTheme.COLORS['text_primary'],
             activebackground=OPERAXNTheme.COLORS['bg_secondary'],
             activeforeground=OPERAXNTheme.COLORS['text_primary'],
+            disabledforeground=OPERAXNTheme.COLORS['text_primary'],
             selectcolor=OPERAXNTheme.COLORS['bg_tertiary'],
             font=OPERAXNTheme.FONTS['small'])
         all_cycles_check.pack(side="left", padx=(0, OPERAXNTheme.PADDING['small']))
@@ -1960,9 +1982,14 @@ class OPERAXN(tk.Frame):
         # Plot area, bordered like the main-window plot container. The figure
         # has no fixed size — fractional margins keep the layout correct at
         # any window size, unlike a one-shot tight_layout.
+        plot_bg = '#ffffff'
+        plot_text = '#20242c'
+        plot_dim = '#4b5563'
+        plot_border = '#9ca3af'
+        plot_grid = '#d8dde6'
         plot_frame = tk.Frame(
             win,
-            bg=OPERAXNTheme.COLORS['canvas_bg'],
+            bg=plot_bg,
             relief=tk.FLAT,
             highlightbackground=OPERAXNTheme.COLORS['border'],
             highlightcolor=OPERAXNTheme.COLORS['accent_primary'],
@@ -1973,24 +2000,25 @@ class OPERAXN(tk.Frame):
                         pady=(2, OPERAXNTheme.PADDING['small']))
         plot_frame.pack_propagate(False)
 
-        fig = Figure(facecolor=OPERAXNTheme.COLORS['bg_primary'], dpi=FIGURE_DPI)
+        fig = Figure(facecolor=plot_bg, dpi=FIGURE_DPI)
         fig.subplots_adjust(left=0.08, right=0.97, top=0.93, bottom=0.12, wspace=0.24)
         ax_time, ax_cap = fig.subplots(1, 2)
 
         def _style_live_axes() -> None:
             for ax in (ax_time, ax_cap):
-                ax.set_facecolor(OPERAXNTheme.COLORS['canvas_bg'])
-                ax.tick_params(colors=OPERAXNTheme.COLORS['text_dim'], labelsize=8)
-                ax.xaxis.label.set_color(OPERAXNTheme.COLORS['text_dim'])
-                ax.yaxis.label.set_color(OPERAXNTheme.COLORS['text_dim'])
+                ax.set_facecolor(plot_bg)
+                ax.tick_params(colors=plot_dim, labelsize=8)
+                ax.xaxis.label.set_color(plot_dim)
+                ax.yaxis.label.set_color(plot_dim)
+                ax.grid(True, color=plot_grid, alpha=0.75, linewidth=0.5)
                 for spine in ax.spines.values():
-                    spine.set_color(OPERAXNTheme.COLORS['border'])
+                    spine.set_color(plot_border)
                 legend = ax.get_legend()
                 if legend is not None:
-                    legend.get_frame().set_facecolor(OPERAXNTheme.COLORS['bg_secondary'])
-                    legend.get_frame().set_edgecolor(OPERAXNTheme.COLORS['border'])
+                    legend.get_frame().set_facecolor(plot_bg)
+                    legend.get_frame().set_edgecolor(plot_border)
                     for text in legend.get_texts():
-                        text.set_color(OPERAXNTheme.COLORS['text_primary'])
+                        text.set_color(plot_text)
 
         plot_time_vs_voltage(ax_time, current["df"])
         plot_capacity_vs_voltage(ax_cap, current["df"], mass_mg=0.0)
@@ -2844,6 +2872,7 @@ class OPERAXN(tk.Frame):
             "export_plots": "disabled",
             "capacity_plot": "disabled",
             "ici_analysis": "disabled",
+            "heatmap": "disabled",
             "create_gif": "disabled",
             "export_data": "disabled",
             "export_nxs": "disabled"
