@@ -33,6 +33,7 @@ from .gui import OPERAXN
 SPLASH_DURATION_MS = 2500
 SPLASH_WIDTH = 500
 SPLASH_HEIGHT = 350
+SPLASH_LOGO_CENTER_Y = 76
 
 REQUIRED_DEPENDENCIES = {
     'numpy': 'NumPy',
@@ -253,7 +254,7 @@ class EnhancedSplashScreen(WindowManager):
     def _create_logo_section(self) -> None:
         """Draw hexagonal logo with rotating inner element."""
         center_x = self.width // 2
-        center_y = 76
+        center_y = SPLASH_LOGO_CENTER_Y
 
         # Create hexagons
         for radius, width, color, tag in [
@@ -552,7 +553,7 @@ class EnhancedSplashScreen(WindowManager):
             return
 
         center_x = self.width // 2
-        center_y = 80
+        center_y = SPLASH_LOGO_CENTER_Y
 
         for i, (item_type, item_id, angle) in enumerate(self.animation_items):
             if item_type == 'rotate':
