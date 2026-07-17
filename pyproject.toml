@@ -18,6 +18,7 @@ authors = [
     { name = "Gabriel E. Perez", email = "gabriel.perez@stfc.ac.uk" },
     { name = "Tobias A. Bird", email = "tobias.bird@diamond.ac.uk" },
     { name = "Gaurav C. Pandey", email = "Gaurav.Pandey@warwick.ac.uk" },
+    { name = "José J. Arroyo-Gómez", email = "josej.arroyog@gmail.com" },
     { name = "Steven Huband", email = "S.Huband@warwick.ac.uk" },
     { name = "Sarah J. Day", email = "sarah.day@diamond.ac.uk" },
     { name = "Louis F. J. Piper", email = "Louis.Piper@warwick.ac.uk" },
