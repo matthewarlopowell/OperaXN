@@ -1,15 +1,20 @@
 """
-Dialog Module for OperaXN
+Themed Tkinter dialogs. BaseDialog provides the house style (non-modal,
+shrink-to-fit sizing, surface-matched widget helpers); concrete dialogs
+cover upload options, plot settings, exports, GIF creation, and progress.
 """
 
 import logging
+import os
 import tkinter as tk
 import tkinter.ttk as ttk
 from dataclasses import dataclass, field
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 from typing import Dict, List, Callable, Tuple, Any
 
 import numpy as np
+
+from core import TimeMethod
 
 from .output import clear_plot_cache
 from .config import (
@@ -47,6 +52,20 @@ class GIFSettings:
     loop: int
     scan_list: List[int] = field(default_factory=list)
 
+@dataclass
+class UploadOptions:
+    """Structured result from UploadOptionsDialog."""
+    paths: List[str]
+    data_source: "DataSourceType"
+    time_method: "TimeMethod"
+    display_size: int
+    include_2d: bool
+    title: str = None
+    sample_name: str = None
+    sample_description: str = None
+    standard_echem_files: List[str] = None
+
+
 
 # ============================================================================
 # Base Dialog Class
@@ -69,7 +88,8 @@ class BaseDialog(tk.Toplevel):
 
         self._center_window()
 
-        self.grab_set()
+        # Dialogs are deliberately non-modal (no grab_set): they float above
+        # the app (transient) but the main window stays fully interactive.
 
         # Bind escape key to cancel
         self.bind('<Escape>', lambda e: self.cancel())
@@ -104,6 +124,18 @@ class BaseDialog(tk.Toplevel):
 
         self.geometry(f"+{x}+{y}")
 
+    def shrink_to_fit(self, min_width: int = 340) -> None:
+        """Size the window to its content (plus margins) and re-center.
+
+        Call at the end of _create_widgets: fixed pixel geometries clip
+        content under Windows DPI scaling; content-driven sizing does not.
+        """
+        self.update_idletasks()
+        width = max(min_width, self.winfo_reqwidth() + 56)
+        height = self.winfo_reqheight() + 14
+        self.geometry(f"{width}x{height}")
+        self._center_window()
+
     def get_result(self) -> Any:
         """Get dialog result after closing."""
         self.wait_window()
@@ -118,6 +150,14 @@ class BaseDialog(tk.Toplevel):
     # Common UI Helper Methods
     # ========================================================================
 
+    def _surface_bg(self, parent: tk.Widget) -> str:
+        """Background of the surface a widget sits on (its parent's bg), so
+        themed widgets never show a mismatched box behind them."""
+        try:
+            return parent.cget('bg')
+        except tk.TclError:
+            return OPERAXNTheme.COLORS['bg_primary']
+
     def create_themed_label(self, parent: tk.Widget = None, text: str = "",
                             font_type: str = "body",
                             fg_color: str = None,
@@ -131,7 +171,7 @@ class BaseDialog(tk.Toplevel):
             parent,
             text=text,
             font=font,
-            bg=OPERAXNTheme.COLORS.get('bg_secondary' if parent != self else 'bg_primary'),
+            bg=self._surface_bg(parent),
             fg=fg
         )
 
@@ -201,7 +241,7 @@ class BaseDialog(tk.Toplevel):
     def create_themed_labelframe(self, parent: tk.Widget = None, text: str = "", **kwargs) -> tk.LabelFrame:
         """Create a themed label frame."""
         parent = parent or self
-        bg_color = OPERAXNTheme.COLORS.get('bg_secondary' if parent != self else 'bg_primary')
+        bg_color = self._surface_bg(parent)
 
         defaults = {
             'text': text,
@@ -248,7 +288,7 @@ class BaseDialog(tk.Toplevel):
                             command: Callable = None) -> tk.Scale:
         """Create a themed scale widget."""
         parent = parent or self
-        bg_color = OPERAXNTheme.COLORS.get('bg_secondary' if parent != self else 'bg_primary')
+        bg_color = self._surface_bg(parent)
 
         scale = tk.Scale(
             parent,
@@ -274,7 +314,7 @@ class BaseDialog(tk.Toplevel):
                                   fg_color: str = None) -> tk.Radiobutton:
         """Create a themed radio button."""
         parent = parent or self
-        bg_color = OPERAXNTheme.COLORS.get('bg_secondary' if parent != self else 'bg_primary')
+        bg_color = self._surface_bg(parent)
         fg = fg_color or OPERAXNTheme.COLORS['text_primary']
 
         rb = tk.Radiobutton(
@@ -288,70 +328,11 @@ class BaseDialog(tk.Toplevel):
             fg=fg,
             activebackground=bg_color,
             activeforeground=OPERAXNTheme.COLORS['accent_primary'],
-            selectcolor=OPERAXNTheme.COLORS['bg_tertiary']
+            selectcolor=OPERAXNTheme.COLORS['bg_tertiary'],
+            highlightthickness=0
         )
 
         return rb
-
-
-# ============================================================================
-# Data Source Selection Dialog
-# ============================================================================
-
-class DataSourceSelectionDialog(BaseDialog):
-    """Data source type selection dialog."""
-
-    def __init__(self, master: tk.Misc) -> None:
-        super().__init__(master, "Select Data Source", "400x275")
-        self._create_widgets()
-
-    def _create_widgets(self) -> None:
-        """Build data source selection widgets."""
-        # Title
-        self.create_themed_label(
-            text="Select Your Data Source Type",
-            font_type="heading",
-            pady=(20, 10)
-        )
-
-        # Radio button frame
-        radio_frame = tk.Frame(self, bg=OPERAXNTheme.COLORS['bg_primary'])
-        radio_frame.pack(pady=10)
-
-        self.source_var = tk.StringVar(value="inhouse")
-
-        # Data source options
-        sources = [
-            ("inhouse", "Laboratory X-ray diffraction", OPERAXNTheme.COLORS['text_primary']),
-            ("synchrotron", "Synchrotron X-ray diffraction", OPERAXNTheme.COLORS['accent_primary']),
-            ("neutron", "Time-of-flight neutron diffraction", OPERAXNTheme.COLORS['danger'])
-        ]
-
-        for value, label, color in sources:
-            option_frame = tk.Frame(radio_frame, bg=OPERAXNTheme.COLORS['bg_primary'])
-            option_frame.pack(anchor="w", pady=5, padx=20, fill="x")
-
-            rb = self.create_themed_radiobutton(
-                option_frame, label, self.source_var, value, fg_color=color
-            )
-            rb.pack(side="left")
-
-        # Buttons
-        self.create_button_frame([
-            ("OK", self._confirm, "primary"),
-            ("Cancel", self.cancel, "secondary")
-        ])
-
-    def _confirm(self) -> None:
-        """Confirm selection and close dialog."""
-        source_map = {
-            "inhouse": DataSourceType.INHOUSE,
-            "synchrotron": DataSourceType.SYNCHROTRON,
-            "neutron": DataSourceType.NEUTRON
-        }
-
-        self.result = source_map.get(self.source_var.get(), DataSourceType.INHOUSE)
-        self.destroy()
 
 
 # ============================================================================
@@ -372,6 +353,7 @@ class PlotSettingsDialog(BaseDialog):
         self.main_app = master
 
         self._create_widgets()
+        self.shrink_to_fit()
 
     def _create_widgets(self) -> None:
         """Build plot settings tabs and controls."""
@@ -401,16 +383,27 @@ class PlotSettingsDialog(BaseDialog):
 
     def _setup_notebook_style(self) -> None:
         """Configure themed notebook style."""
+        C = OPERAXNTheme.COLORS
         style = ttk.Style()
         style.theme_use('clam')
-        style.configure('TNotebook', background=OPERAXNTheme.COLORS['bg_primary'])
+        style.configure('TNotebook', background=C['bg_primary'],
+                        bordercolor=C['border'],
+                        lightcolor=C['bg_primary'], darkcolor=C['bg_primary'])
+        # clam tabs draw their face from light/dark edge colours too — set all
+        # of them or unselected tabs keep the default light face
         style.configure('TNotebook.Tab',
-                        background=OPERAXNTheme.COLORS['bg_secondary'],
-                        foreground=OPERAXNTheme.COLORS['text_primary'],
-                        padding=[10, 6])
+                        background=C['bg_secondary'],
+                        foreground=C['text_secondary'],
+                        bordercolor=C['border'],
+                        lightcolor=C['bg_secondary'], darkcolor=C['bg_secondary'],
+                        padding=[12, 6], font=OPERAXNTheme.FONTS['body'])
         style.map('TNotebook.Tab',
-                  background=[('selected', OPERAXNTheme.COLORS['bg_tertiary'])],
-                  foreground=[('selected', OPERAXNTheme.COLORS['accent_primary'])])
+                  background=[('selected', C['bg_tertiary']),
+                              ('!selected', C['bg_secondary'])],
+                  foreground=[('selected', C['accent_primary']),
+                              ('!selected', C['text_secondary'])],
+                  lightcolor=[('selected', C['bg_tertiary']),
+                              ('!selected', C['bg_secondary'])])
 
     def _create_range_entry_row(self, parent: tk.Widget, label: str, var: tk.StringVar, row: int,
                                 col: int, key: str, on_change: Callable = None) -> tk.Entry:
@@ -787,6 +780,7 @@ class ExportOptionsDialog(BaseDialog):
             window_size = WINDOW_SIZES['export_xrd']
         super().__init__(master, "Export Options", window_size)
         self._create_widgets()
+        self.shrink_to_fit()
 
     def _create_widgets(self) -> None:
         """Build export options widgets."""
@@ -888,6 +882,7 @@ class GIFSettingsDialog(BaseDialog):
         super().__init__(master, "Create GIF", WINDOW_SIZES['gif'])
         self.num_scans = num_scans
         self._create_widgets()
+        self.shrink_to_fit()
 
     def _create_widgets(self) -> None:
         """Build GIF settings widgets."""
@@ -980,62 +975,282 @@ class GIFSettingsDialog(BaseDialog):
 
 
 # ============================================================================
-# Display Size Dialog
+# Upload Options Dialog
 # ============================================================================
 
-class DisplaySizeDialog(BaseDialog):
-    """Max display size selection for synchrotron 2D data downsampling."""
+class UploadOptionsDialog(BaseDialog):
+    """Single upload window collecting every load/generation option at once
+    (data selection, source, time correlation, 2D handling, experiment
+    details, standard echem) — replaces the old sequential dialog chain."""
 
     DISPLAY_OPTIONS = ["No downsampling", "4096", "2048", "1024", "512"]
 
-    def __init__(self, master: tk.Misc) -> None:
-        super().__init__(master, "2D Display Size", "350x175")
+    SOURCES = [
+        ("inhouse", "Laboratory X-ray diffraction"),
+        ("synchrotron", "Synchrotron X-ray diffraction"),
+        ("neutron", "Time-of-flight neutron diffraction"),
+    ]
+
+    def __init__(self, master: tk.Misc, has_loaded_data: bool = False) -> None:
+        super().__init__(master, "Load Data", "540x700")
+        self._has_loaded_data = has_loaded_data
+        self._paths: List[str] = []
+        self._std_echem: List[str] = []
         self._create_widgets()
+        self._update_option_states()
+        self.shrink_to_fit(min_width=540)
+
+    # --- layout ---
 
     def _create_widgets(self) -> None:
-        """Build display size selection widgets."""
-        self.create_themed_label(
-            text="Max 2D image display size:",
-            font_type="heading",
-            pady=(20, 5)
-        )
+        """Build all sections of the combined upload dialog."""
+        # --- Input selection ---
+        self.create_themed_label(text="Input data:", font_type="heading", pady=(14, 4))
+        input_frame = self._block()
+        self.input_var = tk.StringVar(value="No data selected")
+        self._entry(input_frame, self.input_var, width=20, readonly=True
+                    ).pack(side="left", padx=(0, 8))
+        self._small_button(input_frame, "Files", self._select_files)
+        self._small_button(input_frame, "Directory", self._select_directory)
 
-        self.create_themed_label(
-            text="Larger images will be stride-downsampled to this size.",
-            font_type="small",
-            fg_color=OPERAXNTheme.COLORS['text_secondary'],
-            pady=(0, 10)
-        )
+        # --- Data source ---
+        self.create_themed_label(text="Data source type:", font_type="heading",
+                                 pady=(14, 4))
+        source_frame = self._block()
+        self.source_var = tk.StringVar(value="inhouse")
+        for value, label in self.SOURCES:
+            self.create_themed_radiobutton(
+                source_frame, label, self.source_var, value,
+                command=self._update_option_states).pack(anchor="w", pady=1)
 
-        # Combobox
-        combo_frame = tk.Frame(self, bg=OPERAXNTheme.COLORS['bg_primary'])
-        combo_frame.pack(pady=5)
+        # --- Time correlation ---
+        self.create_themed_label(text="Time correlation:", font_type="heading",
+                                 pady=(14, 4))
+        time_frame = self._block()
+        self.time_var = tk.StringVar(value=TimeMethod.ABSOLUTE.value)
+        for value, label in [
+            (TimeMethod.ABSOLUTE.value, "Absolute time (use actual timestamps)"),
+            (TimeMethod.RELATIVE.value, "Relative time (re-zero unsynchronised clocks)"),
+        ]:
+            self.create_themed_radiobutton(
+                time_frame, label, self.time_var, value).pack(anchor="w", pady=1)
 
+        # --- 2D settings ---
+        self.create_themed_label(text="2D detector images:", font_type="heading",
+                                 pady=(14, 4))
+        twod_frame = self._block()
+        size_row = tk.Frame(twod_frame, bg=OPERAXNTheme.COLORS['bg_primary'])
+        size_row.pack(anchor="w")
+        tk.Label(size_row, text="Max 2D size (n x n):",
+                 font=OPERAXNTheme.FONTS['body'],
+                 bg=OPERAXNTheme.COLORS['bg_primary'],
+                 fg=OPERAXNTheme.COLORS['text_primary']).pack(side="left", padx=(0, 8))
         self.size_var = tk.StringVar(value="4096")
-        style = ttk.Style()
-        style.configure("Display.TCombobox", padding=5)
-        self.combo = ttk.Combobox(
-            combo_frame,
-            textvariable=self.size_var,
-            values=self.DISPLAY_OPTIONS,
-            state="readonly",
-            width=20
-        )
-        self.combo.pack()
+        self.size_menu = tk.OptionMenu(size_row, self.size_var, *self.DISPLAY_OPTIONS)
+        self.size_menu.config(
+            bg=OPERAXNTheme.COLORS['bg_tertiary'],
+            fg=OPERAXNTheme.COLORS['text_primary'],
+            activebackground=OPERAXNTheme.COLORS['bg_secondary'],
+            activeforeground=OPERAXNTheme.COLORS['text_primary'],
+            disabledforeground=OPERAXNTheme.COLORS['text_dim'],
+            highlightthickness=0, relief=tk.FLAT, width=14,
+            indicatoron=0,
+            font=OPERAXNTheme.FONTS['body'], cursor='hand2')
+        self.size_menu["menu"].config(
+            bg=OPERAXNTheme.COLORS['bg_secondary'],
+            fg=OPERAXNTheme.COLORS['text_primary'],
+            activebackground=OPERAXNTheme.COLORS['accent_primary'],
+            activeforeground=OPERAXNTheme.COLORS['bg_primary'],
+            font=OPERAXNTheme.FONTS['body'])
+        self.size_menu.pack(side="left")
 
-        # Buttons
+        self.include_2d_var = tk.BooleanVar(value=False)
+        self.include_2d_check = tk.Checkbutton(
+            twod_frame, text="Include 2D images in the NeXus file",
+            variable=self.include_2d_var,
+            font=OPERAXNTheme.FONTS['body'],
+            bg=OPERAXNTheme.COLORS['bg_primary'],
+            fg=OPERAXNTheme.COLORS['text_primary'],
+            activebackground=OPERAXNTheme.COLORS['bg_primary'],
+            activeforeground=OPERAXNTheme.COLORS['accent_primary'],
+            selectcolor=OPERAXNTheme.COLORS['bg_tertiary'],
+            disabledforeground=OPERAXNTheme.COLORS['text_dim'],
+            highlightthickness=0)
+        self.include_2d_check.pack(anchor="w", pady=(6, 0))
+
+        # --- Experiment details ---
+        self.create_themed_label(text="Experiment details (optional):",
+                                 font_type="heading", pady=(14, 4))
+        details = self._block()
+        self.title_var = tk.StringVar()
+        self.sample_var = tk.StringVar()
+        self.sample_desc_var = tk.StringVar()
+        for row, (label, var) in enumerate([
+                ("Title:", self.title_var),
+                ("Sample name:", self.sample_var),
+                ("Cell description:", self.sample_desc_var)]):
+            tk.Label(details, text=label,
+                     font=OPERAXNTheme.FONTS['body'],
+                     bg=OPERAXNTheme.COLORS['bg_primary'],
+                     fg=OPERAXNTheme.COLORS['text_primary']
+                     ).grid(row=row, column=0, sticky="e", padx=(0, 8), pady=2)
+            self._entry(details, var, width=28).grid(row=row, column=1, pady=2)
+
+        # --- Standard echem ---
+        self.create_themed_label(text="Standard electrochemistry (optional):",
+                                 font_type="heading", pady=(14, 4))
+        echem_frame = self._block()
+        self.std_echem_var = tk.StringVar(value="None")
+        self._entry(echem_frame, self.std_echem_var, width=20, readonly=True
+                    ).pack(side="left", padx=(0, 8))
+        self.std_select_btn = self._small_button(
+            echem_frame, "Select", self._select_std_echem)
+        self.std_clear_btn = self._small_button(
+            echem_frame, "Clear", self._clear_std_echem)
+
+        # Note shown when generation options do not apply
+        self.note_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self.note_var,
+                 font=OPERAXNTheme.FONTS['small'],
+                 bg=OPERAXNTheme.COLORS['bg_primary'],
+                 fg=OPERAXNTheme.COLORS['warning']).pack(pady=(10, 0))
+
         self.create_button_frame([
-            ("OK", self._confirm, "primary"),
+            ("Load", self._confirm, "primary"),
             ("Cancel", self.cancel, "secondary")
-        ], pady=15)
+        ], pady=14)
+
+    def _block(self) -> tk.Frame:
+        """Centered content block; widgets inside anchor west (house style)."""
+        frame = tk.Frame(self, bg=OPERAXNTheme.COLORS['bg_primary'])
+        frame.pack()
+        return frame
+
+    def _entry(self, parent: tk.Widget, var: tk.StringVar, width: int,
+               readonly: bool = False) -> tk.Entry:
+        """Themed entry, optionally read-only (for picker-filled fields)."""
+        kwargs = ({"state": "readonly",
+                   "readonlybackground": OPERAXNTheme.COLORS['bg_tertiary']}
+                  if readonly else {})
+        return self.create_themed_entry(parent, var, width, **kwargs)
+
+    @staticmethod
+    def _small_button(parent: tk.Widget, text: str, command) -> tk.Button:
+        """Compact themed picker button, packed to the left."""
+        btn = tk.Button(parent, text=text, command=command, width=9,
+                        bg=OPERAXNTheme.COLORS['button_bg'],
+                        fg=OPERAXNTheme.COLORS['button_text'],
+                        font=OPERAXNTheme.FONTS['small'],
+                        relief=tk.FLAT, cursor='hand2')
+        btn.bind("<Enter>", lambda e: btn.config(bg=OPERAXNTheme.COLORS['button_hover']))
+        btn.bind("<Leave>", lambda e: btn.config(bg=OPERAXNTheme.COLORS['button_bg']))
+        btn.pack(side="left", padx=2)
+        return btn
+
+    # --- selection handlers ---
+
+    def _select_files(self) -> None:
+        """Pick input data files and refresh the option states."""
+        files = filedialog.askopenfilenames(
+            parent=self, title="Select Files",
+            filetypes=[
+                ("All Supported",
+                 "*.zip;*.dat;*.edf;*.txt;*.xlsx;*.csv;*.hdf;*.nxs;*.xy"),
+                ("NeXus files", "*.nxs"),
+                ("ZIP files", "*.zip"),
+                ("All files", "*.*"),
+            ])
+        if files:
+            self._paths = list(files)
+            if len(files) == 1:
+                self.input_var.set(os.path.basename(files[0]))
+            else:
+                self.input_var.set(f"{len(files)} files selected")
+            self._update_option_states()
+
+    def _select_directory(self) -> None:
+        """Pick an input directory and refresh the option states."""
+        directory = filedialog.askdirectory(parent=self, title="Select Directory")
+        if directory:
+            self._paths = [directory]
+            self.input_var.set(directory)
+            self._update_option_states()
+
+    def _select_std_echem(self) -> None:
+        """Pick standard (non-operando) echem files to store in the .nxs."""
+        files = filedialog.askopenfilenames(
+            parent=self, title="Select Standard Electrochemistry Files",
+            filetypes=[("Supported files", "*.txt *.xlsx *.csv"),
+                       ("All files", "*.*")])
+        if files:
+            self._std_echem = list(files)
+            self.std_echem_var.set(f"{len(files)} file(s)")
+
+    def _clear_std_echem(self) -> None:
+        """Drop the selected standard echem files."""
+        self._std_echem = []
+        self.std_echem_var.set("None")
+
+    # --- dynamic enabling ---
+
+    def _is_direct_nxs(self) -> bool:
+        """True when the selection is a single .nxs opened directly."""
+        return len(self._paths) == 1 and self._paths[0].lower().endswith(".nxs")
+
+    def _update_option_states(self) -> None:
+        """Enable/disable generation-only options to match the selection."""
+        direct_nxs = self._is_direct_nxs()
+        source = self.source_var.get()
+
+        # Size applies to synchrotron HDF data (display, and storage if included)
+        self.size_menu.config(
+            state="normal" if source == "synchrotron" else "disabled")
+
+        # Generation-only options are fixed inside a directly opened .nxs
+        gen_state = "disabled" if direct_nxs else "normal"
+        has_2d_source = source in ("inhouse", "synchrotron")
+        self.include_2d_check.config(
+            state="normal" if (has_2d_source and not direct_nxs) else "disabled")
+        if not has_2d_source or direct_nxs:
+            self.include_2d_var.set(False)
+        self.std_select_btn.config(state=gen_state)
+        self.std_clear_btn.config(state=gen_state)
+
+        self.note_var.set(
+            "Opening a NeXus file: generation options are fixed in the file"
+            if direct_nxs else "")
+
+    # --- result ---
 
     def _confirm(self) -> None:
-        """Parse selection and set result as int (0 = no downsampling)."""
-        val = self.size_var.get()
-        if val == "No downsampling":
-            self.result = 0
-        else:
-            self.result = int(val)
+        """Build the UploadOptions result and close; an empty selection is
+        valid only to append standard echem to already-loaded data."""
+        if not self._paths:
+            if not (self._has_loaded_data and self._std_echem):
+                messagebox.showerror("Error", "Please select files or a directory",
+                                     parent=self)
+                return
+
+        size_val = self.size_var.get()
+        display_size = 0 if size_val == "No downsampling" else int(size_val)
+
+        source_map = {
+            "inhouse": DataSourceType.INHOUSE,
+            "synchrotron": DataSourceType.SYNCHROTRON,
+            "neutron": DataSourceType.NEUTRON,
+        }
+
+        self.result = UploadOptions(
+            paths=list(self._paths),
+            data_source=source_map[self.source_var.get()],
+            time_method=TimeMethod(self.time_var.get()),
+            display_size=display_size,
+            include_2d=self.include_2d_var.get(),
+            title=self.title_var.get().strip() or None,
+            sample_name=self.sample_var.get().strip() or None,
+            sample_description=self.sample_desc_var.get().strip() or None,
+            standard_echem_files=list(self._std_echem) or None,
+        )
         self.destroy()
 
 
@@ -1050,6 +1265,7 @@ class ProgressDialog(BaseDialog):
         super().__init__(master, title, WINDOW_SIZES['progress'])
         self.maximum = maximum
         self._create_widgets()
+        self.shrink_to_fit()
 
     def _create_widgets(self) -> None:
         """Build progress bar and label."""

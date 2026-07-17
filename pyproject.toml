@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "OperaXN"
-version = "1.0.0"
+version = "2.0.0"
 description = "Visualise operando diffraction experiments and produce standardised nexus files"
 readme = "README.md"
 license = "MIT"
@@ -68,14 +68,13 @@ Repository = "https://github.com/matthewarlopowell/OperaXN"
 
 [project.scripts]
 operaxn = "operaxn.main:main"
-nexusgen = "nexusgen.main:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["bin/operaxn", "bin/nexusgen"]
+packages = ["bin/core", "bin/operaxn"]
 
 [tool.hatch.build.targets.wheel.sources]
+"bin/core" = "core"
 "bin/operaxn" = "operaxn"
-"bin/nexusgen" = "nexusgen"
 
 [tool.hatch.build.targets.sdist]
-include = ["bin/operaxn", "bin/nexusgen", "LICENSE", "README.md"]
+include = ["bin/core", "bin/operaxn", "definitions", "LICENSE", "README.md"]

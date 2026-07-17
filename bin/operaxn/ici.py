@@ -694,17 +694,39 @@ def embed_figure(fig, parent) -> FigureCanvasTkAgg:
     canvas._operaxn_parent = parent
     canvas._operaxn_toolbar = toolbar_frame
     canvas.draw()
+
+    # Every resize on a scaled display can re-run matplotlib's device-pixel-
+    # ratio race (see sync_figure_to_widget) — not just the opening layout
+    # the windows' startup watchdogs cover. Reconcile after each resize
+    # settles; the sync is a no-op when figure and widget already agree.
+    def _sync_after_resize(_event=None):
+        job = getattr(canvas, '_operaxn_sync_job', None)
+        if job is not None:
+            try:
+                parent.after_cancel(job)
+            except tk.TclError:
+                pass
+
+        def run():
+            canvas._operaxn_sync_job = None
+            sync_figure_to_widget(canvas, force=True)
+
+        canvas._operaxn_sync_job = parent.after(180, run)
+
+    parent.bind('<Configure>', _sync_after_resize, add='+')
     return canvas
 
 
-def sync_figure_to_widget(canvas: FigureCanvasTkAgg) -> None:
+def sync_figure_to_widget(canvas: FigureCanvasTkAgg, force: bool = False) -> None:
     """Resize a canvas's figure to its widget's current size.
 
     On scaled displays matplotlib's one-off DPI adjustment can land after
     the widget's last <Configure> event; the figure is then larger than the
     widget and renders cropped, with no further event to reconcile them.
     Replays the resize handler with the widget's actual size (which also
-    recreates the Tk photo buffer). No-op when the two already agree.
+    recreates the Tk photo buffer). No-op when the two already agree —
+    pass force=True after a window resize, where the sizes can compare
+    equal while the photo buffer is still stale.
     """
     widget = canvas.get_tk_widget()
     parent = getattr(canvas, '_operaxn_parent', widget.master)
@@ -713,13 +735,16 @@ def sync_figure_to_widget(canvas: FigureCanvasTkAgg) -> None:
     height = parent.winfo_height()
     if toolbar is not None:
         height -= toolbar.winfo_height()
-    width = max(1, width - 2)
-    height = max(1, height - 2)
+    # the canvas widget sits inside two 1px borders (frame highlight +
+    # canvas border): its actual size is parent - 4 in each dimension
+    width = max(1, width - 4)
+    height = max(1, height - 4)
     if width <= 1 or height <= 1:
         return
     dpi = canvas.figure.dpi
     fig_w, fig_h = canvas.figure.get_size_inches()
-    if round(fig_w * dpi) != width or round(fig_h * dpi) != height:
+    if (force or round(fig_w * dpi) != width
+            or round(fig_h * dpi) != height):
         widget.configure(width=width, height=height)
         canvas.resize(SimpleNamespace(width=width, height=height))
         canvas.draw_idle()

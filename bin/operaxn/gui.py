@@ -1,11 +1,13 @@
 """
-OperaXN - gui.py
+OperaXN main window: toolbar, scan list, matplotlib canvas, scan
+navigation, and the figure/Excel/GIF/NeXus export flows.
+
+Consumes scan dictionaries and echem data from the input adapter
+(input.py); performs no data processing of its own.
 """
 
 import logging
 import os
-import re
-import sys
 import tempfile
 import threading
 import time
@@ -24,6 +26,7 @@ import numpy as np
 import pandas as pd
 import psutil
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 from .config import (
     APP_VERSION,
@@ -39,23 +42,31 @@ from .config import (
     FIGURE_DPI,
     INTENSITY_SAMPLE_SIZE,
     LARGE_IMAGE_THRESHOLD,
-    MAX_CACHE_SIZE_MB,
     MAX_WORKERS,
     OPERAXNTheme,
     PLOT_UPDATE_DELAY_MS,
     SYNCHROTRON_MAX_DISPLAY_SIZE,
-    WINDOW_SIZES,
 )
 
+from .capacity import (
+    assign_cycles, compute_capacity,
+    plot_capacity_vs_voltage, plot_time_vs_voltage
+)
 from .dialog import (
     PlotSettingsDialog, ExportOptionsDialog, ExportOptions,
     GIFSettingsDialog, GIFSettings, ProgressDialog,
-    DataSourceSelectionDialog, DisplaySizeDialog
+    UploadOptionsDialog, UploadOptions
+)
+from .heatmap import HeatmapWindow
+from .ici import (
+    ICIWindow, echem_source_button, embed_figure, maximise_window,
+    sync_figure_to_widget
 )
 from .input import (
     process_paths, make_oned_arrays, make_twod_arrays,
     make_echem_arrays, get_correlated_data, make_neutron_arrays,
-    NeutronFileGrouper
+    NeutronFileGrouper, SynchrotronFileGrouper, export_nxs, get_loaded_nxs_path,
+    add_standard_echem_files, get_experiment_metadata, get_standard_echem
 )
 from .output import (
     plot_oned_data, plot_twod_data, plot_echem_data,
@@ -138,7 +149,7 @@ class VisualiserConfig:
 
 @dataclass
 class ApplicationState:
-    """Mutable runtime state including loaded data and cache."""
+    """Mutable runtime state for the loaded experiment."""
     scans: List[Dict[str, Any]] = field(default_factory=list)
     echem_df: Optional[pd.DataFrame] = None
     oned_arrays: Dict[int, Dict[str, Any]] = field(default_factory=dict)
@@ -152,67 +163,10 @@ class ApplicationState:
     data_source: DataSourceType = DataSourceType.INHOUSE
     synchrotron_max_size: int = SYNCHROTRON_MAX_DISPLAY_SIZE
     dialog_windows: List[tk.Toplevel] = field(default_factory=list)
-    data_cache: Dict[str, Any] = field(default_factory=dict)
-    cache_size_bytes: int = 0
-    max_cache_bytes: int = MAX_CACHE_SIZE_MB * 1024 * 1024
 
     def reset(self) -> None:
-        """Reset application state and clear cache."""
+        """Reset application state."""
         self.__init__()
-        self.clear_cache()
-
-    def get_cached_data(self, key: str, loader_func: Callable) -> Any:
-        """Get data from cache or load it."""
-        if not CACHE_ENABLED:
-            return loader_func()
-
-        if key not in self.data_cache:
-            data = loader_func()
-            self._add_to_cache(key, data)
-        return self.data_cache[key]
-
-    def _get_data_size(self, data: Any) -> int:
-        """Accurately measure data size."""
-        if isinstance(data, np.ndarray):
-            return data.nbytes
-        elif isinstance(data, pd.DataFrame):
-            return data.memory_usage(deep=True).sum()
-        elif isinstance(data, dict):
-            total_size = sys.getsizeof(data)
-            for key, value in data.items():
-                total_size += self._get_data_size(key)
-                total_size += self._get_data_size(value)
-            return total_size
-        else:
-            return sys.getsizeof(data)
-
-    def _add_to_cache(self, key: str, data: Any) -> None:
-        """Add data to cache with size management."""
-        try:
-            size = self._get_data_size(data)
-            if self.cache_size_bytes + size > self.max_cache_bytes:
-                self._evict_cache_entries(size)
-            self.data_cache[key] = data
-            self.cache_size_bytes += size
-        except (MemoryError, AttributeError) as e:
-            logger.debug("Cache error: %s", e)
-            self.data_cache[key] = data
-
-    def _evict_cache_entries(self, needed_size: int) -> None:
-        """Evict the oldest cache entries to make room."""
-        keys_to_evict = list(self.data_cache.keys())
-
-        for key in keys_to_evict:
-            if self.cache_size_bytes + needed_size <= self.max_cache_bytes:
-                break
-            if key in self.data_cache:
-                evicted_data = self.data_cache.pop(key)
-                self.cache_size_bytes -= sys.getsizeof(evicted_data)
-
-    def clear_cache(self) -> None:
-        """Clear all cached data."""
-        self.data_cache.clear()
-        self.cache_size_bytes = 0
 
 
 # ============================================================================
@@ -352,10 +306,14 @@ class ButtonPanel(BaseUIComponent):
     BUTTON_CONFIGS = [
         ("upload_files", "📁 Upload", "normal", "primary"),
         ("plot_data", "📊 Plot", "disabled", "primary"),
-        ("export_plots", "💾 Export", "disabled", "secondary"),
-        ("create_gif", "🎬 GIF", "disabled", "secondary"),
-        ("export_data", "📄 Excel", "disabled", "secondary"),
-        ("clear_all", "🗑️ Clear", "normal", "danger"),
+        ("capacity_plot", "Capacity", "disabled", "primary"),
+        ("ici_analysis", "ICI", "disabled", "primary"),
+        ("heatmap", "Heatmap", "disabled", "primary"),
+        ("export_plots", "Image", "disabled", "secondary"),
+        ("create_gif", "GIF", "disabled", "secondary"),
+        ("export_data", "Excel", "disabled", "secondary"),
+        ("export_nxs", "📄 NeXus", "disabled", "danger"),
+        ("clear_all", "🗑 Clear", "normal", "danger"),
     ]
 
     def __init__(self, master: tk.Widget, callbacks: Dict[str, Callable]) -> None:
@@ -429,8 +387,11 @@ class FileListPanel(BaseUIComponent):
             borderwidth=0,
             highlightthickness=0,
             height=3,
-            selectmode=tk.SINGLE
+            selectmode=tk.SINGLE,
+            activestyle="none",
+            exportselection=False
         )
+
         self.listbox.pack(fill="both", expand=True)
 
         def on_mousewheel(event):
@@ -444,6 +405,13 @@ class FileListPanel(BaseUIComponent):
 
         if self.on_select:
             self.listbox.bind("<Double-Button-1>", self._on_double_click)
+
+    def highlight_scan(self, index: int) -> None:
+        """Select and reveal the active scan's row."""
+        if 0 <= index < self.listbox.size():
+            self.listbox.selection_clear(0, tk.END)
+            self.listbox.selection_set(index)
+            self.listbox.see(index)
 
     def _on_double_click(self, event: tk.Event) -> None:
         """Handle double-click event."""
@@ -460,7 +428,9 @@ class FileListPanel(BaseUIComponent):
             self._items_cache = items.copy()
 
     def show_progress(self, message: str) -> None:
-        """Show progress message."""
+        """Show transient progress only before persistent scan rows exist."""
+        if self._items_cache:
+            return
         count = self.listbox.size()
         if count > 0:
             self.listbox.delete(count - 1)
@@ -481,7 +451,7 @@ class ScanSelector(BaseUIComponent):
     def _create_widgets(self) -> None:
         """Create selection widgets."""
         frame = tk.Frame(self, bg=OPERAXNTheme.COLORS['bg_primary'])
-        frame.pack(fill="x", padx=OPERAXNTheme.PADDING['small'], pady=3)
+        frame.pack(fill="x", padx=OPERAXNTheme.PADDING['medium'], pady=(2, 4))
 
         tk.Label(
             frame,
@@ -634,6 +604,7 @@ class PlotControls(BaseUIComponent):
         """Create intensity controls for 2D data."""
         frame = tk.Frame(self, bg=OPERAXNTheme.COLORS['bg_primary'])
         frame.pack(side="right", padx=OPERAXNTheme.PADDING['medium'] + 2)
+        self.intensity_frame = frame  # hidden for sources without 2D data
 
         tk.Label(frame, text="2D Intensity:",
                  bg=OPERAXNTheme.COLORS['bg_primary'],
@@ -744,7 +715,7 @@ class PlotControls(BaseUIComponent):
             self.on_intensity_apply(current_min, current_max)
 
     def update_data_source(self, source_type: DataSourceType) -> None:
-        """Update the data source indicator."""
+        """Update the data source indicator and source-dependent controls."""
         if hasattr(self, 'source_label'):
             source_map = {
                 DataSourceType.INHOUSE: ("Laboratory X-ray diffraction", OPERAXNTheme.COLORS['text_primary']),
@@ -753,6 +724,14 @@ class PlotControls(BaseUIComponent):
             }
             text, color = source_map.get(source_type, ("Unknown", OPERAXNTheme.COLORS['text_primary']))
             self.source_label.config(text=text, fg=color)
+
+        # 2D intensity controls are meaningless for neutron (no 2D data)
+        if hasattr(self, 'intensity_frame'):
+            if source_type == DataSourceType.NEUTRON:
+                self.intensity_frame.pack_forget()
+            elif not self.intensity_frame.winfo_ismapped():
+                self.intensity_frame.pack(
+                    side="right", padx=OPERAXNTheme.PADDING['medium'] + 2)
 
     def update_intensity_range(self, vmin: float, vmax: float, current_min: float, current_max: float) -> None:
         """Update intensity slider ranges."""
@@ -908,6 +887,12 @@ class OPERAXN(tk.Frame):
             anchor='w'
         )
 
+        # Size the canvas to the drawn wordmark (a fixed width clips it at
+        # higher DPI scaling)
+        bbox = title_canvas.bbox("all")
+        if bbox:
+            title_canvas.config(width=bbox[2] + 6)
+
         # Subtitle
         tk.Label(
             header,
@@ -923,8 +908,12 @@ class OPERAXN(tk.Frame):
             "upload_files": self._upload_files,
             "plot_data": self._plot_data,
             "export_plots": self._export_data,
+            "capacity_plot": self._open_capacity_window,
+            "ici_analysis": self._open_ici_window,
+            "heatmap": self._open_heatmap,
             "create_gif": self._create_gif,
             "export_data": self._export_to_excel,
+            "export_nxs": self._export_nxs,
             "clear_all": self._clear_all
         }
 
@@ -953,8 +942,27 @@ class OPERAXN(tk.Frame):
         )
         canvas_frame.pack(fill="both", expand=True)
 
-        self.plot_container = tk.Frame(canvas_frame, bg="white")
+        self.plot_container = tk.Frame(
+            canvas_frame, bg=OPERAXNTheme.COLORS['canvas_bg'])
         self.plot_container.pack(fill="both", expand=True, padx=3)
+        self._show_empty_state()
+
+    def _show_empty_state(self) -> None:
+        """Dark placeholder shown in the plot area when no data is loaded."""
+        hint = tk.Frame(self.plot_container, bg=OPERAXNTheme.COLORS['canvas_bg'])
+        hint.pack(fill="both", expand=True)
+        tk.Label(
+            hint, text="No data loaded",
+            font=OPERAXNTheme.FONTS['heading'],
+            bg=OPERAXNTheme.COLORS['canvas_bg'],
+            fg=OPERAXNTheme.COLORS['text_secondary']
+        ).pack(expand=True, anchor="s", pady=(0, 2))
+        tk.Label(
+            hint, text="Upload data or open a NeXus file to begin",
+            font=OPERAXNTheme.FONTS['body'],
+            bg=OPERAXNTheme.COLORS['canvas_bg'],
+            fg=OPERAXNTheme.COLORS['text_dim']
+        ).pack(expand=True, anchor="n", pady=(2, 0))
 
     def _create_scan_selector(self) -> None:
         """Create scan selector."""
@@ -1025,125 +1033,141 @@ class OPERAXN(tk.Frame):
     # ========================================================================
 
     def _upload_files(self) -> None:
-        """Upload and process files."""
-        selected = self._get_file_selection()
-        if not selected:
+        """Open the combined upload options window and process the selection."""
+        # Non-modal: lift an already-open dialog instead of duplicating it
+        existing = getattr(self, "_upload_dialog", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_set()
+                    return
+            except tk.TclError:
+                pass
+
+        self._upload_dialog = UploadOptionsDialog(
+            self.master, has_loaded_data=bool(self.state.scans))
+        options = self._upload_dialog.get_result()
+        self._upload_dialog = None
+        if options is None:
+            return
+
+        if not options.paths and options.standard_echem_files:
+            self._append_standard_echem_async(options.standard_echem_files)
             return
 
         self._clear_all()
 
-        # Get data source selection
-        data_source = self._get_data_source_selection()
-        if not data_source:
-            self._show_message("Warning", "Data source selection cancelled.", "warning")
-            return
+        self.state.data_source = options.data_source
+        self.config.data_source = options.data_source
+        if options.data_source == DataSourceType.SYNCHROTRON:
+            self.config.synchrotron_max_size = options.display_size
+            self.state.synchrotron_max_size = options.display_size
 
-        self.state.data_source = data_source
-        self.config.data_source = data_source
-
-        # Prompt for 2D display size when synchrotron is selected
-        if data_source == DataSourceType.SYNCHROTRON:
-            size_dialog = DisplaySizeDialog(self.master)
-            size_result = size_dialog.get_result()
-            if size_result is None:
-                return
-            self.config.synchrotron_max_size = size_result
-            self.state.synchrotron_max_size = size_result
-
-        # Show progress
         source_name = {
             DataSourceType.INHOUSE: "in-house",
             DataSourceType.SYNCHROTRON: "synchrotron",
             DataSourceType.NEUTRON: "neutron"
-        }.get(data_source, "unknown")
+        }.get(options.data_source, "unknown")
 
         self.file_list.show_progress(f"Processing {source_name} data...")
 
-        # Process files asynchronously
-        self._process_files_async(selected, data_source)
+        self._process_files_async(options)
 
-    def _get_file_selection(self) -> Optional[List[str]]:
-        """Get file selection from user."""
-        dialog = self._create_file_selection_dialog()
-        dialog.wait_window()
-        return getattr(dialog, 'selected', None)
+    def _append_standard_echem_async(self, paths: List[str]) -> None:
+        """Add analysis-only echem to the current session without reloading it."""
+        self.state.ui_state = UIState.LOADING
+        self.file_list.show_progress("Adding electrochemistry data...")
 
-    def _create_file_selection_dialog(self) -> tk.Toplevel:
-        """Create file selection dialog."""
-        dialog = tk.Toplevel(self.master)
-        dialog.title("Upload Options")
-        dialog.geometry(WINDOW_SIZES['upload'])
-        dialog.transient(self.master)
-        dialog.grab_set()
-        dialog.configure(bg=OPERAXNTheme.COLORS['bg_primary'])
-        dialog.selected = None
+        def process() -> None:
+            try:
+                added = add_standard_echem_files(paths)
+                if not added:
+                    self.after(0, lambda: self._show_message(
+                        "No echem data",
+                        "No valid electrochemistry data was found in the selected files.",
+                        "warning"))
+                    return
 
-        self._center_window(dialog)
+                def complete() -> None:
+                    self.file_list.show_progress(
+                        f"Added {len(added)} electrochemistry file(s)")
+                    self.button_panel.update_states({
+                        "capacity_plot": "normal",
+                        "ici_analysis": "normal",
+                        "export_nxs": "normal",
+                    })
+                    sources = self._echem_sources()
+                    for attr in ("_ici_window", "_capacity_window"):
+                        analysis_window = getattr(self, attr, None)
+                        try:
+                            if analysis_window is not None and analysis_window.winfo_exists():
+                                refresh = getattr(analysis_window, "refresh_sources", None)
+                                if refresh is not None:
+                                    refresh(sources)
+                        except tk.TclError:
+                            pass
+                    usable = [item for item in added
+                              if self._has_analysis_current(item.get("data"))]
+                    if not usable:
+                        self._show_message(
+                            "Echem added without current",
+                            "The selected file was loaded, but it has no usable current "
+                            "column and therefore cannot be used for ICI or Capacity analysis.",
+                            "warning")
+                    else:
+                        self._show_message(
+                            "Electrochemistry added",
+                            f"Added {len(usable)} analysis source(s) to the current experiment.",
+                            "info")
 
-        # Label
-        tk.Label(
-            dialog,
-            text="Choose how to select your data:",
-            font=OPERAXNTheme.FONTS['heading'],
-            bg=OPERAXNTheme.COLORS['bg_primary'],
-            fg=OPERAXNTheme.COLORS['text_primary']
-        ).pack(pady=OPERAXNTheme.PADDING['large'])
+                self.after(0, complete)
+            except Exception as exc:
+                logger.debug("Additional echem error: %s", traceback.format_exc())
+                self.after(0, lambda error=str(exc): self._show_message(
+                    "Error", f"Failed to add electrochemistry: {error}", "error"))
+            finally:
+                self.state.ui_state = UIState.IDLE
 
-        # Button frame
-        button_frame = tk.Frame(dialog, bg=OPERAXNTheme.COLORS['bg_primary'])
-        button_frame.pack(pady=3)
+        threading.Thread(target=process, daemon=True).start()
 
-        def handle_files():
-            files = filedialog.askopenfilenames(
-                title="Select Files",
-                filetypes=[
-                    ("All Supported", "*.zip;*.dat;*.edf;*.txt;*.hdf;*.nxs;*.xy"),
-                    ("ZIP Files", "*.zip"),
-                    ("DAT Files", "*.dat"),
-                    ("EDF Files", "*.edf"),
-                    ("Text Files", "*.txt"),
-                    ("HDF Files", "*.hdf"),
-                    ("NXS Files", "*.nxs"),
-                    ("XY Files", "*.xy"),
-                    ("All Files", "*.*")
-                ]
-            )
-            if files:
-                dialog.selected = list(files)
-                dialog.destroy()
+    def _choose_additional_echem(self) -> None:
+        """Choose analysis echem and append it to the active experiment."""
+        focused = self.master.focus_get()
+        parent = focused.winfo_toplevel() if focused is not None else self.master
+        paths = filedialog.askopenfilenames(
+            parent=parent,
+            title="Add Electrochemistry",
+            filetypes=[("Supported files", "*.txt *.xlsx *.csv"),
+                       ("All files", "*.*")])
+        if paths:
+            self._append_standard_echem_async(list(paths))
 
-        def handle_directory():
-            directory = filedialog.askdirectory(title="Select Directory")
-            if directory:
-                dialog.selected = [directory]
-                dialog.destroy()
-
-        # Create buttons
-        StyledButton(button_frame, text="Select Files", command=handle_files,
-                     style="primary", width=12, height=2).pack(side="left", padx=OPERAXNTheme.PADDING['medium'])
-        StyledButton(button_frame, text="Select Directory", command=handle_directory,
-                     style="primary", width=12, height=2).pack(side="left", padx=OPERAXNTheme.PADDING['medium'])
-        StyledButton(button_frame, text="Cancel", command=dialog.destroy,
-                     style="secondary", width=12, height=2).pack(side="left", padx=OPERAXNTheme.PADDING['medium'])
-
-        return dialog
-
-    def _get_data_source_selection(self) -> Optional[DataSourceType]:
-        """Show dialog to select data source type."""
-        dialog = DataSourceSelectionDialog(self.master)
-        return dialog.get_result()
-
-    def _process_files_async(self, selected_paths: List[str], data_source: DataSourceType) -> None:
+    def _process_files_async(self, options: UploadOptions) -> None:
         """Process files asynchronously."""
         self.state.ui_state = UIState.LOADING
+
+        # Stored 2D size follows the single display-size setting
+        # (synchrotron HDF only; EDF is always full resolution)
+        twod_max_size = (options.display_size
+                         if options.include_2d
+                         and options.data_source == DataSourceType.SYNCHROTRON
+                         else 0)
 
         def process():
             try:
                 with self.performance.measure("file_processing"):
                     self.state.scans, self.state.echem_df, self.state.time_method = process_paths(
-                        list(selected_paths),
+                        list(options.paths),
                         self.file_list.show_progress,
-                        data_source=data_source
+                        time_method=options.time_method,
+                        data_source=options.data_source,
+                        standard_echem_files=options.standard_echem_files,
+                        include_2d_images=options.include_2d,
+                        twod_max_display_size=twod_max_size,
+                        title=options.title,
+                        sample_name=options.sample_name,
+                        sample_description=options.sample_description
                     )
 
                 if not self.state.scans:
@@ -1154,7 +1178,10 @@ class OPERAXN(tk.Frame):
 
             except Exception as e:
                 logger.debug("Error details: %s", traceback.format_exc())
-                self.after(0, lambda: self._show_message("Error", f"Failed to process files: {str(e)}", "error"))
+                # bind now: `e` is unbound once the except block exits, and
+                # the lambda only runs later on the Tk main loop
+                error_message = f"Failed to process files: {e}"
+                self.after(0, lambda: self._show_message("Error", error_message, "error"))
             finally:
                 self.state.ui_state = UIState.IDLE
 
@@ -1271,31 +1298,18 @@ class OPERAXN(tk.Frame):
             if scan.get("current") is not None:
                 text += f" / {scan['current']:.3f} mA"
 
-        text += " [N]"
         return text
 
     def _format_synchrotron_scan(self, scan: Dict[str, Any], text: str) -> str:
         """Format synchrotron scan text."""
-        # Extract group ID
+        # Scan ID via the same rule used for file grouping, so the displayed
+        # ID always matches the ID the scan was grouped under
         for file_path in [scan.get("oned"), scan.get("twod")]:
             if file_path:
-                basename = os.path.basename(file_path)
-                base_no_ext = os.path.splitext(basename)[0]
-                base_clean = base_no_ext.replace('_integration', '')
-
-                # Try different patterns
-                patterns = [
-                    r'[a-z]+\d+-\d+-(\d+)',
-                    r'(\d{5,})',
-                    r'(\d{3,})(?!.*\d{3,})'
-                ]
-
-                for pattern in patterns:
-                    match = re.search(pattern, base_clean.lower())
-                    if match:
-                        text += f" - ID: {match.group(1)}"
-                        break
-                if " - ID:" in text:
+                scan_id = SynchrotronFileGrouper.extract_scan_id(
+                    os.path.basename(file_path))
+                if scan_id:
+                    text += f" - ID: {scan_id}"
                     break
 
         if scan.get("timestamp"):
@@ -1306,7 +1320,6 @@ class OPERAXN(tk.Frame):
             if scan.get("current") is not None:
                 text += f" / {scan['current']:.3f} mA"
 
-        text += " [S]"
         return text
 
     def _format_inhouse_scan(self, scan: Dict[str, Any], text: str) -> str:
@@ -1340,9 +1353,16 @@ class OPERAXN(tk.Frame):
         self.scan_selector.set_value(1)
         self.state.intensity_limits.clear()
 
+        echem_state = "normal" if self._echem_sources() else "disabled"
+        # XRD-only view: stays disabled for neutron data
+        heatmap_state = "normal" if self.state.oned_arrays else "disabled"
         self.button_panel.update_states({
             "plot_data": "normal",
-            "export_data": "normal"
+            "export_data": "normal",
+            "export_nxs": "normal",
+            "capacity_plot": echem_state,
+            "ici_analysis": echem_state,
+            "heatmap": heatmap_state
         })
 
         # Recreate controls
@@ -1481,6 +1501,7 @@ class OPERAXN(tk.Frame):
         with self.performance.measure("plot_update"):
             scan_num = self.scan_selector.get_value()
             self.state.current_scan_idx = scan_num - 1
+            self.file_list.highlight_scan(self.state.current_scan_idx)
             scan = self.state.scans[self.state.current_scan_idx]
 
             # Update title
@@ -1713,9 +1734,26 @@ class OPERAXN(tk.Frame):
                            f"Applied intensity range {current_min:.2f} - {current_max:.2f} to all scans",
                            "info")
 
+    def _lift_existing_dialog(self, attr: str) -> bool:
+        """Focus a still-open dialog stored on `attr` instead of duplicating it."""
+        existing = getattr(self, attr, None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_set()
+                    return True
+            except tk.TclError:
+                pass
+        setattr(self, attr, None)
+        return False
+
     def _show_plot_settings(self) -> None:
         """Show plot settings dialog."""
+        if self._lift_existing_dialog('_plot_settings_dialog'):
+            return
         dialog = PlotSettingsDialog(self.master, self.config, self._on_plot_settings_update)
+        self._plot_settings_dialog = dialog
         self.state.dialog_windows.append(dialog)
         dialog.protocol("WM_DELETE_WINDOW", lambda: self._close_dialog(dialog))
 
@@ -1723,6 +1761,413 @@ class OPERAXN(tk.Frame):
         """Handle plot settings update."""
         clear_plot_cache()
         self._update_plots()
+
+    # ========================================================================
+    # Echem Analysis Windows
+    # ========================================================================
+
+    @staticmethod
+    def _has_analysis_current(df: Optional[pd.DataFrame]) -> bool:
+        """True when df has current values, as capacity/ICI analysis needs."""
+        return (df is not None and not df.empty
+                and "current" in df.columns
+                and bool(df["current"].notna().any()))
+
+    def _echem_sources(self) -> Dict[str, pd.DataFrame]:
+        """Echem datasets usable for capacity/ICI analysis, keyed by label.
+
+        The operando echem comes first, followed by any standard echem files
+        stored in the loaded .nxs; datasets without current values are
+        excluded (nothing to classify or integrate)."""
+        sources: Dict[str, pd.DataFrame] = {}
+        if self._has_analysis_current(self.state.echem_df):
+            sources["Operando echem"] = self.state.echem_df
+        for item in get_standard_echem():
+            data = item.get("data")
+            if not self._has_analysis_current(data):
+                continue
+            base = (os.path.basename(str(item.get("source_file") or ""))
+                    or str(item.get("name") or "standard echem"))
+            label = base
+            suffix = 2
+            while label in sources:
+                label = f"{base} ({suffix})"
+                suffix += 1
+            sources[label] = data
+        return sources
+
+    def _open_heatmap(self) -> None:
+        """Open the operando heatmap window (stacked XRD patterns + voltage)."""
+        if self._lift_existing_dialog('_heatmap_window'):
+            return
+        if not self.state.oned_arrays:
+            self._show_message(
+                "No data",
+                "Load 1D XRD data before opening the heatmap.",
+                "warning")
+            return
+
+        win = HeatmapWindow(
+            self.master,
+            scans=self.state.scans,
+            oned_arrays=self.state.oned_arrays,
+            echem_arrays=self.state.echem_arrays,
+            time_method=self.state.time_method)
+        self._heatmap_window = win
+        self.state.dialog_windows.append(win)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_dialog(win))
+
+    def _open_ici_window(self) -> None:
+        """Open the ICI (intermittent current interruption) analysis window."""
+        if self._lift_existing_dialog('_ici_window'):
+            return
+        sources = self._echem_sources()
+        if not sources:
+            self._show_message(
+                "No echem data",
+                "Load echem data with current values before opening ICI Analysis.",
+                "warning")
+            return
+
+        win = ICIWindow(
+            self.master, echem_sources=sources,
+            on_add_source=self._choose_additional_echem)
+        self._ici_window = win
+        self.state.dialog_windows.append(win)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_dialog(win))
+
+    def _open_capacity_window(self) -> None:
+        """Open the capacity analysis window (voltage vs time, capacity vs voltage)."""
+        if self._lift_existing_dialog('_capacity_window'):
+            return
+        sources = self._echem_sources()
+        if not sources:
+            self._show_message(
+                "No echem data",
+                "Load echem data with current values before opening Capacity Analysis.",
+                "warning")
+            return
+
+        # Mutable so the source dropdown can swap datasets inside the closures
+        current = {
+            "name": next(iter(sources)),
+            "df": next(iter(sources.values())),
+            "available": [],
+        }
+
+        win = tk.Toplevel(self.master)
+        win.title("OperaXN — Capacity Analysis")
+        win.configure(bg=OPERAXNTheme.COLORS['bg_primary'])
+        win.minsize(900, 500)
+        maximise_window(win)
+        win.lift()
+        win.focus_force()
+
+        # Compact single-line toolbar matching the main window.
+        controls_wrapper = tk.Frame(
+            win,
+            bg=OPERAXNTheme.COLORS['bg_secondary'],
+            highlightbackground=OPERAXNTheme.COLORS['border'],
+            highlightthickness=1
+        )
+        controls_wrapper.pack(side="top", fill="x",
+                              padx=OPERAXNTheme.PADDING['small'],
+                              pady=(OPERAXNTheme.PADDING['small'], 2))
+        controls = tk.Frame(controls_wrapper, bg=OPERAXNTheme.COLORS['bg_secondary'])
+        controls.pack(fill="x", padx=OPERAXNTheme.PADDING['small'], pady=4)
+
+        def _label(parent: tk.Widget, text: str, dim: bool = False) -> tk.Label:
+            return tk.Label(
+                parent, text=text,
+                bg=OPERAXNTheme.COLORS['bg_secondary'],
+                fg=(OPERAXNTheme.COLORS['text_dim'] if dim
+                    else OPERAXNTheme.COLORS['text_primary']),
+                font=OPERAXNTheme.FONTS['small'])
+
+        def _nav_button(parent: tk.Widget, text: str, command) -> tk.Button:
+            return tk.Button(
+                parent, text=text, command=command, width=1,
+                bg=OPERAXNTheme.COLORS['bg_tertiary'],
+                fg=OPERAXNTheme.COLORS['text_primary'],
+                activebackground=OPERAXNTheme.COLORS['bg_secondary'],
+                activeforeground=OPERAXNTheme.COLORS['text_primary'],
+                disabledforeground=OPERAXNTheme.COLORS['text_dim'],
+                font=OPERAXNTheme.FONTS['button'], relief=tk.FLAT,
+                cursor='hand2', padx=2, pady=3)
+
+        source_var = tk.StringVar(value=next(iter(sources)))
+        source_button = echem_source_button(
+            controls,
+            source_var,
+            list(sources),
+            command=lambda name: win.after_idle(_on_source_change, name),
+            on_add=self._choose_additional_echem,
+        )
+        source_button.pack(side="left", padx=(2, OPERAXNTheme.PADDING['small']))
+
+        _label(controls, "Mass (mg):").pack(side="left")
+        mass_var = tk.StringVar(value="0")
+        mass_entry = tk.Spinbox(
+            controls, textvariable=mass_var, from_=0.0, to=99999.0,
+            increment=0.1, format="%.2f", width=7,
+            command=lambda: _queue_mass_replot(),
+            bg=OPERAXNTheme.COLORS['input_bg'],
+            fg=OPERAXNTheme.COLORS['text_primary'],
+            buttonbackground=OPERAXNTheme.COLORS['bg_secondary'],
+            relief=tk.FLAT, font=OPERAXNTheme.FONTS['small'],
+            highlightbackground=OPERAXNTheme.COLORS['border'],
+            highlightthickness=1)
+        mass_entry.pack(side="left", padx=(2, OPERAXNTheme.PADDING['small']))
+
+        _label(controls, "Cycle:").pack(side="left")
+        cycle_frame = tk.Frame(controls, bg=OPERAXNTheme.COLORS['bg_secondary'])
+        cycle_frame.pack(side="left", padx=(2, OPERAXNTheme.PADDING['small']))
+        cycle_var = tk.IntVar(value=1)
+        prev_cycle = _nav_button(
+            cycle_frame, '◀', lambda: _step_cycle(-1))
+        prev_cycle.pack(side="left", padx=1)
+        cycle_spin = tk.Spinbox(
+            cycle_frame, textvariable=cycle_var, from_=1, to=1, width=4,
+            command=lambda: _replot(),
+            bg=OPERAXNTheme.COLORS['input_bg'],
+            fg=OPERAXNTheme.COLORS['text_primary'],
+            buttonbackground=OPERAXNTheme.COLORS['bg_secondary'],
+            relief=tk.FLAT, font=OPERAXNTheme.FONTS['small'],
+            highlightbackground=OPERAXNTheme.COLORS['border'],
+            highlightthickness=1)
+        cycle_spin.pack(side="left", padx=2)
+        next_cycle = _nav_button(
+            cycle_frame, '▶', lambda: _step_cycle(1))
+        next_cycle.pack(side="left", padx=1)
+
+        all_cycles_var = tk.BooleanVar(value=True)
+        all_cycles_check = tk.Checkbutton(
+            controls, text="All cycles", variable=all_cycles_var,
+            command=lambda: _toggle_all_cycles(),
+            bg=OPERAXNTheme.COLORS['bg_secondary'],
+            fg=OPERAXNTheme.COLORS['text_primary'],
+            activebackground=OPERAXNTheme.COLORS['bg_secondary'],
+            activeforeground=OPERAXNTheme.COLORS['text_primary'],
+            disabledforeground=OPERAXNTheme.COLORS['text_primary'],
+            selectcolor=OPERAXNTheme.COLORS['bg_tertiary'],
+            font=OPERAXNTheme.FONTS['small'])
+        all_cycles_check.pack(side="left", padx=(0, OPERAXNTheme.PADDING['small']))
+
+        cycles_label = _label(controls, "", dim=True)
+        cycles_label.pack(side="left", padx=(0, OPERAXNTheme.PADDING['small']))
+
+        def _refresh_available() -> None:
+            try:
+                current["available"] = sorted(
+                    c for c in assign_cycles(current["df"])["cycle"].unique() if c > 0)
+            except Exception:
+                logger.debug("Cycle detection failed: %s", traceback.format_exc())
+                current["available"] = []
+            cycles_label.config(text=f"({len(current['available'])} available)")
+            maximum = max(current["available"], default=1)
+            cycle_spin.config(to=maximum)
+            if cycle_var.get() not in current["available"]:
+                cycle_var.set(current["available"][0] if current["available"] else 1)
+
+        _refresh_available()
+
+        def _get_mass() -> float:
+            try:
+                return float(mass_var.get())
+            except (ValueError, tk.TclError):
+                return 0.0
+
+        def _get_cycles() -> List[int]:
+            if all_cycles_var.get():
+                return list(current["available"])
+            selected = cycle_var.get()
+            return [selected] if selected in current["available"] else []
+
+        # Plot area, bordered like the main-window plot container. The figure
+        # has no fixed size — fractional margins keep the layout correct at
+        # any window size, unlike a one-shot tight_layout.
+        plot_bg = '#ffffff'
+        plot_text = '#20242c'
+        plot_dim = '#4b5563'
+        plot_border = '#9ca3af'
+        plot_grid = '#d8dde6'
+        plot_frame = tk.Frame(
+            win,
+            bg=plot_bg,
+            relief=tk.FLAT,
+            highlightbackground=OPERAXNTheme.COLORS['border'],
+            highlightcolor=OPERAXNTheme.COLORS['accent_primary'],
+            highlightthickness=2
+        )
+        plot_frame.pack(fill="both", expand=True,
+                        padx=OPERAXNTheme.PADDING['small'],
+                        pady=(2, OPERAXNTheme.PADDING['small']))
+        plot_frame.pack_propagate(False)
+
+        fig = Figure(facecolor=plot_bg, dpi=FIGURE_DPI)
+        fig.subplots_adjust(left=0.08, right=0.97, top=0.93, bottom=0.12, wspace=0.24)
+        ax_time, ax_cap = fig.subplots(1, 2)
+
+        def _style_live_axes() -> None:
+            for ax in (ax_time, ax_cap):
+                ax.set_facecolor(plot_bg)
+                ax.tick_params(colors=plot_dim, labelsize=8)
+                ax.xaxis.label.set_color(plot_dim)
+                ax.yaxis.label.set_color(plot_dim)
+                ax.grid(True, color=plot_grid, alpha=0.75, linewidth=0.5)
+                for spine in ax.spines.values():
+                    spine.set_color(plot_border)
+                legend = ax.get_legend()
+                if legend is not None:
+                    legend.get_frame().set_facecolor(plot_bg)
+                    legend.get_frame().set_edgecolor(plot_border)
+                    for text in legend.get_texts():
+                        text.set_color(plot_text)
+
+        plot_time_vs_voltage(ax_time, current["df"])
+        plot_capacity_vs_voltage(ax_cap, current["df"], mass_mg=0.0)
+        _style_live_axes()
+
+        canvas = embed_figure(fig, plot_frame)
+
+        # Watch until the initial layout and DPI adjustment have both settled;
+        # their event order is not deterministic, so one-shot timers can miss.
+        sync_state = {"attempts": 0}
+
+        def _sync_watchdog() -> None:
+            if not win.winfo_exists():
+                return
+            sync_figure_to_widget(canvas)
+            sync_state["attempts"] += 1
+            if sync_state["attempts"] < 12:
+                win.after(200, _sync_watchdog)
+
+        win.after(150, _sync_watchdog)
+
+        def _replot(*_args) -> None:
+            selected = _get_cycles()
+            plot_time_vs_voltage(ax_time, current["df"], cycles_to_plot=selected)
+            plot_capacity_vs_voltage(ax_cap, current["df"], mass_mg=_get_mass(),
+                                     cycles_to_plot=selected)
+            _style_live_axes()
+            canvas.draw()
+
+        mass_replot_job = {"id": None}
+
+        def _queue_mass_replot(*_args) -> None:
+            """Debounce typing while keeping mass changes live."""
+            if mass_replot_job["id"] is not None:
+                try:
+                    win.after_cancel(mass_replot_job["id"])
+                except tk.TclError:
+                    pass
+
+            def update() -> None:
+                mass_replot_job["id"] = None
+                _replot()
+
+            mass_replot_job["id"] = win.after(150, update)
+
+        def _step_cycle(delta: int) -> None:
+            available = current["available"]
+            if not available:
+                return
+            all_cycles_var.set(False)
+            selected = cycle_var.get()
+            try:
+                index = available.index(selected)
+            except ValueError:
+                index = 0
+            cycle_var.set(available[max(0, min(len(available) - 1, index + delta))])
+            _toggle_all_cycles(replot=False)
+            _replot()
+
+        def _toggle_all_cycles(replot: bool = True) -> None:
+            state = "disabled" if all_cycles_var.get() else "normal"
+            for widget in (prev_cycle, cycle_spin, next_cycle):
+                widget.config(state=state)
+            if replot:
+                _replot()
+
+        def _on_source_change(name: str) -> None:
+            if name == current["name"] or name not in sources:
+                return
+            win.configure(cursor="watch")
+            win.update_idletasks()
+            try:
+                current["name"] = name
+                current["df"] = sources[name]
+                cycle_var.set(1)
+                all_cycles_var.set(True)
+                _refresh_available()
+                _toggle_all_cycles(replot=False)
+                _replot()
+            finally:
+                win.configure(cursor="")
+
+        def _refresh_sources(updated_sources: Dict[str, pd.DataFrame]) -> None:
+            sources.clear()
+            sources.update(updated_sources)
+            source_button.set_values(sources)
+            if current["name"] not in sources and sources:
+                name = next(iter(sources))
+                source_var.set(name)
+                _on_source_change(name)
+
+        win.refresh_sources = _refresh_sources
+
+        def _export_csv() -> None:
+            selected = _get_cycles()
+            if not selected:
+                messagebox.showwarning("No cycles", "No cycles selected to export.",
+                                       parent=win)
+                return
+            path = filedialog.asksaveasfilename(
+                parent=win, defaultextension=".csv",
+                filetypes=[("CSV", "*.csv")], initialfile="capacity_vs_voltage.csv")
+            if not path:
+                return
+            mass = _get_mass()
+            df_full = assign_cycles(current["df"])
+            rows = []
+            for cycle_num in selected:
+                cycle_df = df_full[df_full["cycle"] == cycle_num]
+                for phase in ("charge", "discharge"):
+                    phase_df = cycle_df[cycle_df["phase"] == phase]
+                    if phase_df.empty:
+                        continue
+                    cap = compute_capacity(phase_df)
+                    spec_cap = (cap / (mass / 1000.0) if mass > 0
+                                else np.full_like(cap, np.nan))
+                    for t, v, c, sc in zip(phase_df["t_s"].values,
+                                           phase_df["echem_data"].values,
+                                           cap, spec_cap):
+                        rows.append({
+                            "Cycle": cycle_num,
+                            "Phase": phase,
+                            "Time (s)": t,
+                            "Voltage (V)": v,
+                            "Capacity (mAh)": c,
+                            "Specific Capacity (mAh/g)": sc,
+                        })
+            pd.DataFrame(rows).to_csv(path, index=False, encoding=CSV_ENCODING)
+            messagebox.showinfo("Export complete", f"Saved data to:\n{path}", parent=win)
+
+        export_button = StyledButton(controls, text="Export CSV", command=_export_csv,
+                                     style="secondary", width=11)
+        export_button.pack(side="left", padx=2)
+
+        mass_entry.bind("<Return>", _replot)
+        mass_entry.bind("<FocusOut>", _queue_mass_replot)
+        mass_var.trace_add("write", _queue_mass_replot)
+        cycle_spin.bind("<Return>", _replot)
+
+        # Opens showing every cycle, so start with the stepper disabled
+        _toggle_all_cycles(replot=False)
+
+        self._capacity_window = win
+        self.state.dialog_windows.append(win)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_dialog(win))
 
     # ========================================================================
     # Export Operations
@@ -1739,8 +2184,11 @@ class OPERAXN(tk.Frame):
 
     def _get_export_options(self) -> Optional[ExportOptions]:
         """Get export options from user."""
+        if self._lift_existing_dialog('_export_options_dialog'):
+            return None
         is_neutron = (self.state.data_source == DataSourceType.NEUTRON)
         dialog = ExportOptionsDialog(self.master, is_neutron=is_neutron)
+        self._export_options_dialog = dialog
         return dialog.get_result()
 
     def _perform_export(self, options: ExportOptions) -> None:
@@ -1752,6 +2200,47 @@ class OPERAXN(tk.Frame):
                 self._export_multiple_scans(options.dpi, options.plot_types)
         except Exception as e:
             self._show_message("Error", f"Export failed: {str(e)}", "error")
+
+    def _export_nxs(self) -> None:
+        """Save the canonical NeXus file for the loaded experiment.
+
+        The file already contains everything chosen at generation time
+        (standard echem, 2D images or references), so this is a plain save.
+        """
+        if not self.state.scans:
+            self._show_message("Error", "No data loaded", "error")
+            return
+
+        loaded_path = get_loaded_nxs_path()
+        initial_name = os.path.basename(loaded_path) if loaded_path else "experiment.nxs"
+
+        filename = filedialog.asksaveasfilename(
+            parent=self.master,
+            title="Export NeXus File",
+            defaultextension=".nxs",
+            filetypes=[("NeXus files", "*.nxs"), ("All files", "*.*")],
+            initialfile=initial_name
+        )
+        if not filename:
+            return
+
+        def export_task():
+            try:
+                # No listbox progress here: the scan list is populated during
+                # exports and progress messages would overwrite its entries
+                success, messages = export_nxs(filename)
+                if success:
+                    self.after(0, lambda: self._show_message(
+                        "Success", f"NeXus file exported to:\n{filename}", "info"))
+                else:
+                    self.after(0, lambda: self._show_message(
+                        "Error", "NeXus export failed:\n" + "\n".join(messages), "error"))
+            except Exception as e:
+                logger.debug("NeXus export error: %s", traceback.format_exc())
+                self.after(0, lambda err=e: self._show_message(
+                    "Error", f"NeXus export failed: {err}", "error"))
+
+        threading.Thread(target=export_task, daemon=True).start()
 
     def _export_current_scan(self, dpi: int, plot_types: Dict[str, bool]) -> None:
         """Export current scan."""
@@ -1852,7 +2341,6 @@ class OPERAXN(tk.Frame):
                 success_count += 1
 
             except Exception as e:
-                error_msg = f"Scan {scan_num}: {str(e)}"
                 failed_scans.append((scan_num, str(e)))
                 logger.debug("Failed to export scan %d:\n%s", scan_num, traceback.format_exc())
 
@@ -1903,7 +2391,10 @@ class OPERAXN(tk.Frame):
                                "error")
             return
 
+        if self._lift_existing_dialog('_gif_dialog'):
+            return
         gif_dialog = GIFSettingsDialog(self.master, len(self.state.scans))
+        self._gif_dialog = gif_dialog
         gif_settings = gif_dialog.get_result()
 
         if not gif_settings:
@@ -2083,7 +2574,10 @@ class OPERAXN(tk.Frame):
 
             except Exception as e:
                 logger.debug("Excel export error: %s", traceback.format_exc())
-                self.after(0, lambda: self._show_message("Error", f"Excel export failed: {str(e)}", "error"))
+                # bind now: `e` is unbound once the except block exits, and
+                # the lambda only runs later on the Tk main loop
+                error_message = f"Excel export failed: {e}"
+                self.after(0, lambda: self._show_message("Error", error_message, "error"))
 
         # Run in thread
         thread = threading.Thread(target=export_task, daemon=True)
@@ -2110,15 +2604,17 @@ class OPERAXN(tk.Frame):
 
         base_data = {
             "scan number": scan["scan_num"],
+            "scan ID": "",
             "data source": self.state.data_source.value,
-            "voltage": scan.get("echem", ""),
-            "current": scan.get("current", ""),
-            "voltage timestamp": scan.get("echem_timestamp", "")
+            "voltage (V)": scan.get("echem", ""),
+            "current (mA)": scan.get("current", ""),
+            "voltage timestamp": scan.get("echem_timestamp", ""),
+            "exposure time (s)": scan.get("exposure_time", ""),
         }
 
         if self.state.data_source == DataSourceType.NEUTRON:
-            # Neutron-specific data
-            for i in range(1, 7):
+            # Neutron-specific data (banks are limited to 1-5 by the grouper)
+            for i in range(1, 6):
                 base_data[f"bank_{i}_tof"] = ""
                 base_data[f"bank_{i}_d"] = ""
 
@@ -2133,6 +2629,11 @@ class OPERAXN(tk.Frame):
                         base_data[f"bank_{measurement_num}_tof"] = os.path.basename(files["tof"])
                     if "d" in files:
                         base_data[f"bank_{measurement_num}_d"] = os.path.basename(files["d"])
+                    if not base_data["scan ID"]:
+                        any_file = files.get("tof") or files.get("d")
+                        if any_file:
+                            base_data["scan ID"] = NeutronFileGrouper.extract_scan_id(
+                                os.path.basename(any_file)) or ""
 
             base_data["neutron_metadata"] = os.path.basename(scan["neutron_meta"]) if scan.get("neutron_meta") else ""
         else:
@@ -2140,6 +2641,15 @@ class OPERAXN(tk.Frame):
             base_data["oned"] = os.path.basename(scan["oned"]) if scan.get("oned") else ""
             base_data["twod"] = os.path.basename(scan["twod"]) if scan.get("twod") else ""
             base_data["x-ray timestamp"] = original_timestamp
+
+            if self.state.data_source == DataSourceType.SYNCHROTRON:
+                for file_path in (scan.get("oned"), scan.get("twod")):
+                    if file_path:
+                        scan_id = SynchrotronFileGrouper.extract_scan_id(
+                            os.path.basename(file_path))
+                        if scan_id:
+                            base_data["scan ID"] = scan_id
+                            break
 
         return base_data
 
@@ -2154,7 +2664,7 @@ class OPERAXN(tk.Frame):
 
     def _get_neutron_column_order(self, df: pd.DataFrame) -> List[str]:
         """Get optimal column order for neutron data."""
-        column_order = ["scan number", "data source"]
+        column_order = ["scan number", "scan ID", "data source"]
 
         # Add timestamp columns
         for col in ["neutron_timestamp", "neutron_start", "neutron_end"]:
@@ -2162,12 +2672,13 @@ class OPERAXN(tk.Frame):
                 column_order.append(col)
 
         # Add voltage/current columns
-        for col in ["voltage", "current", "voltage timestamp"]:
+        for col in ["voltage (V)", "current (mA)", "voltage timestamp",
+                    "exposure time (s)"]:
             if col in df.columns:
                 column_order.append(col)
 
         # Add bank columns
-        for i in range(1, 7):
+        for i in range(1, 6):
             for suffix in ["_tof", "_d"]:
                 col = f"bank_{i}{suffix}"
                 if col in df.columns:
@@ -2185,31 +2696,82 @@ class OPERAXN(tk.Frame):
         return column_order
 
     def _save_to_excel(self, df: pd.DataFrame, filename: str) -> None:
-        """Save dataframe to Excel."""
+        """Save the scan summary plus operando echem and experiment sheets."""
+        if self.state.data_source == DataSourceType.NEUTRON:
+            df = df[self._get_neutron_column_order(df)]
+
         with pd.ExcelWriter(filename, engine=EXCEL_ENGINE) as writer:
             df.to_excel(writer, index=False, sheet_name="Scan Summary")
+            self._format_sheet(writer.sheets["Scan Summary"], df)
 
-            # Auto-adjust column widths
-            worksheet = writer.sheets["Scan Summary"]
-            for column in df:
-                column_length = max(
-                    df[column].astype(str).map(len).max(),
-                    len(column)
-                )
+            self._add_operando_echem_sheet(writer)
+            self._add_experiment_sheet(writer)
 
-                if "timestamp" in column.lower():
-                    column_length += 5
-                elif any(x in column.lower() for x in ["tof", "_d", "oned", "twod", "metadata"]):
-                    column_length = max(column_length, 20)
-
-                col_idx = df.columns.get_loc(column)
-                worksheet.column_dimensions[
-                    worksheet.cell(1, col_idx + 1).column_letter
-                ].width = min(column_length + 2, 50)
-
-            # Add statistics sheet for neutron data
             if self.state.data_source == DataSourceType.NEUTRON:
                 self._add_neutron_statistics_sheet(writer, df)
+
+    @staticmethod
+    def _format_sheet(worksheet, df: pd.DataFrame) -> None:
+        """Bold, frozen header row and readable column widths."""
+        from openpyxl.styles import Font
+        header_font = Font(bold=True)
+        for cell in worksheet[1]:
+            cell.font = header_font
+        worksheet.freeze_panes = "A2"
+
+        for column in df:
+            column_length = max(df[column].astype(str).map(len).max(), len(column))
+            col_idx = df.columns.get_loc(column)
+            worksheet.column_dimensions[
+                worksheet.cell(1, col_idx + 1).column_letter
+            ].width = min(column_length + 3, 50)
+
+    def _add_operando_echem_sheet(self, writer: pd.ExcelWriter) -> None:
+        """Full correlated operando series so the workbook is self-contained."""
+        df = self.state.echem_df
+        if df is None or df.empty:
+            return
+
+        out = pd.DataFrame({
+            "timestamp": df["timestamp"].astype(str),
+            "voltage (V)": df["echem_data"],
+        })
+        if "current" in df.columns:
+            out["current (mA)"] = df["current"]
+
+        out.to_excel(writer, index=False, sheet_name="Operando Echem")
+        self._format_sheet(writer.sheets["Operando Echem"], out)
+
+    def _add_experiment_sheet(self, writer: pd.ExcelWriter) -> None:
+        """Experiment-level metadata from the canonical NeXus file."""
+        meta = get_experiment_metadata()
+        if not meta:
+            return
+
+        rows = []
+        for key in ("title", "start_time", "end_time", "experiment_identifier",
+                    "data_source", "correlation_method", "generator",
+                    "generator_version", "total_scans"):
+            if meta.get(key) is not None:
+                rows.append({"field": key, "value": str(meta[key])})
+
+        for group in ("instrument", "sample", "user"):
+            info = meta.get(group)
+            if isinstance(info, dict):
+                if info.get("name"):
+                    rows.append({"field": group, "value": str(info["name"])})
+                source = info.get("source")
+                if group == "instrument" and isinstance(source, dict):
+                    for key in ("name", "type", "probe"):
+                        if source.get(key):
+                            rows.append({"field": f"source {key}",
+                                         "value": str(source[key])})
+
+        if not rows:
+            return
+        out = pd.DataFrame(rows)
+        out.to_excel(writer, index=False, sheet_name="Experiment")
+        self._format_sheet(writer.sheets["Experiment"], out)
 
     def _add_neutron_statistics_sheet(self, writer: pd.ExcelWriter, df: pd.DataFrame) -> None:
         """Add statistics sheet for neutron data."""
@@ -2241,7 +2803,7 @@ class OPERAXN(tk.Frame):
         tof_files = 0
         d_files = 0
 
-        for i in range(1, 7):
+        for i in range(1, 6):
             if row.get(f"bank_{i}_tof", "") != "":
                 tof_files += 1
                 measurements_available = max(measurements_available, i)
@@ -2305,6 +2867,7 @@ class OPERAXN(tk.Frame):
         # Clear UI
         for widget in self.plot_container.winfo_children():
             widget.destroy()
+        self._show_empty_state()
 
         self.file_list.update_items([])
         self.scan_selector.set_range(1, 1)
@@ -2313,8 +2876,12 @@ class OPERAXN(tk.Frame):
         self.button_panel.update_states({
             "plot_data": "disabled",
             "export_plots": "disabled",
+            "capacity_plot": "disabled",
+            "ici_analysis": "disabled",
+            "heatmap": "disabled",
             "create_gif": "disabled",
-            "export_data": "disabled"
+            "export_data": "disabled",
+            "export_nxs": "disabled"
         })
 
         self.controls.grid_remove()
@@ -2328,29 +2895,6 @@ class OPERAXN(tk.Frame):
     # ========================================================================
     # Helper Methods
     # ========================================================================
-
-    def _center_window(self, window: tk.Toplevel) -> None:
-        """Center window on screen."""
-        window.update_idletasks()
-
-        win_width = window.winfo_width()
-        win_height = window.winfo_height()
-
-        main_x = self.master.winfo_x()
-        main_y = self.master.winfo_y()
-        main_width = self.master.winfo_width()
-        main_height = self.master.winfo_height()
-
-        x = main_x + (main_width - win_width) // 2
-        y = main_y + (main_height - win_height) // 2
-
-        screen_width = window.winfo_screenwidth()
-        screen_height = window.winfo_screenheight()
-
-        x = max(0, min(x, screen_width - win_width))
-        y = max(0, min(y, screen_height - win_height))
-
-        window.geometry(f"+{x}+{y}")
 
     def _close_dialog(self, dialog: tk.Toplevel) -> None:
         """Close dialog and remove from tracking."""

@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from .config import ECHEM_TIME_TOLERANCE
+from .config import ECHEM_LOG_MIN_POINTS, ECHEM_TIME_TOLERANCE
 from .model import DataSourceType, Scan, TimeMethod
 from .classify import LOGBOOK_TIME_FORMAT, NeutronFileGrouper, NeutronMetadataParser
 
@@ -216,6 +216,7 @@ class ScanProcessor:
         # Correlate scans with echem using absolute timestamps (before formatting)
         if not combined_echem_df.empty:
             self._correlate_with_echem(scan_list, combined_echem_df)
+            self._annotate_echem_window(scan_list, combined_echem_df)
 
         # Convert display timestamps to relative HH:MM:SS strings
         if self.time_method == TimeMethod.RELATIVE and self.apply_relative_display:
@@ -258,7 +259,8 @@ class ScanProcessor:
                 echem_dfs.append(e_df)
 
         if echem_dfs:
-            combined_df = pd.concat(echem_dfs, ignore_index=True).sort_values("timestamp")
+            combined_df = (pd.concat(echem_dfs, ignore_index=True)
+                           .sort_values("timestamp").reset_index(drop=True))
             logger.info(f"Echem data: {len(combined_df)} rows")
             return combined_df
 
@@ -518,19 +520,23 @@ class ScanProcessor:
                 scan.current = None
                 scan.echem_timestamp = None
 
+    @staticmethod
+    def _parse_echem_timestamps(echem_df: pd.DataFrame) -> Optional[pd.Series]:
+        """Parse the echem timestamp column, trying the known day-first formats."""
+        for kwargs in ({}, {"format": "%d/%m/%Y %H:%M:%S.%f"},
+                       {"format": "%d/%m/%Y %H:%M:%S"}):
+            try:
+                return pd.to_datetime(echem_df["timestamp"], **kwargs)
+            except (ValueError, TypeError):
+                continue
+        logger.error("Could not parse echem timestamps")
+        return None
+
     def _correlate_absolute_time(self, scan_list: List[Scan], echem_df: pd.DataFrame) -> None:
         """Match scans to nearest echem point by absolute timestamp proximity."""
-        try:
-            echem_timestamps = pd.to_datetime(echem_df["timestamp"])
-        except (ValueError, TypeError):
-            try:
-                echem_timestamps = pd.to_datetime(echem_df["timestamp"], format='%d/%m/%Y %H:%M:%S.%f')
-            except (ValueError, TypeError):
-                try:
-                    echem_timestamps = pd.to_datetime(echem_df["timestamp"], format='%d/%m/%Y %H:%M:%S')
-                except (ValueError, TypeError):
-                    logger.error("Could not parse echem timestamps")
-                    return
+        echem_timestamps = self._parse_echem_timestamps(echem_df)
+        if echem_timestamps is None:
+            return
 
         echem_start = echem_timestamps.min()
         echem_end = echem_timestamps.max()
@@ -565,6 +571,89 @@ class ScanProcessor:
                 scan.echem = None
                 scan.current = None
                 scan.echem_timestamp = None
+
+    def _acquisition_window(self, scan: Scan) -> Tuple[Optional[pd.Timestamp],
+                                                       Optional[pd.Timestamp]]:
+        """Return (start, end) of a scan's acquisition as absolute timestamps."""
+        if self.data_source == DataSourceType.NEUTRON:
+            if not scan.neutron_start:
+                return None, None
+            start = pd.to_datetime(scan.neutron_start)
+            end = pd.to_datetime(scan.neutron_end) if scan.neutron_end else None
+            return start, end
+
+        ts = scan.original_timestamp or scan.timestamp
+        if not ts:
+            return None, None
+        try:
+            start = pd.to_datetime(ts)
+        except (ValueError, TypeError):
+            return None, None
+        if scan.exposure_time:
+            return start, start + pd.Timedelta(seconds=scan.exposure_time)
+        return start, None
+
+    def _annotate_echem_window(self, scan_list: List[Scan],
+                               echem_df: pd.DataFrame) -> None:
+        """Fill per-scan echem window summaries: voltage/current min/max,
+        0-based indices into the sorted operando arrays, and (neutron) NXlog
+        segments. Runs before the relative-display rewrite of echem_df."""
+        echem_timestamps = self._parse_echem_timestamps(echem_df)
+        if echem_timestamps is None:
+            return
+
+        # In relative mode the streams have unsynchronised clocks: shift the
+        # scan window into the echem time base with the same references the
+        # nearest-neighbour matching uses.
+        offset = pd.Timedelta(0)
+        if self.time_method == TimeMethod.RELATIVE:
+            reference_time = (self.neutron_reference_time
+                              if self.data_source == DataSourceType.NEUTRON
+                              else self.xrd_reference_time)
+            if reference_time is None or self.echem_reference_time is None:
+                return
+            offset = self.echem_reference_time - reference_time
+
+        ts_values = echem_timestamps.values
+        voltage = pd.to_numeric(echem_df["echem_data"], errors="coerce").to_numpy(dtype=float)
+        current = None
+        if "current" in echem_df.columns:
+            current = pd.to_numeric(echem_df["current"], errors="coerce").to_numpy(dtype=float)
+
+        for scan in scan_list:
+            start, end = self._acquisition_window(scan)
+            if start is None:
+                continue
+            start = start + offset
+            end = (end + offset) if end is not None else start
+
+            i0 = int(np.searchsorted(ts_values, start.to_datetime64(), side="left"))
+            i1 = int(np.searchsorted(ts_values, end.to_datetime64(), side="right"))
+            if i1 <= i0:
+                continue
+
+            scan.echem_index_start = i0
+            scan.echem_index_end = i1 - 1
+            window_v = voltage[i0:i1]
+            scan.voltage_min = float(np.nanmin(window_v))
+            scan.voltage_max = float(np.nanmax(window_v))
+            window_i = current[i0:i1] if current is not None else None
+            has_current = window_i is not None and not np.all(np.isnan(window_i))
+            if has_current:
+                scan.current_min = float(np.nanmin(window_i))
+                scan.current_max = float(np.nanmax(window_i))
+
+            if (self.data_source == DataSourceType.NEUTRON
+                    and i1 - i0 >= ECHEM_LOG_MIN_POINTS):
+                seg_ts = echem_timestamps.iloc[i0:i1]
+                segment = {
+                    "start": seg_ts.iloc[0].isoformat(),
+                    "time_s": (seg_ts - seg_ts.iloc[0]).dt.total_seconds().to_numpy(),
+                    "voltage": window_v.copy(),
+                }
+                if has_current:
+                    segment["current"] = window_i.copy()
+                scan.echem_segment = segment
 
     def _apply_relative_time(self, scan_list: List[Scan], echem_df: pd.DataFrame) -> None:
         """Replace absolute timestamps with HH:MM:SS relative strings for display."""

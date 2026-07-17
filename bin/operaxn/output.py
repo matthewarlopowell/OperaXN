@@ -1,5 +1,6 @@
 """
-Output Module for Data Visualisation
+Matplotlib plotting layer: themed figure layouts, 1D/2D/echem/neutron
+plotters with a plot-object cache, and publication-quality figure export.
 """
 
 import logging
@@ -51,14 +52,6 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Data Models and Enums
 # ============================================================================
-
-class PlotType(Enum):
-    """Available plot type identifiers."""
-    ONED = "oned"
-    TWOD = "twod"
-    ECHEM = "echem"
-    NEUTRON = "neutron"
-
 
 class LayoutType(Enum):
     """Figure layout arrangement identifiers."""
@@ -1166,15 +1159,6 @@ def export_single_scan(scan_data: Dict[str, Any], output_path: str,
 def clear_plot_cache() -> None:
     """Clear the global plot object cache."""
     _plot_cache.clear()
-
-
-def get_plot_cache_stats() -> Dict[str, Any]:
-    """Return cache size and enabled status."""
-    with _plot_cache.lock:
-        return {
-            "num_cached_objects": len(_plot_cache.cache),
-            "cache_enabled": _plot_cache.enabled
-        }
 
 
 def get_scan_time_positions(scans: List[Dict[str, Any]],

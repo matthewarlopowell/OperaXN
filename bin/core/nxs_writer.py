@@ -1,36 +1,45 @@
 """
-NeXus/HDF5 file writer for the core pipeline — schema 3.0.
+NeXus/HDF5 file writer for the core pipeline — schema 4.0.
 
-Layout follows the extended NXmonopd/NXtofnpd application definitions from the
-OperaXN perspective paper:
+Layout conforms to the custom application definitions shipped in
+definitions/ (NXoperando_monopd / NXoperando_tofnpd; validated against
+the NXDL schema by the local tests/run_nxdl_checks.py):
 
 /entry (NXentry)                      one entry for the whole experiment
+    definition = NXoperando_monopd | NXoperando_tofnpd
     title, start_time, end_time, experiment_identifier
+    program_name (@version)           generator provenance
+    process (NXprocess)               correlation provenance
     instrument (NXinstrument)         harvested + instrument profile; static
         name, source (NXsource), crystal (NXcrystal), detector (NXdetector)
         edf_metadata / synchrotron_metadata (full raw harvests, NXcollection)
-    sample (NXsample)
+    sample (NXsample)                 name + optional cell description
     user (NXuser)                     when harvestable (logbook / beamline file)
-    operando_electrochemistry (NXdata)      cycling protocol layer
-    standard_electrochemistry (NXcollection)
+    operando_electrochemistry (NXdata)      time (s, @start ISO)/voltage/current
+    standard_electrochemistry (NXenvironment)  file_NNN NXdata children
     scan_000001..scan_N (NXsubentry)  per acquisition
-        definition = NXmonopd | NXtofnpd
-        title, start_time, end_time
-        environment (NXcollection)    correlated voltage/current/timestamps
+        definition = NXmonopd | NXtofnpd (semantic pointer)
+        title, start_time, end_time (ISO 8601)
+        environment (NXenvironment)   voltage/current (+units), window
+                                      min/max, echem index pointers,
+                                      voltage_log/current_log (NXlog)
         monitor (NXmonitor)           mode/preset/integral + raw counters
         instrument                    soft link to /entry/instrument
-        data (NXdata)                 XRD: polar_angle/data/errors (+2D refs)
-        bank_N (NXdata)               neutron: time_of_flight/data/errors
-                                      + d_spacing/d_data/d_errors (kept, ext.)
+        data (NXdata)                 XRD: polar_angle/data/errors
+        image_source (NXnote)         2D image reference (+image_data NXdata
+                                      when embedding was chosen)
+        bank_N / bank_N_d (NXdata)    neutron: one group per bank and axis
+                                      family (TOF / d-spacing)
 
-Known, deliberate deviations (documented for the paper):
-- processed intensities are floats (definitions say NX_INT raw counts)
-- neutron banks keep their own TOF axes (no common-axis rebin) and d-spacing
-  patterns are stored alongside TOF — nothing is discarded
-- 2D images are stored by reference (path attributes) unless embedding was
-  chosen at generation
+Known, deliberate deviations from NXmonopd/NXtofnpd (documented in the
+definitions): processed intensities are NX_NUMBER, not NX_INT raw counts;
+neutron banks keep their own native axes — nothing is discarded.
+
+All timestamps are timezone-aware ISO 8601 (local wall time + machine
+offset), written via _iso().
 """
 
+import json
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -39,7 +48,8 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from .config import GENERATOR_NAME, GENERATOR_VERSION
+from .config import (DEFINITION_URL_BASE, DEFINITION_VERSION,
+                     ECHEM_TIME_TOLERANCE, GENERATOR_NAME, GENERATOR_VERSION)
 from .classify import extract_edf_scan_fields, parse_mantid_header
 from .correlate import EchemParser
 from .model import DataSourceType, Scan
@@ -196,24 +206,110 @@ def _decode_h5_value(value: Any) -> Any:
 
 
 # ============================================================================
+# Shared writing helpers (also used by the GUI's add-echem-after-load path)
+# ============================================================================
+
+# Mantid axis labels -> NeXus units; the raw label is kept as @x_label
+MANTID_UNIT_MAP = {
+    'Time-of-flight': 'microsecond',
+    'd-Spacing': 'angstrom',
+}
+
+# NXsource/type is an open enumeration; harvested values matching a canonical
+# item case-insensitively adopt its casing (e.g. Diamond files say
+# "Synchrotron X-Ray Source"). The verbatim harvest keeps the original.
+_SOURCE_TYPES = (
+    'Spallation Neutron Source', 'Pulsed Reactor Neutron Source',
+    'Reactor Neutron Source', 'Synchrotron X-ray Source',
+    'Pulsed Muon Source', 'Rotating Anode X-ray', 'Fixed Tube X-ray',
+    'UV Laser', 'Free-Electron Laser', 'Optical Laser', 'Ion Source',
+    'UV Plasma Source', 'Metal Jet X-ray',
+)
+_SOURCE_TYPE_CANONICAL = {t.lower(): t for t in _SOURCE_TYPES}
+
+
+def _iso(value: Any) -> Optional[str]:
+    """Timezone-aware ISO 8601 for a timestamp-like value; None if unparseable.
+    Naive input is local wall time and gets the machine's DST-aware offset."""
+    if value is None:
+        return None
+    try:
+        ts = pd.to_datetime(value)
+    except (ValueError, TypeError):
+        return None
+    if pd.isna(ts):
+        return None
+    return ts.to_pydatetime().astimezone().isoformat()
+
+
+def write_echem_series(group: h5py.Group, echem_df: pd.DataFrame) -> None:
+    """Write an EchemParser DataFrame into an NXdata group: float seconds +
+    time/@start origin (NXlog convention); an all-NaN current is omitted."""
+    timestamps = pd.to_datetime(echem_df['timestamp'])
+    start = timestamps.min()
+    time_ds = group.create_dataset(
+        'time', data=(timestamps - start).dt.total_seconds().to_numpy(dtype=float))
+    time_ds.attrs['units'] = 's'
+    time_ds.attrs['start'] = _iso(start)
+
+    voltage_ds = group.create_dataset(
+        'voltage', data=echem_df['echem_data'].to_numpy(dtype=float))
+    voltage_ds.attrs['units'] = 'V'
+
+    group.attrs['signal'] = 'voltage'
+    group.attrs['axes'] = 'time'
+    group.attrs['time_indices'] = 0
+
+    if 'current' in echem_df.columns:
+        current = pd.to_numeric(echem_df['current'], errors='coerce').to_numpy(dtype=float)
+        if not np.all(np.isnan(current)):
+            current_ds = group.create_dataset('current', data=current)
+            current_ds.attrs['units'] = 'mA'
+            group.attrs['auxiliary_signals'] = ['current']
+
+
+def write_standard_echem_group(parent: h5py.Group,
+                               datasets: List[Dict[str, Any]]) -> h5py.Group:
+    """(Re)write entry/standard_electrochemistry from parsed echem datasets
+    ('source_file' + 'data' items). Single source of truth for the layout:
+    used by NXSWriter and the GUI's add-echem-after-load path."""
+    if 'standard_electrochemistry' in parent:
+        del parent['standard_electrochemistry']
+    container = parent.create_group('standard_electrochemistry')
+    container.attrs['NX_class'] = 'NXenvironment'
+    container.attrs['num_files'] = len(datasets)
+    container.create_dataset(
+        'description', data='Additional (non-correlated) electrochemistry files')
+
+    for index, item in enumerate(datasets, start=1):
+        group = container.create_group(f'file_{index:03d}')
+        group.attrs['NX_class'] = 'NXdata'
+        group.attrs['source_file'] = str(item.get('source_file') or 'echem')
+        write_echem_series(group, item['data'])
+    return container
+
+
+# ============================================================================
 # Writer
 # ============================================================================
 
 class NXSWriter:
-    """Writes the canonical schema-3.0 NeXus/HDF5 file."""
+    """Writes the canonical schema-4.0 NeXus/HDF5 file."""
 
     def __init__(self, data_source: DataSourceType = DataSourceType.INHOUSE,
                  include_2d_images: bool = False,
                  max_display_size: int = 0,
                  correlation_method: str = "absolute",
                  title: Optional[str] = None,
-                 sample_name: Optional[str] = None):
+                 sample_name: Optional[str] = None,
+                 sample_description: Optional[str] = None):
         self.data_source = data_source
         self.include_2d_images = include_2d_images
         self.max_display_size = max_display_size  # 0 = full resolution
         self.correlation_method = correlation_method
         self.title = title
         self.sample_name = sample_name
+        self.sample_description = sample_description
         self.echem_parser = EchemParser()
 
     # --- top level ---
@@ -227,19 +323,29 @@ class NXSWriter:
         with h5py.File(output_path, 'w') as f:
             f.attrs['NX_class'] = 'NXroot'
             f.attrs['file_name'] = os.path.basename(output_path)
-            f.attrs['file_time'] = pd.Timestamp.now().isoformat()
+            f.attrs['file_time'] = _iso(pd.Timestamp.now())
+            f.attrs['default'] = 'entry'
 
             entry = f.create_group('entry')
             entry.attrs['NX_class'] = 'NXentry'
-            entry.attrs['data_source'] = self.data_source.value
-            entry.attrs['correlation_method'] = self.correlation_method
-            entry.attrs['generator'] = GENERATOR_NAME
-            entry.attrs['generator_version'] = GENERATOR_VERSION
-            entry.attrs['total_scans'] = len(scans)
-            entry.attrs['twod_included'] = self.include_2d_images
-            if self.include_2d_images and self.max_display_size > 0:
-                entry.attrs['twod_max_display_size'] = self.max_display_size
 
+            definition = ('NXoperando_tofnpd'
+                          if self.data_source == DataSourceType.NEUTRON
+                          else 'NXoperando_monopd')
+            def_ds = entry.create_dataset('definition', data=definition)
+            def_ds.attrs['version'] = DEFINITION_VERSION
+            def_ds.attrs['URL'] = f'{DEFINITION_URL_BASE}{definition}.nxdl.xml'
+
+            prog_ds = entry.create_dataset('program_name', data=GENERATOR_NAME)
+            prog_ds.attrs['version'] = GENERATOR_VERSION
+            prog_ds.attrs['configuration'] = json.dumps({
+                'data_source': self.data_source.value,
+                'correlation_method': self.correlation_method,
+                'include_2d_images': self.include_2d_images,
+                'max_display_size': self.max_display_size,
+            })
+
+            self._write_process(entry, scans)
             self._write_entry_fields(entry, scans, harvest)
             self._write_instrument(entry, scans, harvest)
             self._write_sample(entry, harvest)
@@ -294,6 +400,27 @@ class NXSWriter:
         merged = {**profile, **{k: v for k, v in harvested.items() if v is not None}}
         return merged
 
+    def _write_process(self, entry: h5py.Group, scans: List[Scan]) -> None:
+        """NXprocess with correlation provenance (entry attrs in schema v3)."""
+        process = entry.create_group('process')
+        process.attrs['NX_class'] = 'NXprocess'
+        process.create_dataset('program', data=GENERATOR_NAME)
+        process.create_dataset('version', data=GENERATOR_VERSION)
+        process.create_dataset('date', data=_iso(pd.Timestamp.now()))
+        process.create_dataset('data_source', data=self.data_source.value)
+        process.create_dataset('correlation_method', data=self.correlation_method)
+        tolerance = process.create_dataset('echem_time_tolerance',
+                                           data=float(ECHEM_TIME_TOLERANCE))
+        tolerance.attrs['units'] = 's'
+        process.create_dataset('total_scans', data=len(scans))
+        # 2D options only apply to the XRD definitions; NXoperando_tofnpd
+        # does not declare them
+        if self.data_source != DataSourceType.NEUTRON:
+            process.create_dataset('twod_included', data=self.include_2d_images)
+            if self.include_2d_images and self.max_display_size > 0:
+                process.create_dataset('twod_max_display_size',
+                                       data=self.max_display_size)
+
     def _write_entry_fields(self, entry: h5py.Group, scans: List[Scan],
                             harvest: Dict[str, Any]) -> None:
         """Entry title, time window, and identifier (user values win)."""
@@ -301,11 +428,14 @@ class NXSWriter:
                  or 'operando diffraction experiment')
         entry.create_dataset('title', data=str(title))
 
-        timestamps = [s.timestamp for s in scans if s.timestamp]
+        timestamps = [s.original_timestamp or s.timestamp for s in scans
+                      if (s.original_timestamp or s.timestamp)]
         if timestamps:
-            entry.create_dataset('start_time', data=str(min(timestamps)))
+            start = min(timestamps)
+            entry.create_dataset('start_time', data=_iso(start) or str(start))
             ends = [s.neutron_end for s in scans if s.neutron_end]
-            entry.create_dataset('end_time', data=str(max(ends) if ends else max(timestamps)))
+            end = max(ends) if ends else max(timestamps)
+            entry.create_dataset('end_time', data=_iso(end) or str(end))
 
         identifier = harvest.get('proposal') or harvest.get('experiment_identifier')
         if identifier:
@@ -316,12 +446,17 @@ class NXSWriter:
         """NXinstrument: source, crystal, detector, and raw-harvest collections."""
         inst = entry.create_group('instrument')
         inst.attrs['NX_class'] = 'NXinstrument'
+        # NeXus linking convention: the linked-to object names its own path
+        # so consumers can tell the original from the per-scan soft links
+        inst.attrs['target'] = '/entry/instrument'
         inst.create_dataset('name', data=str(harvest.get('instrument_name', 'unknown')))
 
         source = inst.create_group('source')
         source.attrs['NX_class'] = 'NXsource'
         source.create_dataset('name', data=str(harvest.get('source_name', 'unknown')))
-        source.create_dataset('type', data=str(harvest.get('source_type', 'unknown')))
+        source_type = str(harvest.get('source_type', 'unknown'))
+        source.create_dataset(
+            'type', data=_SOURCE_TYPE_CANONICAL.get(source_type.lower(), source_type))
         source.create_dataset('probe', data=str(harvest.get('probe', 'x-ray')))
 
         # NXcrystal wavelength (monochromatic sources); EDF stores metres
@@ -343,16 +478,28 @@ class NXSWriter:
         detector.attrs['NX_class'] = 'NXdetector'
         detector_fields = {
             'description': harvest.get('detector_model'),
-            'distance': harvest.get('distance_m') or harvest.get('detector_distance'),
+            # EDF SampleDistance only: the synchrotron detector_distance
+            # carries no unit at source, so the typed NX_LENGTH slot stays
+            # empty (the verbatim value remains in synchrotron_metadata)
+            'distance': harvest.get('distance_m'),
             'x_pixel_size': harvest.get('x_pixel_size_m'),
             'y_pixel_size': harvest.get('y_pixel_size_m'),
             'beam_center_x': harvest.get('beam_center_x'),
             'beam_center_y': harvest.get('beam_center_y'),
         }
+        detector_units = {
+            'distance': 'm',
+            'x_pixel_size': 'm',
+            'y_pixel_size': 'm',
+            'beam_center_x': 'pixel',
+            'beam_center_y': 'pixel',
+        }
         for name, value in detector_fields.items():
             if value is not None:
                 try:
-                    detector.create_dataset(name, data=float(value))
+                    ds = detector.create_dataset(name, data=float(value))
+                    if detector_units.get(name):
+                        ds.attrs['units'] = detector_units[name]
                 except (ValueError, TypeError):
                     detector.create_dataset(name, data=str(value))
 
@@ -380,6 +527,8 @@ class NXSWriter:
         name = (self.sample_name or harvest.get('comment')
                 or harvest.get('run_title') or 'unknown')
         sample.create_dataset('name', data=str(name))
+        if self.sample_description:
+            sample.create_dataset('description', data=str(self.sample_description))
 
     @staticmethod
     def _write_user(entry: h5py.Group, harvest: Dict[str, Any]) -> None:
@@ -413,11 +562,17 @@ class NXSWriter:
 
         # start_time is the acquisition start; for neutron scans the display
         # timestamp is the logbook midpoint and lives in environment instead
-        start = scan.neutron_start or scan.timestamp
+        start = scan.neutron_start or scan.original_timestamp or scan.timestamp
         if start:
-            sub.create_dataset('start_time', data=str(start))
-        if scan.neutron_end:
-            sub.create_dataset('end_time', data=str(scan.neutron_end))
+            sub.create_dataset('start_time', data=_iso(start) or str(start))
+        end = scan.neutron_end
+        if end is None and start and scan.exposure_time:
+            try:
+                end = pd.to_datetime(start) + pd.Timedelta(seconds=scan.exposure_time)
+            except (ValueError, TypeError):
+                end = None
+        if end is not None:
+            sub.create_dataset('end_time', data=_iso(end) or str(end))
 
         # Instrument: linked, not copied
         sub['instrument'] = h5py.SoftLink('/entry/instrument')
@@ -431,27 +586,60 @@ class NXSWriter:
         if scan.neutron_files:
             self._write_neutron_banks(sub, scan, reader_factory)
 
-    @staticmethod
-    def _write_environment(sub: h5py.Group, scan: Scan) -> None:
+    @classmethod
+    def _write_environment(cls, sub: h5py.Group, scan: Scan) -> None:
         """Electrochemical state at acquisition time (the operando extension)."""
         env = sub.create_group('environment')
-        env.attrs['NX_class'] = 'NXcollection'
+        env.attrs['NX_class'] = 'NXenvironment'
 
-        if scan.timestamp:
-            env.create_dataset('scan_timestamp', data=str(scan.timestamp))
-        if scan.echem is not None:
-            env.create_dataset('voltage (V)', data=scan.echem)
-        if scan.current is not None:
-            env.create_dataset('current (mA)', data=scan.current)
-        if scan.echem_timestamp:
-            env.create_dataset('voltage_timestamp', data=str(scan.echem_timestamp))
-        if scan.timestamp_for_correlation is not None:
-            env.create_dataset('midpoint_adjusted_timestamp',
-                               data=str(scan.timestamp_for_correlation))
-        if scan.exposure_time is not None:
-            env.create_dataset('exposure_time', data=scan.exposure_time)
+        def scalar(name: str, value: Optional[float], units: str) -> None:
+            if value is None:
+                return
+            ds = env.create_dataset(name, data=float(value))
+            ds.attrs['units'] = units
+
+        def date(name: str, value: Any) -> None:
+            iso = _iso(value)
+            if iso:
+                env.create_dataset(name, data=iso)
+
+        date('scan_timestamp', scan.original_timestamp or scan.timestamp)
+        scalar('voltage', scan.echem, 'V')
+        scalar('current', scan.current, 'mA')
+        scalar('voltage_min', scan.voltage_min, 'V')
+        scalar('voltage_max', scan.voltage_max, 'V')
+        scalar('current_min', scan.current_min, 'mA')
+        scalar('current_max', scan.current_max, 'mA')
+        date('voltage_timestamp', scan.echem_timestamp)
+        date('midpoint_adjusted_timestamp', scan.timestamp_for_correlation)
+        scalar('exposure_time', scan.exposure_time, 's')
+        # File names use first/last: "_end" is a reserved NeXus suffix
+        if scan.echem_index_start is not None:
+            env.create_dataset('echem_index_first', data=int(scan.echem_index_start))
+        if scan.echem_index_end is not None:
+            env.create_dataset('echem_index_last', data=int(scan.echem_index_end))
         if scan.logbook and scan.logbook.get('full_line'):
             env.create_dataset('logbook_entry', data=str(scan.logbook['full_line']))
+
+        segment = scan.echem_segment
+        if segment:
+            cls._write_nxlog(env, 'voltage_log', segment, segment['voltage'], 'V')
+            if segment.get('current') is not None:
+                cls._write_nxlog(env, 'current_log', segment,
+                                 segment['current'], 'mA')
+
+    @staticmethod
+    def _write_nxlog(env: h5py.Group, name: str, segment: Dict[str, Any],
+                     values: Any, value_units: str) -> None:
+        """NXlog with float-second time (+@start ISO origin) and value arrays."""
+        log = env.create_group(name)
+        log.attrs['NX_class'] = 'NXlog'
+        time_ds = log.create_dataset(
+            'time', data=np.asarray(segment['time_s'], dtype=float))
+        time_ds.attrs['units'] = 's'
+        time_ds.attrs['start'] = _iso(segment['start'])
+        value_ds = log.create_dataset('value', data=np.asarray(values, dtype=float))
+        value_ds.attrs['units'] = value_units
 
     def _write_monitor(self, sub: h5py.Group, scan: Scan) -> None:
         """Beam monitor record: EDF counters when available, timer fallback."""
@@ -464,7 +652,8 @@ class NXSWriter:
 
         monitor.create_dataset('mode', data='timer')
         if scan.exposure_time is not None:
-            monitor.create_dataset('preset', data=float(scan.exposure_time))
+            preset = monitor.create_dataset('preset', data=float(scan.exposure_time))
+            preset.attrs['units'] = 's'
 
         # Best available integral: first positive counter in preference order
         integral = None
@@ -474,7 +663,8 @@ class NXSWriter:
                 integral = float(val)
                 break
         if integral is not None:
-            monitor.create_dataset('integral', data=integral)
+            integral_ds = monitor.create_dataset('integral', data=integral)
+            integral_ds.attrs['units'] = 'counts'
 
         # Keep every raw counter — nothing harvested is discarded
         for key, val in counters.items():
@@ -485,157 +675,142 @@ class NXSWriter:
 
     def _write_xrd_data(self, sub: h5py.Group, scan: Scan,
                         reader_factory: DataReaderFactory) -> None:
-        """NXdata with the 1D pattern (plus errors) and the 2D image layer."""
-        data_group = sub.create_group('data')
-        data_group.attrs['NX_class'] = 'NXdata'
-
+        """NXdata with the 1D pattern (plus errors); 2D image at subentry level."""
         if scan.oned:
+            data_group = sub.create_group('data')
+            data_group.attrs['NX_class'] = 'NXdata'
             try:
                 arr = reader_factory.read_file(scan.oned)
-                data_group.create_dataset('polar_angle', data=arr[:, 0])
+                angle_ds = data_group.create_dataset('polar_angle', data=arr[:, 0])
+                angle_ds.attrs['units'] = 'degrees'
                 data_group.create_dataset('data', data=arr[:, 1])
                 if arr.shape[1] >= 3:
                     data_group.create_dataset('errors', data=arr[:, 2])
                 data_group.attrs['signal'] = 'data'
                 data_group.attrs['axes'] = 'polar_angle'
-                data_group.attrs['oned_source_file'] = os.path.basename(scan.oned)
+                data_group.attrs['polar_angle_indices'] = 0
             except Exception as e:
                 logger.error(f"Error reading 1D data for scan {scan.scan_num}: {e}")
-                data_group.attrs['oned_source_file'] = os.path.basename(scan.oned)
+            data_group.attrs['oned_source_file'] = os.path.basename(scan.oned)
 
         if scan.twod:
-            self._write_2d_data(data_group, scan)
+            self._write_2d_data(sub, scan)
 
-    def _write_2d_data(self, data_group: h5py.Group, scan: Scan) -> None:
-        """Embed or reference the 2D detector image depending on configuration."""
+    def _write_2d_data(self, sub: h5py.Group, scan: Scan) -> None:
+        """Reference the source 2D detector image (image_source NXnote) and
+        embed a copy in image_data when embedding was chosen."""
         twod_path = str(scan.twod)
         basename = os.path.basename(twod_path)
         ext = os.path.splitext(basename)[1].lower()
+        mime = {'.hdf': 'application/x-hdf5',
+                '.edf': 'application/x-esrf-edf'}.get(ext)
 
-        is_hdf = (ext == ".hdf")
-        is_edf = (ext == ".edf")
-
-        data_group.attrs["twod_source"] = basename
-        data_group.attrs["twod_source_path"] = twod_path
-        data_group.attrs["twod_is_hdf"] = is_hdf
-        data_group.attrs["twod_is_edf"] = is_edf
-
-        if self.max_display_size > 0:
-            data_group.attrs["twod_max_display_size"] = self.max_display_size
-        else:
-            data_group.attrs["twod_max_display_size"] = "full_resolution"
+        note = sub.create_group('image_source')
+        note.attrs['NX_class'] = 'NXnote'
+        note.create_dataset('file_name', data=twod_path)
+        if mime:
+            note.create_dataset('type', data=mime)
+        note.create_dataset('description',
+                            data=f'2D detector image {basename}')
+        note.create_dataset('max_display_size', data=int(self.max_display_size))
 
         if not self.include_2d_images:
-            data_group.attrs["twod_embedded"] = False
+            note.create_dataset('embedded', data=False)
             return
 
         try:
-            if is_hdf:
+            if ext == '.hdf':
                 hdf_reader = HDFReader(max_display_size=self.max_display_size)
                 data_2d = hdf_reader.read(twod_path)
-                data_group.attrs["twod_original_shape"] = hdf_reader.original_shape
+                original_shape = hdf_reader.original_shape
             else:
                 data_2d = DataReaderFactory.read_file(twod_path)
-                data_group.attrs["twod_original_shape"] = data_2d.shape
+                original_shape = data_2d.shape
 
-            data_group.create_dataset("twod_image", data=data_2d)
-            data_group.attrs["twod_embedded"] = True
+            image = sub.create_group('image_data')
+            image.attrs['NX_class'] = 'NXdata'
+            image.attrs['signal'] = 'data'
+            image_ds = image.create_dataset('data', data=data_2d)
+            image_ds.attrs['interpretation'] = 'image'
+            note.create_dataset('original_shape',
+                                data=np.asarray(original_shape, dtype=np.int64))
+            note.create_dataset('embedded', data=True)
 
         except Exception as e:
             logger.error(f"Error embedding 2D data for scan {scan.scan_num}: {e}")
-            data_group.attrs["twod_embedded"] = False
+            note.create_dataset('embedded', data=False)
 
     def _write_neutron_banks(self, sub: h5py.Group, scan: Scan,
                              reader_factory: DataReaderFactory) -> None:
-        """Per-bank NXdata groups. Banks keep their own TOF axes and d-spacing
-        patterns are stored alongside TOF (keep-all-data extension)."""
+        """One NXdata per bank and axis family: bank_N (native TOF) plus
+        bank_N_d (d-spacing) — keep-all-data, one axis family per group."""
         for meas_num, meas_files in scan.neutron_files.items():
-            bank = sub.create_group(f'bank_{meas_num}')
-            bank.attrs['NX_class'] = 'NXdata'
-            bank.attrs['measurement_number'] = meas_num
-
-            for key, (x_name, y_name, e_name) in {
-                'tof': ('time_of_flight', 'data', 'errors'),
-                'd': ('d_spacing', 'd_data', 'd_errors'),
+            for key, (suffix, x_name) in {
+                'tof': ('', 'time_of_flight'),
+                'd': ('_d', 'd_spacing'),
             }.items():
                 if key not in meas_files:
                     continue
                 path = meas_files[key]
+                bank = sub.create_group(f'bank_{meas_num}{suffix}')
+                bank.attrs['NX_class'] = 'NXdata'
+                # grouper keys are strings; the schema wants NX_INT
+                bank.attrs['measurement_number'] = (
+                    int(meas_num) if str(meas_num).isdigit() else meas_num)
+                bank.attrs['source_file'] = os.path.basename(path)
                 try:
                     arr = reader_factory.read_file(path, is_neutron=True)
                     x_ds = bank.create_dataset(x_name, data=arr[:, 0])
-                    bank.create_dataset(y_name, data=arr[:, 1])
+                    bank.create_dataset('data', data=arr[:, 1])
                     if arr.shape[1] >= 3:
-                        bank.create_dataset(e_name, data=arr[:, 2])
+                        bank.create_dataset('errors', data=arr[:, 2])
 
                     header = parse_mantid_header(path)
-                    if header.get('x_unit'):
-                        x_ds.attrs['units'] = header['x_unit']
+                    label = header.get('x_unit')
+                    if label:
+                        # Mantid exports axis labels, not units
+                        x_ds.attrs['units'] = MANTID_UNIT_MAP.get(label, label)
+                        bank.attrs['x_label'] = label
                     if header.get('spectrum') is not None:
-                        bank.attrs[f'{key}_spectrum'] = header['spectrum']
+                        bank.attrs['spectrum'] = header['spectrum']
                     if header.get('y_unit'):
-                        bank.attrs[f'{key}_y_unit'] = header['y_unit']
+                        bank.attrs['y_unit'] = header['y_unit']
+                    bank.attrs['signal'] = 'data'
+                    bank.attrs['axes'] = x_name
                 except Exception as e:
                     logger.error(f"Error reading {key} data: {e}")
-                bank.attrs[f'{key}_source_file'] = os.path.basename(path)
-
-            if 'time_of_flight' in bank:
-                bank.attrs['signal'] = 'data'
-                bank.attrs['axes'] = 'time_of_flight'
 
     # --- electrochemistry layers ---
 
     @staticmethod
     def _write_operando_echem(entry: h5py.Group, echem_df: pd.DataFrame) -> None:
-        """Full cycling protocol as parallel timestamp/voltage/current arrays."""
+        """Full cycling protocol: time (s, @start ISO) / voltage / current."""
         if echem_df is None or echem_df.empty:
             return
 
         echem_group = entry.create_group('operando_electrochemistry')
         echem_group.attrs['NX_class'] = 'NXdata'
-
-        # Use .to_numpy(dtype=object) to avoid PyArrow-backed arrays in pandas >= 3.0
-        timestamps = echem_df['timestamp'].astype(str).to_numpy(dtype=object)
-        echem_group.create_dataset('timestamps', data=timestamps)
-        echem_group.create_dataset('voltage (V)',
-                                   data=echem_df['echem_data'].to_numpy(dtype=float))
-
-        if 'current' in echem_df.columns:
-            current_values = echem_df['current'].to_numpy(dtype=float)
-            echem_group.create_dataset('current (mA)', data=current_values)
+        write_echem_series(echem_group, echem_df)
+        entry.attrs['default'] = 'operando_electrochemistry'
 
     def _write_standard_echem(self, entry: h5py.Group,
                               standard_echem_files: Optional[List[str]]) -> None:
-        """Parse and store each additional echem file as a file_N dataset."""
+        """Parse and store each additional echem file as a file_NNN NXdata."""
         if not standard_echem_files:
             return
 
-        std_echem_container = entry.create_group('standard_electrochemistry')
-        std_echem_container.attrs['NX_class'] = 'NXcollection'
-        std_echem_container.attrs['num_files'] = len(standard_echem_files)
-
-        for idx, std_echem_path in enumerate(standard_echem_files, start=1):
+        datasets = []
+        for std_echem_path in standard_echem_files:
             if not os.path.isfile(std_echem_path):
                 continue
-
             standard_echem_df = self.echem_parser.parse(std_echem_path)
             if standard_echem_df is None or standard_echem_df.empty:
                 continue
+            datasets.append({'source_file': os.path.basename(std_echem_path),
+                             'data': standard_echem_df})
+            logger.info(f"Added standard electrochemistry file"
+                        f" {os.path.basename(std_echem_path)}"
+                        f" ({len(standard_echem_df)} points)")
 
-            group_name = f'file_{idx:03d}'
-            std_group = std_echem_container.create_group(group_name)
-            std_group.attrs['NX_class'] = 'NXdata'
-            std_group.attrs['source_file'] = os.path.basename(std_echem_path)
-
-            std_timestamps = standard_echem_df['timestamp'].astype(str).to_numpy(dtype=object)
-            std_group.create_dataset('timestamps', data=std_timestamps)
-            std_group.create_dataset('voltage (V)',
-                                     data=standard_echem_df['echem_data'].to_numpy(dtype=float))
-
-            if 'current' in standard_echem_df.columns:
-                current_vals = standard_echem_df['current'].to_numpy(dtype=float)
-                if not np.all(np.isnan(current_vals)):
-                    std_group.create_dataset('current (mA)', data=current_vals)
-
-            logger.info(f"Added standard electrochemistry file {idx}:"
-                        f" {os.path.basename(std_echem_path)} ({len(standard_echem_df)} points)")
+        if datasets:
+            write_standard_echem_group(entry, datasets)

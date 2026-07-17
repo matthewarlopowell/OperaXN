@@ -1,5 +1,10 @@
 """
-OperaXN - __init__.py
+OperaXN — operando diffraction visualisation with NeXus-canonical storage.
+
+The GUI (this package) is a thin layer over the shared `core` pipeline:
+every raw-data upload is generated into a canonical .nxs file and the
+interface works entirely from that file; opening a .nxs directly skips
+generation. See the `core` package for the pipeline itself.
 """
 
 from .config import APP_VERSION, APP_AUTHOR, SUPPORT_EMAIL
@@ -29,12 +34,24 @@ from .config import (
 
 from .gui import OPERAXN, UIState, VisualiserConfig
 
+from .capacity import (
+    classify_phases,
+    assign_cycles,
+    compute_capacity,
+    plot_capacity_vs_voltage,
+    plot_time_vs_voltage
+)
+
+from .heatmap import HeatmapWindow
+from .ici import ICIWindow
+
 from .input import (
     process_paths,
     make_oned_arrays,
     make_twod_arrays,
     make_echem_arrays,
     get_correlated_data,
+    add_standard_echem_files,
     FileType,
     DataType,
     TimeMethod
@@ -53,7 +70,7 @@ from .output import (
 )
 
 from .dialog import (
-    DataSourceSelectionDialog,
+    UploadOptionsDialog,
     PlotSettingsDialog,
     ExportOptionsDialog,
     GIFSettingsDialog,
@@ -76,6 +93,7 @@ __all__ = [
     'make_twod_arrays',
     'make_echem_arrays',
     'get_correlated_data',
+    'add_standard_echem_files',
     'get_scan_time_positions',
 
     # Plotting
@@ -87,8 +105,17 @@ __all__ = [
     'export_single_scan',
     'clear_plot_cache',
 
+    # Echem analysis
+    'classify_phases',
+    'assign_cycles',
+    'compute_capacity',
+    'plot_capacity_vs_voltage',
+    'plot_time_vs_voltage',
+    'ICIWindow',
+    'HeatmapWindow',
+
     # Dialogs
-    'DataSourceSelectionDialog',
+    'UploadOptionsDialog',
     'PlotSettingsDialog',
     'ExportOptionsDialog',
     'GIFSettingsDialog',
@@ -117,20 +144,3 @@ __all__ = [
     'PARALLEL_PROCESSING',
     'MAX_CACHE_SIZE_MB',
 ]
-
-
-def get_version():
-    """Get the current version of OperaXN."""
-    return __version__
-
-
-def get_system_info():
-    """Get system information for debugging."""
-    return {
-        'app_name': APP_NAME,
-        'version': __version__,
-        'cache_enabled': CACHE_ENABLED,
-        'parallel_processing': PARALLEL_PROCESSING,
-        'max_cache_mb': MAX_CACHE_SIZE_MB,
-        'debug_mode': DEBUG_MODE
-    }

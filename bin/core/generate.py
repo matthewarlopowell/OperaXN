@@ -19,6 +19,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from . import config as _config
 from .config import (
     BATCH_SIZE,
     MAX_WORKERS,
@@ -363,7 +364,8 @@ def generate(input_paths: List[str],
              progress_callback: ProgressCallback = None,
              time_method: TimeMethod = TimeMethod.ABSOLUTE,
              title: Optional[str] = None,
-             sample_name: Optional[str] = None) -> Tuple[bool, List[str]]:
+             sample_name: Optional[str] = None,
+             sample_description: Optional[str] = None) -> Tuple[bool, List[str]]:
     """Full pipeline: raw paths -> canonical .nxs file at output_path.
 
     Returns (success, messages)."""
@@ -393,14 +395,44 @@ def generate(input_paths: List[str],
                                max_display_size=max_display_size,
                                correlation_method=time_method.value,
                                title=title,
-                               sample_name=sample_name)
+                               sample_name=sample_name,
+                               sample_description=sample_description)
             writer.write(output_path, scans, echem_df, std_files)
+
+        if _config.USE_PYNXTOOLS_WRITER:
+            _revalidate_with_pynxtools(output_path, data_source)
 
         return True, messages if messages else ["NeXus file generated successfully"]
 
     except Exception as e:
         logger.exception("Error generating NeXus file")
         return False, [f"Error: {e}"]
+
+
+def _revalidate_with_pynxtools(output_path: str,
+                               data_source: DataSourceType) -> None:
+    """Best-effort rewrite through the pynxtools dataconverter (validates
+    against the NXoperando_* definitions). Any failure is logged and the
+    plain NXSWriter file is kept — the GUI never breaks on this path."""
+    tmp_out = output_path + ".pynx.nxs"
+    try:
+        from pynxtools_operaxn.reader import ensure_definitions_installed
+        from pynxtools.dataconverter.convert import convert
+
+        ensure_definitions_installed()
+        nxdl = ('NXoperando_tofnpd' if data_source == DataSourceType.NEUTRON
+                else 'NXoperando_monopd')
+        convert(input_file=(output_path,), reader='operaxn', nxdl=nxdl,
+                output=tmp_out)
+        os.replace(tmp_out, output_path)
+        logger.info(f"Output validated and rewritten by pynxtools ({nxdl})")
+    except Exception as e:
+        logger.warning(f"pynxtools validation pass skipped: {e}")
+        if os.path.isfile(tmp_out):
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
 
 
 def cache_dir() -> str:

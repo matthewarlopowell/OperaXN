@@ -88,6 +88,18 @@ class Scan:
     timestamp_for_correlation: Optional[pd.Timestamp] = None
     # Harvested logbook extras (run_title, users, proposal, full_line)
     logbook: Optional[Dict[str, Any]] = None
+    # Echem summary over the acquisition window [start, end]
+    voltage_min: Optional[float] = None
+    voltage_max: Optional[float] = None
+    current_min: Optional[float] = None
+    current_max: Optional[float] = None
+    # 0-based positional window into the operando echem arrays (inclusive end)
+    echem_index_start: Optional[int] = None
+    echem_index_end: Optional[int] = None
+    # Echem stream segment spanning the window (long acquisitions):
+    # {"start": iso_str, "time_s": ndarray, "voltage": ndarray,
+    #  "current": Optional[ndarray]}
+    echem_segment: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert scan to plain dictionary (consumed by the visualiser GUI)."""
@@ -109,6 +121,12 @@ class Scan:
             "neutron_end": self.neutron_end,
             "source_nxs": self.source_nxs,
             "timestamp_for_correlation": self.timestamp_for_correlation,
+            "voltage_min": self.voltage_min,
+            "voltage_max": self.voltage_max,
+            "current_min": self.current_min,
+            "current_max": self.current_max,
+            "echem_index_start": self.echem_index_start,
+            "echem_index_end": self.echem_index_end,
         }
 
 
@@ -127,6 +145,13 @@ class ScanData:
     echem: Optional[float] = None            # voltage (V)
     current: Optional[float] = None          # current (mA)
     echem_timestamp: Optional[str] = None
+    # Echem summary over the acquisition window, when present in the file
+    voltage_min: Optional[float] = None
+    voltage_max: Optional[float] = None
+    current_min: Optional[float] = None
+    current_max: Optional[float] = None
+    echem_index_start: Optional[int] = None
+    echem_index_end: Optional[int] = None
     # 1D XRD: {"x": ndarray, "y": ndarray, "e": ndarray?, "source": str} or None
     oned: Optional[Dict[str, Any]] = None
     # 2D XRD: embedded image array, or None

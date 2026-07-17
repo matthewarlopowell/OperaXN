@@ -6,7 +6,12 @@ file (`generate`), and the GUI runs purely by interpreting that file
 (`nxs_reader.load`). Uploading a .nxs directly skips generation. One read path.
 """
 
-from .config import ECHEM_TIME_TOLERANCE
+from .config import (
+    ECHEM_TIME_TOLERANCE,
+    GENERATOR_NAME,
+    GENERATOR_VERSION,
+    SYNCHROTRON_MAX_DISPLAY_SIZE,
+)
 from .model import (
     DataSourceType,
     DataType,
@@ -46,10 +51,12 @@ from .correlate import (
     format_relative_time,
     parse_relative_time,
 )
-from .nxs_writer import NXSWriter
+from .nxs_writer import NXSWriter, write_standard_echem_group
 from .nxs_reader import is_canonical_nxs, load
 from .generate import (
     FileProcessor,
+    cache_dir,
+    convert_tabular_to_txt,
     default_cache_path,
     generate,
     process_raw,
@@ -71,9 +78,11 @@ __all__ = [
     # Correlation
     'EchemParser', 'ScanProcessor', 'format_relative_time', 'parse_relative_time',
     # NeXus I/O
-    'NXSWriter', 'is_canonical_nxs', 'load',
+    'NXSWriter', 'write_standard_echem_group', 'is_canonical_nxs', 'load',
     # Pipeline
-    'FileProcessor', 'default_cache_path', 'generate', 'process_raw', 'validate',
+    'FileProcessor', 'cache_dir', 'convert_tabular_to_txt',
+    'default_cache_path', 'generate', 'process_raw', 'validate',
     # Config
-    'ECHEM_TIME_TOLERANCE',
+    'ECHEM_TIME_TOLERANCE', 'GENERATOR_NAME', 'GENERATOR_VERSION',
+    'SYNCHROTRON_MAX_DISPLAY_SIZE',
 ]

@@ -14,10 +14,24 @@ import multiprocessing
 GENERATOR_NAME = "operaxn-core"
 GENERATOR_VERSION = "2.0.0"
 
+# --- NeXus application definitions ---
+# Custom definitions shipped in definitions/ (schema v4 layout).
+
+DEFINITION_VERSION = "1.0"
+DEFINITION_URL_BASE = ("https://github.com/matthewarlopowell/OperaXN/"
+                       "blob/main/definitions/")
+
+# Route generated files through the pynxtools dataconverter (validating them
+# against the NXoperando_* definitions at write time). Requires pynxtools
+# with an 'operaxn' reader registered; when anything is missing or fails the
+# plain NXSWriter file is kept, so the GUI never breaks.
+USE_PYNXTOOLS_WRITER = False
+
 # --- Correlation ---
 
 ECHEM_TIME_TOLERANCE = 300  # seconds, echem-to-scan nearest-neighbour matching
 MAX_EXPOSURE_TIME = 3600  # seconds, reject computed exposures above this
+ECHEM_LOG_MIN_POINTS = 2  # min echem points in a scan window to emit an NXlog
 
 # --- Scan identification ---
 

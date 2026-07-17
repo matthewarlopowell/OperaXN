@@ -2,29 +2,39 @@
 
 **OPERAndo X-ray and Neutron diffraction data visualisation tool**
 
-**OperaXN** is a Python-based desktop application for correlating, visualising and analysing *operando* diffraction data collected by laboratory XRD, synchrotron XRD or neutron diffraction sources. It also includes **Nexus Generator**, a companion tool for generating standardised NeXus (`.nxs`) files from raw electrochemical and diffraction data to facilitate easy data sharing in machine-readable formats.
+**OperaXN** is a Python desktop application for correlating, visualising and
+analysing *operando* diffraction data collected at laboratory XRD, synchrotron
+XRD or neutron diffraction sources. Raw diffraction and electrochemistry files
+are time-correlated and consolidated into a single standardised NeXus (`.nxs`)
+file — the canonical record of the experiment — which OperaXN then visualises
+and analyses. The same file can be shared, re-opened directly, and read by any
+HDF5/NeXus tool.
 
 ## Features
 
-### OperaXN
-- Automated time-correlation of electrochemical (voltage and current) and diffraction datasets
-- Simultaneous visualisation of X-ray (1D and 2D) and neutron diffraction data with electrochemical cycling
-- Interactive GUI with scan navigation and visualisation controls
-- Export publication-quality figures (PNG, PDF, SVG)
-- Generate animated GIFs
-- Currently supports `.dat`, `.xy`, `.edf`, `.hdf`, `.nxs`, `.txt`, and `.zip` files
+- Automated time-correlation of electrochemical (voltage/current) and
+  diffraction datasets, by absolute timestamp or elapsed time
+- Generation of schema-compliant NeXus files conforming to the
+  `NXoperando_monopd` / `NXoperando_tofnpd` application definitions
+  (see [definitions/](definitions)) — including per-scan electrochemical
+  state (correlated voltage/current, acquisition-window min/max, optional
+  per-scan logs) alongside the full cycling record
+- Simultaneous visualisation of X-ray (1D and 2D) and neutron (per-bank
+  TOF/d-spacing) diffraction data with electrochemical cycling
+- Operando heatmap (stacked patterns vs scan/time with the voltage track),
+  capacity analysis, and ICI (intermittent current interruption) analysis
+- Export publication-quality figures (PNG, PDF, SVG), animated GIFs, and
+  Excel summaries
+- Supports `.dat`, `.xy`, `.edf`, `.hdf`, `.nxs`, `.txt`, and `.zip` inputs
 
-### Nexus Generator
-- Build Nexus files from raw diffraction and electrochemistry data
-- Supports synchrotron, in-house, and neutron data types
-- Embeds instrument metadata and time-correlated scan data
-- Produces files compliant with the Nexus standard for seamless data sharing
-  
 ## Installation
 
 ### macOS prerequisite
 
-The system Python bundled with macOS does not include a compatible version of Tcl/Tk and the GUI will not render. Before installing, download and install Python from **[python.org](https://www.python.org/downloads/)** (3.11 or later). The official installer bundles Tcl/Tk 8.6+, which is required.
+The system Python bundled with macOS does not include a compatible version of
+Tcl/Tk and the GUI will not render. Before installing, download and install
+Python from **[python.org](https://www.python.org/downloads/)** (3.11 or
+later). The official installer bundles Tcl/Tk 8.6+, which is required.
 
 ### From source
 
@@ -44,17 +54,14 @@ pip install -e .
 
 ## Usage
 
-### Launch OperaXN
-
 ```bash
 operaxn
 ```
 
-### Launch Nexus Generator
-
-```bash
-nexusgen
-```
+Upload raw data (or an existing `.nxs`) via the GUI; every load/generation
+option — data source, time-correlation mode, 2D image handling, experiment
+details, standard electrochemistry files — is collected in a single upload
+dialog. Export the generated NeXus file at any point to share the experiment.
 
 ### Command line options
 
@@ -66,10 +73,27 @@ operaxn --check-deps    # Verify dependencies
 
 ## Time correlation
 
-OperaXN correlates diffraction scans with electrochemistry data by timestamp. Two modes are available (selected at load time):
+OperaXN correlates diffraction scans with electrochemistry data by timestamp.
+Two modes are available (selected at load time):
 
-- **Absolute** — scan timestamps are matched directly to echem timestamps via nearest-neighbour lookup.
-- **Relative** — both datasets are zeroed to their respective first timestamps and correlated by elapsed time. Useful when diffraction and echem clocks are not synchronised.
+- **Absolute** — scan timestamps are matched directly to echem timestamps via
+  nearest-neighbour lookup at the exposure midpoint.
+- **Relative** — both datasets are zeroed to their respective first timestamps
+  and correlated by elapsed time. Useful when diffraction and echem clocks are
+  not synchronised.
+
+Correlation runs once, at generation; the results (and the full operando
+cycling record, enabling re-correlation) are stored in the `.nxs` file.
+
+## NeXus files
+
+Generated files conform to the custom application definitions in
+[definitions/](definitions): a single `NXentry` holding the instrument and
+sample description plus the full electrochemical cycling record, and one
+`NXsubentry` per diffraction acquisition carrying the electrochemical state
+of the cell during that acquisition. Files can be inspected with any HDF5
+tool (e.g. [DAWN](https://dawnsci.org/), NeXpy, h5web) and validated with
+FAIRmat's [pynxtools](https://github.com/FAIRmat-NFDI/pynxtools).
 
 ## Dependencies
 
@@ -88,9 +112,9 @@ OperaXN correlates diffraction scans with electrochemistry data by timestamp. Tw
 ```
 OperaXN/
   bin/
-    operaxn/       # Main visualisation application
-    nexusgen/      # Nexus file generator
-  examples/        # Example datasets
+    core/          # Pipeline: classify, correlate, NeXus read/write
+    operaxn/       # Tk GUI: visualisation and analysis
+  definitions/     # NXoperando_monopd / NXoperando_tofnpd NXDL definitions
   pyproject.toml
   requirements.txt
 ```

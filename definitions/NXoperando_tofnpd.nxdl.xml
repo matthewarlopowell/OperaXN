@@ -1,0 +1,311 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  NXoperando_tofnpd — application definition for operando powder diffraction
+  of electrochemical cells using time-of-flight neutrons.
+
+  Status: draft authored by the OperaXN project (WMG, University of Warwick);
+  not yet submitted to nexusformat/definitions or FAIRmat-NFDI.
+
+  This definition extends the scope of the ratified NXtofnpd definition to
+  operando measurements: a single NXentry holds experiment-level metadata and
+  the full electrochemical cycling record, and each diffraction acquisition is
+  stored as one NXsubentry modelled on NXtofnpd.
+
+  Documented deviations from NXtofnpd (intentional):
+  * intensities are NX_NUMBER, not NX_INT — patterns are focussed/normalised,
+    processed data (e.g. Mantid output), not raw event counts;
+  * detector banks are stored as one NXdata group per bank with its native
+    time-of-flight axis (bank_N), optionally accompanied by the d-spacing
+    focussed pattern of the same bank in a sibling group (bank_N_d).
+
+  Monochromatic data uses the companion definition NXoperando_monopd.
+-->
+<definition xmlns="http://definition.nexusformat.org/nxdl/3.1"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="http://definition.nexusformat.org/nxdl/3.1 ../schema/nxdl.xsd"
+            name="NXoperando_tofnpd" type="group" extends="NXobject"
+            category="application">
+    <symbols>
+        <doc>
+            Symbols used in dimension declarations. Each symbol binds within a
+            single group instance: nE may differ between electrochemistry
+            series. Bank pattern lengths vary per bank and are therefore not
+            constrained by a symbol.
+        </doc>
+        <symbol name="nE">
+            <doc>Number of points in one electrochemistry time series.</doc>
+        </symbol>
+    </symbols>
+    <doc>
+        Application definition for operando powder diffraction of
+        electrochemical cells at a time-of-flight neutron source.
+        A single entry holds the experiment-level instrument and sample
+        description together with the full electrochemical cycling record;
+        each diffraction acquisition is a sequentially numbered NXsubentry
+        (scan_000001, scan_000002, ...) modelled on NXtofnpd, carrying the
+        electrochemical state of the cell during that acquisition.
+    </doc>
+
+    <group type="NXentry">
+        <attribute name="default" optional="true">
+            <doc>Name of the NXdata group to visualise first, typically operando_electrochemistry.</doc>
+        </attribute>
+        <field name="definition">
+            <doc>Official NeXus NXDL schema to which this file conforms.</doc>
+            <attribute name="version" optional="true"/>
+            <attribute name="URL" optional="true"/>
+            <enumeration>
+                <item value="NXoperando_tofnpd"/>
+            </enumeration>
+        </field>
+        <field name="title"/>
+        <field name="start_time" type="NX_DATE_TIME"/>
+        <field name="end_time" type="NX_DATE_TIME" recommended="true"/>
+        <field name="experiment_identifier" optional="true"/>
+        <field name="program_name" recommended="true">
+            <doc>Name of the program that generated this file (provenance).</doc>
+            <attribute name="version" optional="true"/>
+            <attribute name="configuration" optional="true"/>
+        </field>
+
+        <group name="process" type="NXprocess" recommended="true">
+            <doc>
+                Provenance of the diffraction–electrochemistry correlation:
+                the generating program and the parameters used to match each
+                diffraction acquisition to the electrochemical record.
+            </doc>
+            <field name="program" optional="true"/>
+            <field name="version" optional="true"/>
+            <field name="date" type="NX_DATE_TIME" optional="true"/>
+            <field name="data_source" optional="true">
+                <doc>Origin of the diffraction data.</doc>
+                <enumeration>
+                    <item value="neutron"/>
+                </enumeration>
+            </field>
+            <field name="correlation_method" optional="true">
+                <doc>
+                    absolute: diffraction and electrochemistry clocks are
+                    synchronised and matched on absolute timestamps.
+                    relative: streams are aligned on elapsed time from their
+                    respective starts (unsynchronised clocks).
+                </doc>
+                <enumeration>
+                    <item value="absolute"/>
+                    <item value="relative"/>
+                </enumeration>
+            </field>
+            <field name="echem_time_tolerance" type="NX_NUMBER" units="NX_TIME" optional="true">
+                <doc>Maximum accepted distance between a scan timestamp and its matched electrochemistry point.</doc>
+            </field>
+            <field name="total_scans" type="NX_INT" optional="true"/>
+        </group>
+
+        <group name="instrument" type="NXinstrument">
+            <attribute name="target" optional="true">
+                <doc>HDF5 path of this group; marks it as the original that the per-scan instrument soft links point to.</doc>
+            </attribute>
+            <field name="name"/>
+            <group name="source" type="NXsource">
+                <field name="name"/>
+                <field name="type"/>
+                <field name="probe">
+                    <enumeration>
+                        <item value="neutron"/>
+                    </enumeration>
+                </field>
+            </group>
+            <group name="detector" type="NXdetector" optional="true">
+                <field name="description" optional="true"/>
+            </group>
+        </group>
+
+        <group name="sample" type="NXsample">
+            <field name="name"/>
+            <field name="description" recommended="true">
+                <doc>
+                    Cell chemistry, electrode composition, cell format and
+                    fabrication details. Strongly recommended for reusability;
+                    intended to become required in a future revision.
+                </doc>
+            </field>
+        </group>
+
+        <group name="user" type="NXuser" optional="true">
+            <field name="name"/>
+        </group>
+
+        <group name="operando_electrochemistry" type="NXdata" recommended="true">
+            <doc>
+                Full electrochemical cycling record of the operando experiment.
+                Time is stored as elapsed seconds with the absolute origin in
+                the start attribute (NXlog convention), enabling both plotting
+                and re-correlation against the scan subentries.
+            </doc>
+            <attribute name="signal">
+                <enumeration>
+                    <item value="voltage"/>
+                </enumeration>
+            </attribute>
+            <attribute name="axes">
+                <enumeration>
+                    <item value="time"/>
+                </enumeration>
+            </attribute>
+            <attribute name="auxiliary_signals" optional="true"/>
+            <attribute name="time_indices" type="NX_INT" optional="true"/>
+            <field name="time" type="NX_FLOAT" units="NX_TIME">
+                <dimensions rank="1">
+                    <dim index="1" value="nE"/>
+                </dimensions>
+                <attribute name="start" type="NX_DATE_TIME"/>
+            </field>
+            <field name="voltage" type="NX_FLOAT" units="NX_VOLTAGE">
+                <dimensions rank="1">
+                    <dim index="1" value="nE"/>
+                </dimensions>
+            </field>
+            <field name="current" type="NX_FLOAT" units="NX_CURRENT" recommended="true">
+                <dimensions rank="1">
+                    <dim index="1" value="nE"/>
+                </dimensions>
+            </field>
+        </group>
+
+        <group name="standard_electrochemistry" type="NXenvironment" optional="true">
+            <doc>
+                Additional electrochemistry files associated with the
+                experiment but not time-correlated with the diffraction data
+                (e.g. formation cycles), one NXdata group per source file.
+            </doc>
+            <attribute name="num_files" type="NX_INT" optional="true"/>
+            <field name="description" optional="true"/>
+            <group type="NXdata" nameType="any" minOccurs="0" maxOccurs="unbounded">
+                <doc>One source file, named file_NNN (file_001, file_002, ...).</doc>
+                <attribute name="source_file" optional="true"/>
+                <attribute name="time_indices" type="NX_INT" optional="true"/>
+                <field name="time" type="NX_FLOAT" units="NX_TIME">
+                    <attribute name="start" type="NX_DATE_TIME"/>
+                </field>
+                <field name="voltage" type="NX_FLOAT" units="NX_VOLTAGE"/>
+                <field name="current" type="NX_FLOAT" units="NX_CURRENT" optional="true"/>
+            </group>
+        </group>
+
+        <group name="SCAN" type="NXsubentry" nameType="any" minOccurs="1" maxOccurs="unbounded">
+            <doc>
+                One group per diffraction acquisition, named scan_NNNNNN with a
+                zero-padded sequence number (scan_000001, scan_000002, ...).
+                The measurement setup is invariant during the experiment: by
+                convention each subentry carries an HDF5 soft link named
+                "instrument" to the experiment-level /entry/instrument group
+                rather than a copy. (Declared here as documentation only:
+                NXDL links cannot be optional, and file validators do not
+                traverse soft links.)
+            </doc>
+            <attribute name="scan_number" type="NX_INT" optional="true"/>
+            <field name="definition">
+                <doc>
+                    Ratified technique definition this subentry is modelled on.
+                    Deviations from NXtofnpd (NX_NUMBER data, per-bank NXdata
+                    groups) are documented at the top of this definition;
+                    NXoperando_tofnpd is the authoritative schema for the
+                    subentry contents.
+                </doc>
+                <enumeration>
+                    <item value="NXtofnpd"/>
+                </enumeration>
+            </field>
+            <field name="title" optional="true"/>
+            <field name="start_time" type="NX_DATE_TIME"/>
+            <field name="end_time" type="NX_DATE_TIME" recommended="true">
+                <doc>Required in practice: neutron acquisitions are long and the window bounds the electrochemistry summary.</doc>
+            </field>
+            <group name="environment" type="NXenvironment">
+                <doc>Electrochemical state of the cell during this acquisition.</doc>
+                <field name="voltage" type="NX_FLOAT" units="NX_VOLTAGE" recommended="true">
+                    <doc>Cell voltage at the electrochemistry point nearest the midpoint of the acquisition window.</doc>
+                </field>
+                <field name="current" type="NX_FLOAT" units="NX_CURRENT" recommended="true"/>
+                <field name="voltage_min" type="NX_FLOAT" units="NX_VOLTAGE" optional="true">
+                    <doc>Minimum cell voltage over the acquisition window [start_time, end_time].</doc>
+                </field>
+                <field name="voltage_max" type="NX_FLOAT" units="NX_VOLTAGE" optional="true"/>
+                <field name="current_min" type="NX_FLOAT" units="NX_CURRENT" optional="true"/>
+                <field name="current_max" type="NX_FLOAT" units="NX_CURRENT" optional="true"/>
+                <field name="scan_timestamp" type="NX_DATE_TIME" recommended="true">
+                    <doc>Midpoint of the acquisition window, used for correlation.</doc>
+                </field>
+                <field name="midpoint_adjusted_timestamp" type="NX_DATE_TIME" optional="true"/>
+                <field name="voltage_timestamp" type="NX_DATE_TIME" optional="true">
+                    <doc>Timestamp of the matched electrochemistry point.</doc>
+                </field>
+                <field name="exposure_time" type="NX_FLOAT" units="NX_TIME" recommended="true"/>
+                <field name="echem_index_first" type="NX_INT" optional="true">
+                    <doc>First index (0-based) of the acquisition window within the operando_electrochemistry arrays.</doc>
+                </field>
+                <field name="echem_index_last" type="NX_INT" optional="true">
+                    <doc>Last index (0-based, inclusive) of the acquisition window within the operando_electrochemistry arrays.</doc>
+                </field>
+                <field name="logbook_entry" optional="true"/>
+                <group name="voltage_log" type="NXlog" recommended="true">
+                    <doc>Voltage segment spanning the acquisition window; recommended for long neutron acquisitions.</doc>
+                    <field name="time" type="NX_FLOAT" units="NX_TIME">
+                        <attribute name="start" type="NX_DATE_TIME"/>
+                    </field>
+                    <field name="value" type="NX_FLOAT" units="NX_VOLTAGE"/>
+                </group>
+                <group name="current_log" type="NXlog" optional="true">
+                    <field name="time" type="NX_FLOAT" units="NX_TIME">
+                        <attribute name="start" type="NX_DATE_TIME"/>
+                    </field>
+                    <field name="value" type="NX_FLOAT" units="NX_CURRENT"/>
+                </group>
+            </group>
+
+            <group name="monitor" type="NXmonitor" recommended="true">
+                <field name="mode"/>
+                <field name="preset" type="NX_FLOAT" optional="true"/>
+                <field name="integral" type="NX_FLOAT" optional="true"/>
+            </group>
+
+            <group type="NXdata" nameType="any" minOccurs="1" maxOccurs="unbounded">
+                <doc>
+                    One focussed pattern per detector bank. Groups holding the
+                    native time-of-flight pattern are named bank_N and carry
+                    the time_of_flight axis; the optional d-spacing pattern of
+                    the same bank is a sibling group named bank_N_d carrying
+                    the d_spacing axis. Exactly one of time_of_flight or
+                    d_spacing must be present in each group (not expressible
+                    in NXDL for variable-name groups).
+                </doc>
+                <attribute name="signal" optional="true">
+                    <enumeration>
+                        <item value="data"/>
+                    </enumeration>
+                </attribute>
+                <attribute name="axes" optional="true"/>
+                <attribute name="measurement_number" type="NX_INT" optional="true"/>
+                <attribute name="spectrum" type="NX_INT" optional="true">
+                    <doc>Spectrum/workspace index in the source reduction file.</doc>
+                </attribute>
+                <attribute name="y_unit" optional="true">
+                    <doc>Intensity unit label as exported by the reduction software.</doc>
+                </attribute>
+                <attribute name="x_label" optional="true">
+                    <doc>Verbatim axis label from the source file (e.g. Mantid "Time-of-flight").</doc>
+                </attribute>
+                <attribute name="source_file" optional="true"/>
+                <field name="time_of_flight" type="NX_FLOAT" units="NX_TIME_OF_FLIGHT" optional="true"/>
+                <field name="d_spacing" type="NX_FLOAT" units="NX_LENGTH" optional="true"/>
+                <field name="data" type="NX_NUMBER" units="NX_ANY">
+                    <doc>
+                        Focussed intensities. Relaxed from NXtofnpd's NX_INT to
+                        NX_NUMBER: these are processed, not raw counts.
+                    </doc>
+                </field>
+                <field name="errors" type="NX_NUMBER" optional="true"/>
+            </group>
+        </group>
+    </group>
+</definition>

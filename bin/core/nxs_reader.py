@@ -2,13 +2,15 @@
 NeXus/HDF5 file reader for the core pipeline.
 
 Loads a canonical .nxs into an ExperimentModel. Dispatches on layout:
-- schema 3.0: single /entry NXentry with scan_NNNNNN NXsubentries
-  (environment / monitor / data / bank_N groups; NXmonopd/NXtofnpd-based)
-- schema 2.0 and v1 nexusgen files: root-level scan_NNNN NXentry groups
-  (metadata / xrd_data / neutron_data groups)
+- schema 4.0/3.0: single /entry with scan_NNNNNN NXsubentries; one loader
+  reads both, trying v4 names first (voltage, time/@start, bank_N +
+  bank_N_d, image_source) with v3 fallbacks ("voltage (V)", string
+  timestamps, combined bank groups, twod_* attributes).
+- schema 2.0 / v1 nexusgen: root-level scan_NNNN groups
+  (metadata / xrd_data / neutron_data).
 
-Within each layout the reader dispatches on which groups are present, so
-mixed or partial files render whatever they contain.
+Partial files render whatever they contain. Timestamps handed to the GUI
+are normalised to 'YYYY-MM-DD HH:MM:SS' whatever the file stores.
 """
 
 import logging
@@ -25,6 +27,21 @@ from .model import ExperimentModel, ScanData
 logger = logging.getLogger(__name__)
 
 _SCAN_GROUP_RE = re.compile(r"scan_(\d+)$")
+_BANK_GROUP_RE = re.compile(r"bank_(\d+)(_d)?$")
+_RELATIVE_TS_RE = re.compile(r"\d{1,3}:\d{2}:\d{2}$")
+
+
+def _display_ts(value: Any) -> Any:
+    """Normalise a stored timestamp to the GUI's 'YYYY-MM-DD HH:MM:SS' form.
+    v4 stores ISO 8601; relative HH:MM:SS strings pass through unchanged."""
+    if not value or not isinstance(value, str):
+        return value
+    if _RELATIVE_TS_RE.fullmatch(value):
+        return value
+    try:
+        return pd.to_datetime(value).strftime('%Y-%m-%d %H:%M:%S')
+    except (ValueError, TypeError):
+        return value
 
 
 def is_canonical_nxs(path: str) -> bool:
@@ -32,10 +49,13 @@ def is_canonical_nxs(path: str) -> bool:
     raw beamline .nxs."""
     try:
         with h5py.File(path, 'r') as f:
-            # v3 layout: /entry with our attrs or scan_ subgroups
+            # v4/v3 layout: /entry with our provenance or scan_ subgroups
             entry = f.get('entry')
-            if entry is not None and ('generator' in entry.attrs or any(
-                    _SCAN_GROUP_RE.fullmatch(k) for k in entry.keys())):
+            if entry is not None and ('generator' in entry.attrs
+                                      or 'program_name' in entry
+                                      or 'definition' in entry
+                                      or any(_SCAN_GROUP_RE.fullmatch(k)
+                                             for k in entry.keys())):
                 return True
             # v1/v2 layout: root-level scan groups or generator attribute
             if any(_SCAN_GROUP_RE.fullmatch(k) for k in f.keys()):
@@ -54,6 +74,8 @@ def load(path: str) -> ExperimentModel:
         entry = f.get('entry')
         is_v3 = (entry is not None and isinstance(entry, h5py.Group)
                  and ('generator' in entry.attrs
+                      or 'program_name' in entry
+                      or 'definition' in entry
                       or any(_SCAN_GROUP_RE.fullmatch(k) for k in entry.keys())))
 
         if is_v3:
@@ -90,16 +112,39 @@ def _load_v3(entry: h5py.Group, model: ExperimentModel) -> None:
 
 
 def _read_global_metadata_v3(entry: h5py.Group, model: ExperimentModel) -> None:
-    """Entry attrs, top-level fields, and instrument/sample/user groups."""
+    """Entry fields/attrs + instrument/sample/user groups -> flat metadata.
+    v4 provenance (program_name, process) lands on the same keys the v3
+    entry attrs used, so GUI consumers see one shape for both schemas."""
     out: Dict[str, Any] = {}
 
     for attr_name, attr_val in entry.attrs.items():
         out[attr_name] = _decode(attr_val)
 
-    for field in ('title', 'start_time', 'end_time', 'experiment_identifier'):
+    for field in ('title', 'start_time', 'end_time', 'experiment_identifier',
+                  'definition'):
         val = _dataset_scalar(entry, field)
         if val is not None:
             out[field] = _decode(val)
+    for field in ('start_time', 'end_time'):
+        if field in out:
+            out[field] = _display_ts(out[field])
+
+    # v4 provenance: program_name/@version + process fields
+    program = entry.get('program_name')
+    if isinstance(program, h5py.Dataset):
+        out['generator'] = _decode(program[()])
+        version = program.attrs.get('version')
+        if version is not None:
+            out['generator_version'] = _decode(version)
+
+    process = entry.get('process')
+    if isinstance(process, h5py.Group):
+        for field in ('data_source', 'correlation_method', 'total_scans',
+                      'twod_included', 'twod_max_display_size',
+                      'echem_time_tolerance', 'date'):
+            val = _dataset_scalar(process, field)
+            if val is not None:
+                out[field] = _decode(val)
 
     for group_name in ('instrument', 'sample', 'user'):
         grp = entry.get(group_name)
@@ -130,24 +175,37 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
     scan_num = int(_SCAN_GROUP_RE.fullmatch(name).group(1))
     scan = ScanData(scan_num=int(sub.attrs.get('scan_number', scan_num)))
 
-    start = _decode(_dataset_scalar(sub, 'start_time'))
-    end = _decode(_dataset_scalar(sub, 'end_time'))
+    start = _display_ts(_decode(_dataset_scalar(sub, 'start_time')))
+    end = _display_ts(_decode(_dataset_scalar(sub, 'end_time')))
 
     # Environment: correlated electrochemistry + timestamps
     env = sub.get('environment')
     if isinstance(env, h5py.Group):
-        scan.timestamp = _decode(_dataset_scalar(env, 'scan_timestamp')) or start
-        scan.midpoint_timestamp = _decode(
-            _dataset_scalar(env, 'midpoint_adjusted_timestamp'))
-        scan.echem_timestamp = _decode(_dataset_scalar(env, 'voltage_timestamp'))
-        scan.echem = _float_or_none(_dataset_scalar(env, 'voltage (V)'))
-        scan.current = _float_or_none(_dataset_scalar(env, 'current (mA)'))
+        scan.timestamp = _display_ts(
+            _decode(_dataset_scalar(env, 'scan_timestamp'))) or start
+        scan.midpoint_timestamp = _display_ts(_decode(
+            _dataset_scalar(env, 'midpoint_adjusted_timestamp')))
+        scan.echem_timestamp = _display_ts(
+            _decode(_dataset_scalar(env, 'voltage_timestamp')))
+        scan.echem = _float_or_none(
+            _first_scalar(env, 'voltage', 'voltage (V)'))
+        scan.current = _float_or_none(
+            _first_scalar(env, 'current', 'current (mA)'))
         scan.exposure_time = _float_or_none(_dataset_scalar(env, 'exposure_time'))
+        scan.voltage_min = _float_or_none(_dataset_scalar(env, 'voltage_min'))
+        scan.voltage_max = _float_or_none(_dataset_scalar(env, 'voltage_max'))
+        scan.current_min = _float_or_none(_dataset_scalar(env, 'current_min'))
+        scan.current_max = _float_or_none(_dataset_scalar(env, 'current_max'))
+        scan.echem_index_start = _int_or_none(
+            _first_scalar(env, 'echem_index_first', 'echem_index_start'))
+        scan.echem_index_end = _int_or_none(
+            _first_scalar(env, 'echem_index_last', 'echem_index_end'))
     else:
         scan.timestamp = start
 
-    # Neutron acquisition window (present when end_time was written)
-    if end:
+    # Neutron acquisition window (both bounds written only for neutron scans;
+    # v4 XRD scans carry end_time = start + exposure, which is not a window)
+    if end and not (sub.get('data') or sub.get('image_source')):
         scan.neutron_start = start
         scan.neutron_end = end
 
@@ -167,13 +225,41 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
     if isinstance(data_grp, h5py.Group):
         _read_xrd_v3(data_grp, scan)
 
-    # Neutron banks
+    # v4 2D image reference/embed (subentry level; overrides v3 data attrs)
+    note = sub.get('image_source')
+    if isinstance(note, h5py.Group):
+        scan.twod_source = _decode(_dataset_scalar(note, 'file_name'))
+        embedded = _dataset_scalar(note, 'embedded')
+        scan.twod_embedded = bool(embedded) if embedded is not None else False
+        image = sub.get('image_data')
+        if (scan.twod_embedded and isinstance(image, h5py.Group)
+                and 'data' in image):
+            scan.twod = np.asarray(image['data'][()], dtype=float)
+
+    # Neutron banks: v4 bank_N (TOF) + bank_N_d (d-spacing) pairs, with the
+    # v3 combined-group fields as fallback inside bank_N
     banks: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for key in sub.keys():
-        if key.startswith('bank_') and isinstance(sub[key], h5py.Group):
-            bank = _read_bank_v3(sub[key])
-            if bank:
-                banks[key[len('bank_'):]] = bank
+        m = _BANK_GROUP_RE.fullmatch(key)
+        if not m or not isinstance(sub[key], h5py.Group):
+            continue
+        b = sub[key]
+        bank_num, is_d = m.group(1), bool(m.group(2))
+        if is_d:
+            trace = _read_bank_trace(b, 'd_spacing', 'data', 'errors',
+                                     ('source_file',))
+            if trace:
+                banks.setdefault(bank_num, {})['d'] = trace
+        else:
+            trace = _read_bank_trace(b, 'time_of_flight', 'data', 'errors',
+                                     ('source_file', 'tof_source_file'))
+            if trace:
+                banks.setdefault(bank_num, {})['tof'] = trace
+            # v3 combined group: d family lives alongside TOF
+            trace = _read_bank_trace(b, 'd_spacing', 'd_data', 'd_errors',
+                                     ('d_source_file',))
+            if trace:
+                banks.setdefault(bank_num, {})['d'] = trace
     if banks:
         scan.neutron = banks
 
@@ -204,26 +290,27 @@ def _read_xrd_v3(grp: h5py.Group, scan: ScanData) -> None:
         scan.twod = np.asarray(grp['twod_image'][()], dtype=float)
 
 
-def _read_bank_v3(b: h5py.Group) -> Dict[str, Dict[str, Any]]:
-    """TOF and d-spacing traces of one detector bank as {'tof'|'d': arrays}."""
-    bank: Dict[str, Dict[str, Any]] = {}
+def _read_bank_trace(b: h5py.Group, x_name: str, y_name: str, e_name: str,
+                     source_attrs: tuple) -> Optional[Dict[str, Any]]:
+    """One x/y(/e) trace from a bank NXdata group, or None when absent."""
+    x = _dataset_1d(b, x_name)
+    y = _dataset_1d(b, y_name)
+    if x is None or y is None or len(x) != len(y):
+        return None
 
-    for key, (x_name, y_name, e_name) in {
-        'tof': ('time_of_flight', 'data', 'errors'),
-        'd': ('d_spacing', 'd_data', 'd_errors'),
-    }.items():
-        x = _dataset_1d(b, x_name)
-        y = _dataset_1d(b, y_name)
-        if x is not None and y is not None and len(x) == len(y):
-            entry = {"x": np.asarray(x, dtype=float),
-                     "y": np.asarray(y, dtype=float),
-                     "source": _decode(b.attrs.get(f'{key}_source_file'))}
-            e = _dataset_1d(b, e_name)
-            if e is not None and len(e) == len(x):
-                entry["e"] = np.asarray(e, dtype=float)
-            bank[key] = entry
+    source = None
+    for attr in source_attrs:
+        source = _decode(b.attrs.get(attr))
+        if source is not None:
+            break
 
-    return bank
+    trace = {"x": np.asarray(x, dtype=float),
+             "y": np.asarray(y, dtype=float),
+             "source": source}
+    e = _dataset_1d(b, e_name)
+    if e is not None and len(e) == len(x):
+        trace["e"] = np.asarray(e, dtype=float)
+    return trace
 
 
 # ============================================================================
@@ -335,28 +422,50 @@ def _read_scan_legacy(scan_grp: h5py.Group, name: str) -> ScanData:
 # Shared section readers (same group names in all schema versions)
 # ============================================================================
 
-def _read_operando_echem(parent: h5py.Group, model: ExperimentModel) -> None:
-    """Cycling protocol -> model.echem_df (empty frame when absent/invalid)."""
-    if 'operando_electrochemistry' not in parent:
-        model.echem_df = pd.DataFrame(columns=["timestamp", "echem_data", "current"])
-        return
+def _read_echem_series(grp: h5py.Group) -> Optional[pd.DataFrame]:
+    """One echem NXdata group -> timestamp/echem_data/current DataFrame.
+    Reads the v4 time/@start convention first, then the v3 string arrays."""
+    # v4: time/@start + voltage/current
+    v = _dataset_1d(grp, 'voltage')
+    time_item = grp.get('time')
+    if v is not None and isinstance(time_item, h5py.Dataset):
+        start = _decode(time_item.attrs.get('start'))
+        seconds = np.asarray(time_item[()], dtype=float).reshape(-1)
+        if start is not None and len(seconds) == len(v):
+            start_ts = pd.to_datetime(start)
+            if start_ts.tzinfo is not None:
+                # in-memory model uses naive local wall time throughout
+                start_ts = start_ts.tz_localize(None)
+            # float-seconds storage can be ~1 ns off; source data (and the
+            # v3 string format) never exceeds microsecond resolution
+            timestamps = (start_ts + pd.to_timedelta(seconds, unit='s')).round('us')
+            df = pd.DataFrame({"timestamp": timestamps,
+                               "echem_data": np.asarray(v, dtype=float)})
+            i = _dataset_1d(grp, 'current')
+            df["current"] = (np.asarray(i, dtype=float)
+                             if i is not None and len(i) == len(v) else np.nan)
+            return df
 
-    e = parent['operando_electrochemistry']
-    ts = _dataset_1d(e, 'timestamps')
-    v = _dataset_1d(e, 'voltage (V)')
-    i = _dataset_1d(e, 'current (mA)')
-
+    # v3: string timestamps + unit-suffixed names
+    ts = _dataset_1d(grp, 'timestamps')
+    v = _dataset_1d(grp, 'voltage (V)')
     if ts is None or v is None or len(ts) != len(v):
-        model.echem_df = pd.DataFrame(columns=["timestamp", "echem_data", "current"])
-        return
-
+        return None
+    i = _dataset_1d(grp, 'current (mA)')
     timestamps = pd.to_datetime([_decode(t) for t in ts])
     df = pd.DataFrame({"timestamp": timestamps, "echem_data": v.astype(float)})
-    if i is not None and len(i) == len(ts):
-        df["current"] = i.astype(float)
-    else:
-        df["current"] = np.nan
+    df["current"] = (i.astype(float)
+                     if i is not None and len(i) == len(ts) else np.nan)
+    return df
 
+
+def _read_operando_echem(parent: h5py.Group, model: ExperimentModel) -> None:
+    """Cycling protocol -> model.echem_df (empty frame when absent/invalid)."""
+    df = None
+    if 'operando_electrochemistry' in parent:
+        df = _read_echem_series(parent['operando_electrochemistry'])
+    if df is None:
+        df = pd.DataFrame(columns=["timestamp", "echem_data", "current"])
     model.echem_df = df
 
 
@@ -369,22 +478,17 @@ def _read_standard_echem(parent: h5py.Group, model: ExperimentModel) -> None:
     for name in sorted(se.keys()):
         if not name.startswith('file_'):
             continue
-        grp = se[name]
-        ts = _dataset_1d(grp, 'timestamps')
-        v = _dataset_1d(grp, 'voltage (V)')
-        i = _dataset_1d(grp, 'current (mA)')
-
-        if ts is None or v is None or len(ts) != len(v):
+        df = _read_echem_series(se[name])
+        if df is None:
             continue
-
-        timestamps = pd.to_datetime([_decode(t) for t in ts])
-        df = pd.DataFrame({"timestamp": timestamps, "echem_data": v.astype(float)})
-        if i is not None and len(i) == len(ts):
-            df["current"] = i.astype(float)
+        # Preserve the historical shape: standard-echem frames only carry a
+        # current column when the file actually had current data
+        if df["current"].isna().all():
+            df = df.drop(columns=["current"])
 
         model.standard_echem.append({
             "name": name,
-            "source_file": _decode(grp.attrs.get('source_file')),
+            "source_file": _decode(se[name].attrs.get('source_file')),
             "data": df,
         })
 
@@ -401,6 +505,25 @@ def _dataset_scalar(grp: h5py.Group, name: str) -> Optional[Any]:
     except Exception:
         pass
     return None
+
+
+def _first_scalar(grp: h5py.Group, *names: str) -> Optional[Any]:
+    """First present scalar dataset among names (v4 name, then v3 fallback)."""
+    for name in names:
+        val = _dataset_scalar(grp, name)
+        if val is not None:
+            return val
+    return None
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    """Value as int, or None when missing or non-numeric."""
+    if value is None:
+        return None
+    try:
+        return int(np.array(value).squeeze())
+    except (ValueError, TypeError):
+        return None
 
 
 def _dataset_1d(grp: h5py.Group, name: str) -> Optional[np.ndarray]:

@@ -1,5 +1,6 @@
 """
-OperaXN
+OperaXN application entry point: CLI parsing, logging setup, dependency
+checks, splash screen, and window lifecycle management.
 """
 
 import argparse
@@ -32,6 +33,7 @@ from .gui import OPERAXN
 SPLASH_DURATION_MS = 2500
 SPLASH_WIDTH = 500
 SPLASH_HEIGHT = 350
+SPLASH_LOGO_CENTER_Y = 76
 
 REQUIRED_DEPENDENCIES = {
     'numpy': 'NumPy',
@@ -169,7 +171,6 @@ class EnhancedSplashScreen(WindowManager):
     """Animated splash screen shown during application startup."""
 
     def __init__(self, root: tk.Tk) -> None:
-        """Initialise splash screen."""
         self.root = root
         self.width = SPLASH_WIDTH
         self.height = SPLASH_HEIGHT
@@ -252,7 +253,7 @@ class EnhancedSplashScreen(WindowManager):
     def _create_logo_section(self) -> None:
         """Draw hexagonal logo with rotating inner element."""
         center_x = self.width // 2
-        center_y = 80
+        center_y = SPLASH_LOGO_CENTER_Y
 
         # Create hexagons
         for radius, width, color, tag in [
@@ -307,13 +308,14 @@ class EnhancedSplashScreen(WindowManager):
         xn_width = (self.canvas.bbox(temp)[2] - self.canvas.bbox(temp)[0]) if self.canvas.bbox(temp) else 60
         self.canvas.delete(temp)
 
-        gap = 4
+        # The differently coloured title runs should read as one wordmark.
+        gap = 0
         total_width = opera_width + gap + xn_width
         opera_x = center_x - total_width // 2 + opera_width // 2
         xn_x = center_x + total_width // 2 - xn_width // 2
 
         self.canvas.create_text(
-            opera_x, 150,
+            opera_x, 151,
             text=opera_text,
             font=title_font,
             fill=OPERAXNTheme.COLORS['text_primary'],
@@ -321,7 +323,7 @@ class EnhancedSplashScreen(WindowManager):
         )
 
         self.canvas.create_text(
-            xn_x, 150,
+            xn_x, 151,
             text=xn_text,
             font=title_font,
             fill=OPERAXNTheme.COLORS['danger'],
@@ -330,7 +332,7 @@ class EnhancedSplashScreen(WindowManager):
 
         # Subtitle
         self.canvas.create_text(
-            center_x, 185,
+            center_x, 204,
             text="OPERAndo X-ray and Neutron data visualisation tool",
             font=subtitle_font,
             fill=OPERAXNTheme.COLORS['text_secondary'],
@@ -338,12 +340,12 @@ class EnhancedSplashScreen(WindowManager):
         )
 
         # Version badge
-        self._create_version_badge(center_x, 205, 215, version_font)
+        self._create_version_badge(center_x, 221, 231, version_font)
 
         # Copyright
         if APP_COPYRIGHT:
             self.canvas.create_text(
-                center_x, 245,
+                center_x, 255,
                 text=f"© {APP_COPYRIGHT}",
                 font=(OPERAXNTheme._SANS, 8),
                 fill=OPERAXNTheme.COLORS['text_secondary'],
@@ -372,8 +374,8 @@ class EnhancedSplashScreen(WindowManager):
         """Draw progress bar, status label, and loading dots."""
         center_x = self.width // 2
         bar_width = 300
-        bar_height = 4
-        bar_y = 265
+        bar_height = 5
+        bar_y = 274
 
         # Progress bar background
         self.canvas.create_rectangle(
@@ -403,7 +405,7 @@ class EnhancedSplashScreen(WindowManager):
 
         # Status text
         self.ui_elements['status_label'] = self.canvas.create_text(
-            center_x, 280,
+            center_x, 298,
             text="Initialising application...",
             font=(OPERAXNTheme._SANS, 9),
             fill=OPERAXNTheme.COLORS['text_secondary'],
@@ -412,7 +414,7 @@ class EnhancedSplashScreen(WindowManager):
 
         # Loading dots
         self.ui_elements['loading_dots'] = self.canvas.create_text(
-            center_x + 110, 280,
+            center_x, 319,
             text="",
             font=(OPERAXNTheme._SANS, 9),
             fill=OPERAXNTheme.COLORS['accent_primary'],
@@ -550,7 +552,7 @@ class EnhancedSplashScreen(WindowManager):
             return
 
         center_x = self.width // 2
-        center_y = 80
+        center_y = SPLASH_LOGO_CENTER_Y
 
         for i, (item_type, item_id, angle) in enumerate(self.animation_items):
             if item_type == 'rotate':
@@ -600,7 +602,6 @@ class ApplicationManager:
     """Orchestrates startup, splash, and main-window lifecycle."""
 
     def __init__(self, args: argparse.Namespace) -> None:
-        """Initialise application manager."""
         self.args = args
         self.logger = setup_logging(args.debug or DEBUG_MODE)
         self.root = None
@@ -759,9 +760,10 @@ class ApplicationManager:
             if self.app:
                 # Clear caches
                 from .output import clear_plot_cache
-                from .input import clear_global_cache
+                from .input import clear_global_cache, cleanup_session_cache
                 clear_plot_cache()
                 clear_global_cache()
+                cleanup_session_cache()
         except Exception as e:
             self.logger.debug("Error clearing caches on close: %s", e)
 
@@ -871,4 +873,3 @@ def main(args: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -1,12 +1,13 @@
 """
-Configuration Module for OperaXN
+GUI-side configuration: theme, fonts, plot appearance, and window
+defaults. Pipeline constants (correlation tolerance, schema version,
+performance limits) live in core.config.
 """
 
 import multiprocessing
 import os
 import platform
 import tkinter as tk
-from enum import Enum
 
 # ============================================================================
 # Debug Mode
@@ -21,11 +22,9 @@ LOG_FILE = "operaxn.log" if DEBUG_MODE else None
 # Data Source Types
 # ============================================================================
 
-class DataSourceType(Enum):
-    """Types of data sources."""
-    SYNCHROTRON = "synchrotron"
-    INHOUSE = "inhouse"
-    NEUTRON = "neutron"
+# Re-exported from core so enum identity is shared across the whole app —
+# a locally defined copy would silently fail == comparisons against core's.
+from core import DataSourceType  # noqa: E402,F401
 
 
 # ============================================================================
@@ -102,7 +101,6 @@ CACHE_ENABLED = True
 MAX_CACHE_SIZE_MB = 1000
 PARALLEL_PROCESSING = True
 MAX_WORKERS = min(multiprocessing.cpu_count(), 8)
-BATCH_SIZE = 20
 
 # Display Quality
 SYNCHROTRON_MAX_DISPLAY_SIZE = 4096  # 2048 recommended
@@ -110,17 +108,11 @@ FIGURE_DPI = 95
 EXPORT_DPI = 300
 INTERPOLATION_METHOD = "bilinear"
 
-# Data Processing
+# Data Processing (pipeline constants live in core.config; these are GUI-side)
 LARGE_IMAGE_THRESHOLD = 2_000_000
 INTENSITY_SAMPLE_SIZE = 20_000
-MAX_DATASET_ELEMENTS = 100_000_000  # threshold for sampling large HDF5 datasets
-TARGET_DISPLAY_PIXELS = 2048 * 2048  # target pixel count for downsampling
-PARALLEL_PROCESSING_THRESHOLD = 20  # min files to trigger parallel processing
 LRU_CACHE_MAXSIZE = 128
-MAX_EXPOSURE_TIME = 3600  # seconds, reject entries above this
 SECONDS_PER_HOUR = 3600.0
-FILE_READ_RETRIES = 2
-FILE_READ_RETRY_DELAY = 0.5  # seconds
 
 # Plot Layout
 VMIN_FLOOR = 1e-10  # floor value to avoid log(0) in logarithmic plots
@@ -157,10 +149,8 @@ DEFAULT_GIF_LOOP = 0
 # Window Sizes
 # ============================================================================
 
+# Initial dialog sizes only; BaseDialog.shrink_to_fit resizes to content
 WINDOW_SIZES = {
-    'main': "1150x750",
-    'upload': "400x150",
-    'plot_settings': "400x375",
     'export_neutron': "400x375",
     'export_xrd': "400x425",
     'gif': "400x425",
@@ -204,9 +194,12 @@ for exts in SUPPORTED_EXTENSIONS.values():
 # ============================================================================
 
 APP_NAME = "OperaXN"
-APP_VERSION = "1.0.0"
+# Single source of truth for the app version: core.config.GENERATOR_VERSION
+# (also written into every generated .nxs as @generator_version)
+from core import GENERATOR_VERSION as APP_VERSION  # noqa: E402,F401
+
 APP_AUTHOR = "Matthew Powell"
-APP_COPYRIGHT = "2025"
+APP_COPYRIGHT = "2025-2026"
 DOCUMENTATION_URL = "https://github.com/matthewarlopowell/OperaXN"
 SUPPORT_EMAIL = "Matt.Powell@warwick.ac.uk"
 
