@@ -1,13 +1,13 @@
 [build-system]
 requires = [
-    "hatchling>=1.6.0",
+    "hatchling>=1.26.0",
 ]
 build-backend = "hatchling.build"
 
 [project]
 name = "OperaXN"
 version = "2.0.0"
-description = "Visualise operando diffraction experiments and produce standardised nexus files"
+description = "Visualise operando diffraction experiments and produce standardised NeXus files"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -38,7 +38,6 @@ keywords = [
 
 classifiers = [
     "Development Status :: 4 - Beta",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",

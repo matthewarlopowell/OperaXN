@@ -3,29 +3,27 @@
 **OPERAndo X-ray and Neutron diffraction data visualisation tool**
 
 **OperaXN** is a Python desktop application for correlating, visualising and
-analysing *operando* diffraction data collected at laboratory XRD, synchrotron
-XRD or neutron diffraction sources. Raw diffraction and electrochemistry files
+sharing *operando* diffraction data collected at laboratory XRD, synchrotron
+XRD and neutron diffraction sources. Raw diffraction and electrochemistry files
 are time-correlated and consolidated into a single standardised NeXus (`.nxs`)
-file — the canonical record of the experiment — which OperaXN then visualises
-and analyses. The same file can be shared, re-opened directly, and read by any
-HDF5/NeXus tool.
+file which OperaXN then visualises. The same file can be shared, re-opened
+directly and read by any HDF5/NeXus tool.
 
 ## Features
 
 - Automated time-correlation of electrochemical (voltage/current) and
-  diffraction datasets, by absolute timestamp or elapsed time
-- Generation of schema-compliant NeXus files conforming to the
+  diffraction datasets by absolute timestamp or elapsed time
+- Generation of NeXus files conforming to the
   `NXoperando_monopd` / `NXoperando_tofnpd` application definitions
-  (see [definitions/](definitions)) — including per-scan electrochemical
-  state (correlated voltage/current, acquisition-window min/max, optional
-  per-scan logs) alongside the full cycling record
+  (see [definitions/](definitions)), including per-scan electrochemical
+  state alongside the full cycling record
 - Simultaneous visualisation of X-ray (1D and 2D) and neutron (per-bank
   TOF/d-spacing) diffraction data with electrochemical cycling
 - Operando heatmap (stacked patterns vs scan/time with the voltage track),
-  capacity analysis, and ICI (intermittent current interruption) analysis
+  capacity analysis and ICI (intermittent current interruption) analysis
 - Export publication-quality figures (PNG, PDF, SVG), animated GIFs, and
   Excel summaries
-- Supports `.dat`, `.xy`, `.edf`, `.hdf`, `.nxs`, `.txt`, and `.zip` inputs
+- Supports `.nxs`, `.dat`, `.xy`, `.edf`, `.hdf`, `.txt`, and `.zip` inputs
 
 ## Installation
 
@@ -34,7 +32,7 @@ HDF5/NeXus tool.
 The system Python bundled with macOS does not include a compatible version of
 Tcl/Tk and the GUI will not render. Before installing, download and install
 Python from **[python.org](https://www.python.org/downloads/)** (3.11 or
-later). The official installer bundles Tcl/Tk 8.6+, which is required.
+later). The official installer bundles Tcl/Tk 8.6+.
 
 ### From source
 
@@ -58,10 +56,9 @@ pip install -e .
 operaxn
 ```
 
-Upload raw data (or an existing `.nxs`) via the GUI; every load/generation
-option — data source, time-correlation mode, 2D image handling, experiment
-details, standard electrochemistry files — is collected in a single upload
-dialog. Export the generated NeXus file at any point to share the experiment.
+Upload raw data (or an existing `.nxs`) via the GUI; every load and
+generation option is collected in a single upload dialog. Export the
+generated NeXus file at any point to share the experiment.
 
 ### Command line options
 
@@ -82,8 +79,8 @@ Two modes are available (selected at load time):
   and correlated by elapsed time. Useful when diffraction and echem clocks are
   not synchronised.
 
-Correlation runs once, at generation; the results (and the full operando
-cycling record, enabling re-correlation) are stored in the `.nxs` file.
+Correlation runs once at generation; the results are stored in the `.nxs`
+file alongside the full cycling record.
 
 ## NeXus files
 
@@ -91,7 +88,7 @@ Generated files conform to the custom application definitions in
 [definitions/](definitions): a single `NXentry` holding the instrument and
 sample description plus the full electrochemical cycling record, and one
 `NXsubentry` per diffraction acquisition carrying the electrochemical state
-of the cell during that acquisition. Files can be inspected with any HDF5
+of the cell during that scan. Files can be inspected with any HDF5
 tool (e.g. [DAWN](https://dawnsci.org/), NeXpy, h5web) and validated with
 FAIRmat's [pynxtools](https://github.com/FAIRmat-NFDI/pynxtools).
 
@@ -107,7 +104,7 @@ FAIRmat's [pynxtools](https://github.com/FAIRmat-NFDI/pynxtools).
 - PSutil >= 5.8.0
 - ImageIO >= 2.9.0
 
-## Project Structure
+## Project structure
 
 ```
 OperaXN/
@@ -119,9 +116,15 @@ OperaXN/
   requirements.txt
 ```
 
+## Contributing
+
+Bug reports, feature requests and pull requests are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
-## AI Usage
+## AI usage
+
 This project was developed with the assistance of Claude (Anthropic).

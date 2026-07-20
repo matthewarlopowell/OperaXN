@@ -19,14 +19,13 @@ dist/
 .ruff_cache/
 .mypy_cache/
 
-# Local test suite (kept out of the repo deliberately)
+# Local test suite
 /tests/
 
 # Vendored NIAC NXDL schema, used only by the local test suite
-# (see definitions/README.md for the pinned tag to validate against)
 /schema/
 
-# Local pynxtools reader plugin (validation tooling, kept out of the repo)
+# Local pynxtools reader plugin
 /pynxtools-operaxn/
 .coverage
 htmlcov/
