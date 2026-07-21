@@ -73,9 +73,9 @@ operaxn --check-deps    # Verify dependencies
 OperaXN correlates diffraction scans with electrochemistry data by timestamp.
 Two modes are available (selected at load time):
 
-- **Absolute** — scan timestamps are matched directly to echem timestamps via
+- **Absolute** -> scan timestamps are matched directly to echem timestamps via
   nearest-neighbour lookup at the exposure midpoint.
-- **Relative** — both datasets are zeroed to their respective first timestamps
+- **Relative** -> both datasets are zeroed to their respective first timestamps
   and correlated by elapsed time. Useful when diffraction and echem clocks are
   not synchronised.
 
