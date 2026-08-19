@@ -1,0 +1,55 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+type: software
+title: "OperaXN"
+abstract: >-
+  Visualise operando diffraction experiments and produce standardised
+  NeXus files.
+authors:
+  - family-names: Powell
+    given-names: Matthew A.
+    email: Matt.Powell@warwick.ac.uk
+    affiliation: "WMG, University of Warwick"
+    # orcid: "https://orcid.org/TODO"
+  - family-names: Menon
+    given-names: Ashok S.
+    affiliation: "WMG, University of Warwick"
+    orcid: "https://orcid.org/0000-0001-8148-8615"
+  - family-names: Arroyo-Gómez
+    given-names: José J.
+    # orcid: "https://orcid.org/TODO"
+  - family-names: Bird
+    given-names: Tobias A.
+    affiliation: "Diamond Light Source Ltd."
+    # orcid: "https://orcid.org/TODO"
+  - family-names: Pérez
+    given-names: Gabriel E.
+    affiliation: "ISIS Neutron and Muon Source"
+    orcid: "https://orcid.org/0000-0003-3150-8467"
+  - family-names: Pandey
+    given-names: Gaurav C.
+    affiliation: "WMG, University of Warwick"
+    orcid: "https://orcid.org/0000-0001-9823-1672"
+  - family-names: Huband
+    given-names: Steven
+    affiliation: "Department of Physics, University of Warwick"
+    # orcid: "https://orcid.org/TODO"
+  - family-names: Day
+    given-names: Sarah J.
+    affiliation: "Diamond Light Source Ltd."
+    # orcid: "https://orcid.org/TODO"
+  - family-names: Piper
+    given-names: Louis F. J.
+    affiliation: "WMG, University of Warwick"
+    orcid: "https://orcid.org/0000-0002-3421-3210"
+license: MIT
+version: 2.0.0
+repository-code: "https://github.com/matthewarlopowell/OperaXN"
+keywords:
+  - operando
+  - diffraction
+  - XRD
+  - neutron
+  - electrochemistry
+  - NeXus
+  - synchrotron
