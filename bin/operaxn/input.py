@@ -5,9 +5,9 @@ Every upload goes through the canonical .nxs file:
 - raw data  -> core.generate() into a cache .nxs -> core.load()
 - .nxs file -> core.load() directly
 
-This module exposes the same API the GUI has always consumed
-(process_paths, make_*_arrays, get_correlated_data), but the data now comes
-from the loaded ExperimentModel instead of re-reading raw files per scan.
+This module exposes the GUI's data API (process_paths, make_*_arrays,
+get_correlated_data); every call serves data from the loaded
+ExperimentModel — raw files are never re-read per scan.
 Relative time is applied here as a display-only view transform; the .nxs
 always stores absolute timestamps.
 """
@@ -44,8 +44,6 @@ from core import (  # noqa: F401  (clear_global_cache used by main.py)
     HDFReader,
     clear_global_cache,
 )
-
-from .config import OPERAXNTheme, WINDOW_SIZES
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +139,9 @@ def _apply_relative_view(scan_dicts: List[Dict[str, Any]],
 
     Scan t=0 is the earliest correlation midpoint (XRD scans only for
     XRD sources, all scans for neutron); echem t=0 is its earliest point.
-    Mirrors the old ScanProcessor._apply_relative_time behaviour.
+    Same rewrite as core ScanProcessor._apply_relative_time, which the
+    canonical pipeline leaves disabled (apply_relative_display=False) so
+    generated files keep absolute time; the view is applied here instead.
     """
     if data_source == DataSourceType.NEUTRON:
         candidates = scan_dicts
@@ -188,15 +188,18 @@ def process_paths(selected_paths: List[str],
                   twod_max_display_size: int = 0,
                   title: Optional[str] = None,
                   sample_name: Optional[str] = None,
-                  sample_description: Optional[str] = None
+                  sample_description: Optional[str] = None,
+                  sample_preparation_date: Optional[str] = None,
+                  cycling_protocol: Optional[Dict[str, Any]] = None
                   ) -> tuple:
     """Load an experiment: generate the canonical .nxs (or take one directly),
     load it, and return (scan_dicts, echem_df, time_method_str).
 
+    `time_method` defaults to absolute correlation when None.
     `standard_echem_files`, `include_2d_images`, `twod_max_display_size`,
-    `title`, `sample_name`, and `sample_description` are generation options:
-    they determine what is stored in the .nxs and are ignored when a .nxs is
-    opened directly."""
+    `title`, `sample_name`, `sample_description`, `sample_preparation_date`,
+    and `cycling_protocol` are generation options: they determine what is
+    stored in the .nxs and are ignored when a .nxs is opened directly."""
     paths = [str(p) for p in selected_paths]
     empty = ([], pd.DataFrame(columns=["timestamp", "echem_data", "current"]),
              TimeMethod.ABSOLUTE.value)
@@ -205,8 +208,6 @@ def process_paths(selected_paths: List[str],
         return empty
 
     if time_method is None:
-        time_method = TimeSortingDialog.ask_method()
-    if time_method is None:  # dialog dismissed
         time_method = TimeMethod.ABSOLUTE
 
     # A new load replaces the session: drop the previous unsaved cache file
@@ -232,6 +233,8 @@ def process_paths(selected_paths: List[str],
             title=title,
             sample_name=sample_name,
             sample_description=sample_description,
+            sample_preparation_date=sample_preparation_date,
+            cycling_protocol=cycling_protocol,
             progress_callback=progress_callback,
         )
         if not success:
@@ -553,88 +556,3 @@ def get_correlated_data(scans: List[Dict[str, Any]],
             result["neutron"] = neutron_data
 
     return result
-
-
-# ============================================================================
-# Time method dialog
-# ============================================================================
-
-class TimeSortingDialog:
-    """Tkinter dialog for choosing absolute vs. relative time display."""
-
-    @staticmethod
-    def ask_method() -> Optional[TimeMethod]:
-        """Show modal dialog and return chosen TimeMethod (None if dismissed)."""
-        import tkinter as tk
-
-        dialog = tk.Toplevel()
-        dialog.title("Time Sorting Method")
-        dialog.geometry(WINDOW_SIZES['time'])
-        dialog.transient()
-
-        dialog.configure(bg=OPERAXNTheme.COLORS['bg_primary'])
-
-        result = {"method": TimeMethod.ABSOLUTE}
-
-        dialog.protocol("WM_DELETE_WINDOW",
-                        lambda: [result.update({"method": None}), dialog.destroy()])
-
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_width() // 2)
-        y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
-        dialog.geometry(f"+{x}+{y}")
-
-        tk.Label(
-            dialog,
-            text="How should timestamps be handled?",
-            font=OPERAXNTheme.FONTS['heading'],
-            bg=OPERAXNTheme.COLORS['bg_primary'],
-            fg=OPERAXNTheme.COLORS['text_primary']
-        ).pack(pady=20)
-
-        var = tk.StringVar(value=TimeMethod.ABSOLUTE.value)
-
-        options = [
-            (TimeMethod.ABSOLUTE.value, "Absolute time (use actual timestamps)"),
-            (TimeMethod.RELATIVE.value, "Relative time (XRD and echem each start at 00:00:00)")
-        ]
-
-        for value, text in options:
-            tk.Radiobutton(
-                dialog,
-                text=text,
-                variable=var,
-                value=value,
-                font=OPERAXNTheme.FONTS['body'],
-                bg=OPERAXNTheme.COLORS['bg_primary'],
-                fg=OPERAXNTheme.COLORS['text_primary'],
-                activebackground=OPERAXNTheme.COLORS['bg_primary'],
-                activeforeground=OPERAXNTheme.COLORS['accent_primary'],
-                selectcolor=OPERAXNTheme.COLORS['bg_tertiary']
-            ).pack(anchor="w", padx=30, pady=5)
-
-        def confirm():
-            result["method"] = TimeMethod(var.get())
-            dialog.destroy()
-
-        button_frame = tk.Frame(dialog, bg=OPERAXNTheme.COLORS['bg_primary'])
-        button_frame.pack(pady=10)
-
-        confirm_btn = tk.Button(
-            button_frame,
-            text="OK",
-            command=confirm,
-            width=12,
-            bg=OPERAXNTheme.COLORS['accent_primary'],
-            fg=OPERAXNTheme.COLORS['bg_primary'],
-            font=OPERAXNTheme.FONTS['button'],
-            relief=tk.FLAT,
-            cursor='hand2'
-        )
-        confirm_btn.pack()
-
-        confirm_btn.bind("<Enter>", lambda e: confirm_btn.config(bg=OPERAXNTheme.COLORS['accent_hover']))
-        confirm_btn.bind("<Leave>", lambda e: confirm_btn.config(bg=OPERAXNTheme.COLORS['accent_primary']))
-
-        dialog.wait_window()
-        return result["method"]

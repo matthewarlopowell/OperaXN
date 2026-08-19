@@ -8,9 +8,8 @@ for each pulse a linear fit of ΔV against √Δt over a configurable time
 window yields R = -intercept/I and k = -slope/I, with errors propagated
 from the fit covariance.
 
-Panels: overview (V vs t, phase-coloured), pulse zoom (V + I), ICI fit
-(ΔV vs √Δt with Δt secondary axis), R² vs pulse, and R/k vs voltage,
-capacity, or specific capacity for charge and discharge.
+The window pairs the raw voltage trace with per-pulse fit diagnostics
+and summary plots of the fitted R and k values.
 
 Ported from the OperaXN-ICI fork (Joe Arroyo).
 """
@@ -37,7 +36,6 @@ _C = OPERAXNTheme.COLORS
 BG = _C['bg_primary']
 BG2 = _C['bg_secondary']
 BG3 = _C['bg_tertiary']
-CANVAS = _C['canvas_bg']
 ACCENT = _C['accent_primary']
 TEXT = _C['text_primary']
 DIM = _C['text_dim']
@@ -89,7 +87,7 @@ def _prepare_df(echem_df: pd.DataFrame) -> pd.DataFrame:
 
 def _detect_pulses(phase_df: pd.DataFrame, max_rest: float = 1800.0) -> list[dict]:
     """
-    Mirrors pyICI's assign_valid_pulses logic.
+    Detect valid pulses in a phase's current trace.
 
     A pulse = active period (current != 0) followed by rest (current == 0).
     Valid only if 0 < rest_duration <= max_rest. This naturally excludes the
@@ -274,7 +272,7 @@ class _Btn(tk.Button):
 
 
 def _spinbox(master, var, **kw):
-    """Themed spinbox."""
+    """Flat spinbox using the theme's input colours and border."""
     return tk.Spinbox(
         master, textvariable=var,
         bg=INPUT, fg=TEXT, buttonbackground=BG2,
@@ -640,10 +638,8 @@ class _RKAxisBar(tk.Frame):
     def _set_xaxis(self, value):
         """Switch the R/k x-axis toggle and refresh."""
         self.xaxis_var.set(value)
-        on = dict(bg=ACCENT, fg=_C['button_text'])
-        off = dict(bg=BG3, fg=DIM)
         for val, btn in self._btns.items():
-            btn.config(**(on if val == value else off))
+            btn.set_selected(val == value)
         self._on_change()
 
 

@@ -143,7 +143,7 @@ class PlotObjectCache:
         self.enabled = CACHE_ENABLED
 
     def get(self, key: str) -> Optional[Any]:
-        """Retrieve cached plot object by key."""
+        """Return the cached object for key; None on miss or when disabled."""
         if not self.enabled:
             return None
         with self.lock:
@@ -152,7 +152,7 @@ class PlotObjectCache:
             return self.cache.get(key)
 
     def set(self, key: str, obj: Any) -> None:
-        """Store plot object with LRU eviction."""
+        """Store an object with LRU eviction; no-op while disabled."""
         if not self.enabled:
             return
         with self.lock:

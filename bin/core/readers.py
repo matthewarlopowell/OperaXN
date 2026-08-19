@@ -1,11 +1,12 @@
 """
 Raw data file readers for the core pipeline.
 
-Merge decisions applied relative to the v1 packages:
+Interface contracts:
 - `read_file` flags are keyword-only (`use_cache`, `is_neutron`) so a stray
-  positional boolean cannot flip meaning between the two old signatures.
+  positional boolean cannot flip meaning between the two.
 - `HDFReader` downsampling is an instance attribute (no mutable module-global).
-- fabio is an optional dependency (EDF support degrades gracefully).
+- The fabio import is guarded so core still imports without it (EDF reads
+  raise ImportError).
 """
 
 import logging
@@ -25,7 +26,7 @@ from .config import (
     SYNCHROTRON_MAX_DISPLAY_SIZE,
     TARGET_DISPLAY_PIXELS,
 )
-from .model import FileType
+from .model import SUPPORTED_EXTENSIONS, FileType
 
 try:
     import fabio
@@ -43,7 +44,8 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 class FileCache:
-    """Thread-safe least-accessed-eviction file data cache with size limits."""
+    """Caches file data thread-safely, evicting least-accessed entries
+    to stay within a byte-size budget."""
 
     def __init__(self, max_size_mb: int = MAX_CACHE_SIZE_MB) -> None:
         self.cache: Dict[str, Any] = {}
@@ -60,28 +62,27 @@ class FileCache:
                 return self.cache[key]
         return None
 
-    def put(self, key: str, value: Any, size_bytes: Optional[int] = None) -> None:
+    def put(self, key: str, value: Any) -> None:
         """Store value, evicting least-accessed entries to stay within budget."""
         with self.lock:
-            if size_bytes is None:
-                size_bytes = sys.getsizeof(value)
+            size_bytes = sys.getsizeof(value)
 
             while self.current_size + size_bytes > self.max_size_bytes and self.cache:
-                self._evict_lru()
+                self._evict_lfu()
 
             self.cache[key] = value
             self.current_size += size_bytes
             self.access_count[key] = 1
 
-    def _evict_lru(self) -> None:
+    def _evict_lfu(self) -> None:
         """Drop the entry with the lowest access count."""
         if not self.cache:
             return
-        lru_key = min(self.access_count.keys(), key=lambda k: self.access_count.get(k, 0))
-        if lru_key in self.cache:
-            value = self.cache.pop(lru_key)
+        lfu_key = min(self.access_count.keys(), key=lambda k: self.access_count.get(k, 0))
+        if lfu_key in self.cache:
+            value = self.cache.pop(lfu_key)
             self.current_size -= sys.getsizeof(value)
-            self.access_count.pop(lru_key, None)
+            self.access_count.pop(lfu_key, None)
 
     def clear(self) -> None:
         """Empty the cache and reset accounting."""
@@ -97,16 +98,6 @@ _file_cache = FileCache()
 def clear_global_cache() -> None:
     """Empty the module-wide file cache (e.g. between sessions)."""
     _file_cache.clear()
-
-
-def get_cache_stats() -> Dict[str, Any]:
-    """Current size and occupancy of the module-wide file cache."""
-    return {
-        "size_bytes": _file_cache.current_size,
-        "size_mb": _file_cache.current_size / (1024 * 1024),
-        "num_items": len(_file_cache.cache),
-        "max_size_mb": MAX_CACHE_SIZE_MB,
-    }
 
 
 # ============================================================================
@@ -136,13 +127,13 @@ class DataReader(ABC):
 
     @staticmethod
     def _get_cache_key(path: str) -> str:
-        """Key on path, size, and mtime so edited files are never served stale."""
+        """Cache key from path, size, and mtime (edits never served stale)."""
         stat = os.stat(path)
         return f"{path}_{stat.st_size}_{stat.st_mtime}"
 
 
 class DATReader(DataReader):
-    """Reads .dat files (XRD or neutron) as two-column arrays."""
+    """Reads .dat files (XRD or neutron) as X/Y(/error) column arrays."""
 
     def __init__(self, data_type: str = "xrd") -> None:
         super().__init__()
@@ -223,7 +214,7 @@ class EDFReader(DataReader):
 
 
 class XYReader(DataReader):
-    """Reads .xy integrated diffraction data as two-column arrays."""
+    """Reads .xy integrated diffraction data as X/Y(/error) column arrays."""
 
     def _read_impl(self, path: str) -> np.ndarray:
         """Load whitespace-delimited columns via numpy."""
@@ -240,7 +231,9 @@ class HDFReader(DataReader):
     """Reads HDF5 detector images with auto-discovery and optional downsampling.
 
     `max_display_size` is per-instance: set it before reading to control
-    downsampling (0 disables it). No module-global configuration.
+    downsampling (0 disables it). No module-global configuration, but
+    `DataReaderFactory.READERS` holds a shared instance — construct your
+    own rather than mutating it.
     """
 
     COMMON_DATA_PATHS = [
@@ -422,7 +415,7 @@ class DataReaderFactory:
             return cls.NEUTRON_READER
 
         ext = os.path.splitext(file_path)[1].lower()
-        file_type = FileType(ext) if ext in {ft.value for ft in FileType} else None
+        file_type = FileType(ext) if ext in SUPPORTED_EXTENSIONS else None
 
         if file_type and file_type in cls.READERS:
             return cls.READERS[file_type]

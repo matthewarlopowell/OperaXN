@@ -1,5 +1,5 @@
 """
-Shared configuration for the OperaXN/NexusGen core pipeline.
+Shared configuration for the OperaXN core pipeline.
 
 GUI-specific settings (theme, window sizes, plot appearance) stay in the
 respective application packages; only values the core pipeline needs live here.
@@ -8,8 +8,8 @@ respective application packages; only values the core pipeline needs live here.
 import multiprocessing
 
 # --- Generator identity ---
-# Written into every .nxs as @generator/@generator_version; the file layout
-# itself is self-describing (the reader detects it structurally).
+# Written into every .nxs as a program_name dataset with @version; the file
+# layout itself is self-describing (the reader detects it structurally).
 
 GENERATOR_NAME = "operaxn-core"
 GENERATOR_VERSION = "2.0.0"
@@ -17,14 +17,16 @@ GENERATOR_VERSION = "2.0.0"
 # --- NeXus application definitions ---
 # Custom definitions shipped in definitions/ (schema v4 layout).
 
-DEFINITION_VERSION = "1.0"
+# 1.0.0: first release, shipped with OperaXN 2.0.0; matches the published
+# specification (Tan et al., ACS Energy Lett., Figure 4).
+DEFINITION_VERSION = "1.0.0"
 DEFINITION_URL_BASE = ("https://github.com/matthewarlopowell/OperaXN/"
                        "blob/main/definitions/")
 
-# Route generated files through the pynxtools dataconverter (validating them
-# against the NXoperando_* definitions at write time). Requires pynxtools
-# with an 'operaxn' reader registered; when anything is missing or fails the
-# plain NXSWriter file is kept, so the GUI never breaks.
+# After writing, validate and rewrite generated files through the pynxtools
+# dataconverter (checking them against the NXoperando_* definitions).
+# Requires pynxtools with an 'operaxn' reader registered; when anything is
+# missing or fails the plain NXSWriter file is kept, so the GUI never breaks.
 USE_PYNXTOOLS_WRITER = False
 
 # --- Correlation ---
@@ -35,8 +37,8 @@ ECHEM_LOG_MIN_POINTS = 2  # min echem points in a scan window to emit an NXlog
 
 # --- Scan identification ---
 
-# ISIS-style neutron run numbers; enforced identically by the logbook parser,
-# the file grouper, and any display code (see NeutronFileGrouper).
+# ISIS-style neutron run numbers; enforced by the logbook parser and neutron
+# file grouper (display code shares the rule via NeutronFileGrouper).
 SCAN_ID_MIN_DIGITS = 5
 SCAN_ID_MAX_DIGITS = 7
 
@@ -48,8 +50,6 @@ PARALLEL_PROCESSING = True
 MAX_WORKERS = min(multiprocessing.cpu_count(), 8)
 BATCH_SIZE = 20
 PARALLEL_PROCESSING_THRESHOLD = 20  # min files to trigger parallel processing
-FILE_READ_RETRIES = 2
-FILE_READ_RETRY_DELAY = 0.5  # seconds
 
 # --- 2D data handling ---
 
