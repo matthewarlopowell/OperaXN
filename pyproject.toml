@@ -12,17 +12,18 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+# Order mirrors CITATION.cff, which is canonical (it is what Zenodo reads).
 authors = [
     { name = "Matthew A. Powell", email = "Matt.Powell@warwick.ac.uk" },
-    { name = "Gabriel E. Perez", email = "gabriel.perez@stfc.ac.uk" },
-    { name = "Tobias A. Bird", email = "tobias.bird@diamond.ac.uk" },
-    { name = "Gaurav C. Pandey", email = "Gaurav.Pandey@warwick.ac.uk" },
+    { name = "Ashok S. Menon", email = "Ashok.Menon@warwick.ac.uk" },
     { name = "José J. Arroyo-Gómez", email = "josej.arroyog@gmail.com" },
+    { name = "Tobias A. Bird", email = "tobias.bird@diamond.ac.uk" },
+    { name = "Gabriel E. Pérez", email = "gabriel.perez@stfc.ac.uk" },
+    { name = "Gaurav C. Pandey", email = "Gaurav.Pandey@warwick.ac.uk" },
     { name = "Steven Huband", email = "S.Huband@warwick.ac.uk" },
     { name = "Sarah J. Day", email = "sarah.day@diamond.ac.uk" },
     { name = "Louis F. J. Piper", email = "Louis.Piper@warwick.ac.uk" },
-    { name = "Ashok S. Menon", email = "Ashok.Menon@warwick.ac.uk" },
 ]
 
 maintainers = [
@@ -44,7 +45,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Chemistry",
     "Topic :: Scientific/Engineering :: Physics",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -62,6 +62,16 @@ dependencies = [
     "imageio>=2.9.0",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "lxml>=4.9",
+    # NeXus schema validation of generated files. Pinned to the minor the
+    # definitions were validated against, so an upstream validator change
+    # cannot redden CI on its own.
+    "pynxtools>=0.15,<0.16",
+]
+
 [project.urls]
 Repository = "https://github.com/matthewarlopowell/OperaXN"
 "Bug Tracker" = "https://github.com/matthewarlopowell/OperaXN/issues"
@@ -77,4 +87,19 @@ packages = ["bin/core", "bin/operaxn"]
 "bin/operaxn" = "operaxn"
 
 [tool.hatch.build.targets.sdist]
-include = ["bin/core", "bin/operaxn", "definitions", "LICENSE", "README.md"]
+# Anchored with a leading slash so a stray nested tests/ or LICENSE
+# (e.g. a venv left inside the checkout) cannot be swept into the sdist.
+include = [
+    "/bin/core", "/bin/operaxn", "/definitions", "/tests", "/schema",
+    "/examples", "/LICENSE", "/README.md", "/CITATION.cff",
+    "/CONTRIBUTING.md", "/requirements.txt",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "gui: imports the Tk GUI package (needs tkinter importable; no display required)",
+    "display: opens real Tk windows (skipped automatically when no display is available)",
+    "realdata: runs against local instrument datasets via the OPERAXN_TEST_DATA env var",
+]
