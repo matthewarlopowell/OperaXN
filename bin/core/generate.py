@@ -15,7 +15,7 @@ import shutil
 import tempfile
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -82,9 +82,7 @@ def convert_tabular_to_txt(path: str) -> str:
 class FileProcessor:
     """Collects, extracts, and pre-classifies files from paths, ZIPs, and directories."""
 
-    def __init__(self, progress_callback: ProgressCallback = None,
-                 data_source: DataSourceType = DataSourceType.INHOUSE):
-        self.progress_callback = progress_callback
+    def __init__(self, data_source: DataSourceType = DataSourceType.INHOUSE):
         self.data_source = data_source
         self.tempdir: Optional[str] = None
         self.processed_files: set = set()
@@ -101,11 +99,6 @@ class FileProcessor:
         write, must happen inside the context)."""
         if self.tempdir and os.path.exists(self.tempdir):
             shutil.rmtree(self.tempdir, ignore_errors=True)
-
-    def _progress(self, message: str) -> None:
-        """Forward a status message to the progress callback, if any."""
-        if self.progress_callback:
-            self.progress_callback(message)
 
     def process_paths(self, selected_paths: List[str]) -> List[FileRecord]:
         """Main entry: collect files, group source-specific ones, process the rest."""
@@ -145,7 +138,7 @@ class FileProcessor:
         return records
 
     def _process_neutron_files(self, all_files: List[Tuple[str, str]]) -> List[FileRecord]:
-        """Create records for all neutron .txt and .dat files."""
+        """Create records for every collected file (no extension filter)."""
         records = []
 
         for extracted_path, original_path in all_files:
@@ -287,9 +280,9 @@ def _run_pipeline(processor: FileProcessor,
                   time_method: TimeMethod) -> Tuple[List[Scan], pd.DataFrame]:
     """Collect, classify, and correlate using an already-open FileProcessor.
 
-    Must run (and any subsequent reading of the returned scans' file paths must
-    happen) inside the processor's context: ZIP inputs are extracted to its
-    temp directory, which is removed on context exit."""
+    The processor's context must stay open while the returned scans' file
+    paths are read: see the tempdir constraint on `process_raw`.
+    """
     records = processor.process_paths(input_paths)
 
     if not records:
@@ -327,11 +320,12 @@ def process_raw(input_paths: List[str],
     both streams, for unsynchronised clocks). Timestamps in the output are
     always absolute — relative display is a GUI view transform.
 
-    NOTE: for ZIP inputs the file paths on the returned scans point into a
-    temp directory that is removed when this function returns. Use `generate`
-    (which keeps the extraction alive until the .nxs is written) when the data
-    itself is needed."""
-    with FileProcessor(progress_callback, data_source) as processor:
+    For ZIP inputs the file paths on the returned scans point into a temp
+    directory that is removed when this function returns. Use `generate`
+    (which keeps the extraction alive until the .nxs is written) when the
+    data itself is needed.
+    """
+    with FileProcessor(data_source) as processor:
         return _run_pipeline(processor, input_paths, data_source,
                              progress_callback, time_method)
 
@@ -365,15 +359,19 @@ def generate(input_paths: List[str],
              time_method: TimeMethod = TimeMethod.ABSOLUTE,
              title: Optional[str] = None,
              sample_name: Optional[str] = None,
-             sample_description: Optional[str] = None) -> Tuple[bool, List[str]]:
-    """Full pipeline: raw paths -> canonical .nxs file at output_path.
-
-    Returns (success, messages)."""
+             sample_description: Optional[str] = None,
+             sample_preparation_date: Optional[str] = None,
+             cycling_protocol: Optional[Dict[str, Any]] = None
+             ) -> Tuple[bool, List[str]]:
+    """Full pipeline: raw paths -> canonical .nxs file at output_path;
+    returns (success, messages). `sample_preparation_date` (ISO 8601) and
+    `cycling_protocol` (keys per nxs_writer.CYCLING_PROTOCOL_FIELDS) are
+    forwarded to the writer."""
     try:
         # The FileProcessor context must span writing too: the writer reads
         # data from the scans' file paths, which for ZIP inputs live in the
         # processor's temp extraction directory.
-        with FileProcessor(progress_callback, data_source) as processor:
+        with FileProcessor(data_source) as processor:
             scans, echem_df = _run_pipeline(processor, input_paths, data_source,
                                             progress_callback, time_method)
 
@@ -396,7 +394,9 @@ def generate(input_paths: List[str],
                                correlation_method=time_method.value,
                                title=title,
                                sample_name=sample_name,
-                               sample_description=sample_description)
+                               sample_description=sample_description,
+                               sample_preparation_date=sample_preparation_date,
+                               cycling_protocol=cycling_protocol)
             writer.write(output_path, scans, echem_df, std_files)
 
         if _config.USE_PYNXTOOLS_WRITER:

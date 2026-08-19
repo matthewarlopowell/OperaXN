@@ -1,5 +1,5 @@
 # requirements.txt
-# Python >= 3.9
+# Python >= 3.10
 
 # core pipeline
 numpy>=1.20.0

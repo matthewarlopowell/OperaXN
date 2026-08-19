@@ -643,7 +643,7 @@ class ApplicationManager:
             self._show_error(
                 "Missing required dependencies:\n\n" +
                 "\n".join(f"• {dep}" for dep in missing_required) +
-                "\n\nPlease install using:\npip install -r requirements.txt"
+                "\n\nPlease install using:\npip install --upgrade operaxn"
             )
             return False
 
@@ -787,6 +787,14 @@ class ApplicationManager:
 
 def display_dependency_check() -> int:
     """Print dependency status to stdout; return 1 if required deps are missing."""
+    # The status glyphs below are not encodable in the Windows ANSI
+    # codepage, so a redirected or piped stdout would raise
+    # UnicodeEncodeError before any status could be reported.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
     missing_required, missing_optional = check_dependencies()
 
     print("\n" + "=" * 60)
@@ -798,7 +806,7 @@ def display_dependency_check() -> int:
         for dep in missing_required:
             print(f"   - {dep}")
         print("\nPlease install using:")
-        print("   pip install -r requirements.txt")
+        print("   pip install --upgrade operaxn")
         return 1
     else:
         print("✓ All required dependencies installed")

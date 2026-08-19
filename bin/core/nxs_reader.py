@@ -6,7 +6,7 @@ Loads a canonical .nxs into an ExperimentModel. Dispatches on layout:
   reads both, trying v4 names first (voltage, time/@start, bank_N +
   bank_N_d, image_source) with v3 fallbacks ("voltage (V)", string
   timestamps, combined bank groups, twod_* attributes).
-- schema 2.0 / v1 nexusgen: root-level scan_NNNN groups
+- schema 2.0 / legacy v1 files: root-level scan_NNNN groups
   (metadata / xrd_data / neutron_data).
 
 Partial files render whatever they contain. Timestamps handed to the GUI
@@ -44,18 +44,22 @@ def _display_ts(value: Any) -> Any:
         return value
 
 
+def _entry_is_canonical(entry) -> bool:
+    """True when /entry carries our provenance or scan_ subgroups."""
+    return (entry is not None and isinstance(entry, h5py.Group)
+            and ('generator' in entry.attrs
+                 or 'program_name' in entry
+                 or 'definition' in entry
+                 or any(_SCAN_GROUP_RE.fullmatch(k) for k in entry.keys())))
+
+
 def is_canonical_nxs(path: str) -> bool:
     """True if the file looks like one of our generated files, as opposed to a
     raw beamline .nxs."""
     try:
         with h5py.File(path, 'r') as f:
             # v4/v3 layout: /entry with our provenance or scan_ subgroups
-            entry = f.get('entry')
-            if entry is not None and ('generator' in entry.attrs
-                                      or 'program_name' in entry
-                                      or 'definition' in entry
-                                      or any(_SCAN_GROUP_RE.fullmatch(k)
-                                             for k in entry.keys())):
+            if _entry_is_canonical(f.get('entry')):
                 return True
             # v1/v2 layout: root-level scan groups or generator attribute
             if any(_SCAN_GROUP_RE.fullmatch(k) for k in f.keys()):
@@ -72,11 +76,7 @@ def load(path: str) -> ExperimentModel:
 
     with h5py.File(path, 'r') as f:
         entry = f.get('entry')
-        is_v3 = (entry is not None and isinstance(entry, h5py.Group)
-                 and ('generator' in entry.attrs
-                      or 'program_name' in entry
-                      or 'definition' in entry
-                      or any(_SCAN_GROUP_RE.fullmatch(k) for k in entry.keys())))
+        is_v3 = _entry_is_canonical(entry)
 
         if is_v3:
             _load_v3(entry, model)
@@ -98,11 +98,12 @@ def _scan_groups(parent: h5py.Group):
 
 
 # ============================================================================
-# Schema 3.0
+# Schema 4.0 / 3.0 (one loader, v4 names first with v3 fallbacks)
 # ============================================================================
 
 def _load_v3(entry: h5py.Group, model: ExperimentModel) -> None:
-    """Populate the model from a /entry NXentry (schema 3.0 layout)."""
+    """Populate the model from a /entry NXentry (schema 4.0/3.0 layouts,
+    v4 names first with v3 fallbacks)."""
     _read_global_metadata_v3(entry, model)
     _read_operando_echem(entry, model)
     _read_standard_echem(entry, model)
@@ -121,7 +122,7 @@ def _read_global_metadata_v3(entry: h5py.Group, model: ExperimentModel) -> None:
         out[attr_name] = _decode(attr_val)
 
     for field in ('title', 'start_time', 'end_time', 'experiment_identifier',
-                  'definition'):
+                  'definition', 'pre_sample_flightpath'):
         val = _dataset_scalar(entry, field)
         if val is not None:
             out[field] = _decode(val)
@@ -146,7 +147,7 @@ def _read_global_metadata_v3(entry: h5py.Group, model: ExperimentModel) -> None:
             if val is not None:
                 out[field] = _decode(val)
 
-    for group_name in ('instrument', 'sample', 'user'):
+    for group_name in ('instrument', 'sample', 'user', 'cycling_protocol'):
         grp = entry.get(group_name)
         if isinstance(grp, h5py.Group):
             out[group_name] = _flatten_group(grp)
@@ -200,12 +201,18 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
             _first_scalar(env, 'echem_index_first', 'echem_index_start'))
         scan.echem_index_end = _int_or_none(
             _first_scalar(env, 'echem_index_last', 'echem_index_end'))
+        scan.capacity = _float_or_none(_dataset_scalar(env, 'capacity'))
     else:
         scan.timestamp = start
 
     # Neutron acquisition window (both bounds written only for neutron scans;
-    # v4 XRD scans carry end_time = start + exposure, which is not a window)
-    if end and not (sub.get('data') or sub.get('image_source')):
+    # v4 XRD scans carry end_time = start + exposure, which is not a window).
+    # Gated on the NXtofnpd definition (bank groups as fallback) so an XRD
+    # scan whose data failed to read is not misread as a neutron window.
+    definition = _decode(_dataset_scalar(sub, 'definition'))
+    is_neutron = (definition == 'NXtofnpd' if definition else
+                  any(_BANK_GROUP_RE.fullmatch(k) for k in sub.keys()))
+    if end and is_neutron and not (sub.get('data') or sub.get('image_source')):
         scan.neutron_start = start
         scan.neutron_end = end
 
@@ -314,7 +321,7 @@ def _read_bank_trace(b: h5py.Group, x_name: str, y_name: str, e_name: str,
 
 
 # ============================================================================
-# Legacy layouts (schema 2.0 and v1 nexusgen files)
+# Legacy layouts (schema 2.0 and v1 files)
 # ============================================================================
 
 def _load_legacy(f: h5py.File, model: ExperimentModel) -> None:
@@ -547,7 +554,7 @@ def _float_or_none(value: Any) -> Optional[float]:
 
 
 def _decode(value: Any) -> Optional[Any]:
-    """Decode HDF5 bytes/numpy scalars to native Python values."""
+    """Native Python value for HDF5 bytes/numpy scalars (arrays -> lists)."""
     if value is None:
         return None
     if isinstance(value, bytes):

@@ -1,9 +1,9 @@
 """
-Shared data model for the OperaXN/NexusGen core pipeline.
+Shared data model for the OperaXN core pipeline.
 
-Unifies the previously duplicated dataclasses: `Scan` carries both
-`source_nxs` (needed by the NeXus writer for global metadata) and `to_dict()`
-(consumed by the visualiser GUI).
+`Scan` describes source files on disk (paths, timestamps, correlation
+results); `ScanData` carries the loaded data arrays. `source_nxs` on a Scan
+feeds the NeXus writer's global metadata.
 """
 
 from dataclasses import dataclass, field
@@ -100,34 +100,9 @@ class Scan:
     # {"start": iso_str, "time_s": ndarray, "voltage": ndarray,
     #  "current": Optional[ndarray]}
     echem_segment: Optional[Dict[str, Any]] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert scan to plain dictionary (consumed by the visualiser GUI)."""
-        return {
-            "scan_num": self.scan_num,
-            "oned": self.oned,
-            "twod": self.twod,
-            "echem": self.echem,
-            "current": self.current,
-            "echem_timestamp": self.echem_timestamp,
-            "neutron_meta": self.neutron_meta,
-            "neutron_files": self.neutron_files,
-            "timestamp": self.timestamp,
-            "original_timestamp": self.original_timestamp,
-            "exposure_time": self.exposure_time,
-            "oned_exposure": self.oned_exposure,
-            "twod_exposure": self.twod_exposure,
-            "neutron_start": self.neutron_start,
-            "neutron_end": self.neutron_end,
-            "source_nxs": self.source_nxs,
-            "timestamp_for_correlation": self.timestamp_for_correlation,
-            "voltage_min": self.voltage_min,
-            "voltage_max": self.voltage_max,
-            "current_min": self.current_min,
-            "current_max": self.current_max,
-            "echem_index_start": self.echem_index_start,
-            "echem_index_end": self.echem_index_end,
-        }
+    # Capacity (mAh); reserved — written when set, the core does not
+    # compute it yet
+    capacity: Optional[float] = None
 
 
 @dataclass
@@ -152,6 +127,7 @@ class ScanData:
     current_max: Optional[float] = None
     echem_index_start: Optional[int] = None
     echem_index_end: Optional[int] = None
+    capacity: Optional[float] = None         # capacity (mAh), when stored
     # 1D XRD: {"x": ndarray, "y": ndarray, "e": ndarray?, "source": str} or None
     oned: Optional[Dict[str, Any]] = None
     # 2D XRD: embedded image array, or None

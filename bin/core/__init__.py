@@ -1,5 +1,5 @@
 """
-OperaXN core - shared pipeline for the visualiser and the NeXus generator.
+OperaXN core — the pipeline shared by NeXus generation and the GUI.
 
 Architecture: every raw-data upload is first generated into a canonical .nxs
 file (`generate`), and the GUI runs purely by interpreting that file
@@ -30,7 +30,6 @@ from .readers import (
     XYReader,
     FABIO_AVAILABLE,
     clear_global_cache,
-    get_cache_stats,
 )
 from .classify import (
     DATClassifier,
@@ -69,7 +68,7 @@ __all__ = [
     'Scan', 'ScanData', 'TimeMethod',
     # Readers
     'DataReaderFactory', 'DATReader', 'EDFReader', 'HDFReader', 'XYReader',
-    'FABIO_AVAILABLE', 'clear_global_cache', 'get_cache_stats',
+    'FABIO_AVAILABLE', 'clear_global_cache',
     # Classification / harvesting
     'DATClassifier', 'EDFClassifier', 'FileClassificationManager',
     'NeutronFileGrouper', 'NeutronMetadataParser', 'NexusMetadataExtractor',

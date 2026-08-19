@@ -1,9 +1,10 @@
 """
 Electrochemistry parsing and scan/echem time-correlation for the core pipeline.
 
-The canonical .nxs file always stores absolute timestamps: `generate` runs this
-processor in ABSOLUTE mode, and relative time is a GUI-side view transform.
-RELATIVE mode is retained for compatibility during migration.
+The canonical .nxs file always stores absolute timestamps. RELATIVE mode,
+selected at upload, matches scans to echem by relative offsets (for
+unsynchronised instrument clocks); relative display time is a GUI-side view
+transform (`generate` runs this processor with the display rewrite off).
 """
 
 import logging
@@ -193,7 +194,6 @@ class ScanProcessor:
         self.echem_reference_time: Optional[pd.Timestamp] = None
         self.neutron_reference_time: Optional[pd.Timestamp] = None
         self.echem_parser = EchemParser()
-        self.neutron_parser = NeutronMetadataParser()
 
     def process_scans(self, df: pd.DataFrame) -> Tuple[List[Scan], pd.DataFrame]:
         """Main pipeline: parse echem -> build scans -> adjust timestamps -> correlate."""
@@ -211,7 +211,7 @@ class ScanProcessor:
         self._adjust_for_exposure_time(scan_list)
 
         if self.time_method == TimeMethod.RELATIVE:
-            self._set_reference_times(df, combined_echem_df, neutron_metadata_df, scan_list)
+            self._set_reference_times(combined_echem_df, scan_list)
 
         # Correlate scans with echem using absolute timestamps (before formatting)
         if not combined_echem_df.empty:
@@ -235,7 +235,7 @@ class ScanProcessor:
 
         neutron_dfs = []
         for path in neutron_meta_paths:
-            meta_df = self.neutron_parser.parse(path)
+            meta_df = NeutronMetadataParser.parse(path)
             if meta_df is not None:
                 meta_df["source_file"] = path
                 neutron_dfs.append(meta_df)
@@ -266,8 +266,7 @@ class ScanProcessor:
 
         return pd.DataFrame(columns=["timestamp", "echem_data", "current", "source_file"])
 
-    def _set_reference_times(self, df: pd.DataFrame, echem_df: pd.DataFrame,
-                             neutron_df: Optional[pd.DataFrame] = None,
+    def _set_reference_times(self, echem_df: pd.DataFrame,
                              scan_list: Optional[List[Scan]] = None) -> None:
         """Set t=0 reference for each data stream in relative time mode."""
 
@@ -280,14 +279,9 @@ class ScanProcessor:
             ]
             self.xrd_reference_time = min(mids) if mids else None
         else:
-            xrd_timestamps = []
-            for _, row in df.iterrows():
-                if pd.notna(row.get("timestamp")) and (pd.notna(row.get("oned")) or pd.notna(row.get("twod"))):
-                    try:
-                        xrd_timestamps.append(pd.to_datetime(row["timestamp"]))
-                    except (ValueError, TypeError):
-                        pass
-            self.xrd_reference_time = min(xrd_timestamps) if xrd_timestamps else None
+            # Neutron dataframes carry no oned/twod rows, and an empty scan
+            # list implies none either -- there is nothing to reference.
+            self.xrd_reference_time = None
 
         # Echem reference: earliest echem point
         if not echem_df.empty:
@@ -304,15 +298,6 @@ class ScanProcessor:
                 if scan.timestamp_for_correlation is not None
             ]
             self.neutron_reference_time = min(mids) if mids else None
-        elif neutron_df is not None and not neutron_df.empty:
-            neutron_timestamps = []
-            for _, row in neutron_df.iterrows():
-                if pd.notna(row.get("start_time")):
-                    try:
-                        neutron_timestamps.append(pd.to_datetime(row["start_time"]))
-                    except (ValueError, TypeError):
-                        pass
-            self.neutron_reference_time = min(neutron_timestamps) if neutron_timestamps else None
 
     @staticmethod
     def _create_neutron_scan_list(df: pd.DataFrame,

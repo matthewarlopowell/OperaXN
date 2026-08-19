@@ -14,7 +14,7 @@ __author__ = APP_AUTHOR
 __email__ = SUPPORT_EMAIL
 __license__ = "MIT"
 
-from .config import (
+from .config import (  # noqa: F401  (package API re-exports)
     DataSourceType,
     DEFAULT_TWOD_YMIN_PERCENT,
     DEFAULT_TWOD_YMAX_PERCENT,

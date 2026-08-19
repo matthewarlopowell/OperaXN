@@ -7,7 +7,6 @@ performance limits) live in core.config.
 import multiprocessing
 import os
 import platform
-import tkinter as tk
 
 # ============================================================================
 # Debug Mode
@@ -84,13 +83,6 @@ class OPERAXNTheme:
         'large': 15
     }
 
-    BUTTON_CONFIG = {
-        'relief': tk.FLAT,
-        'cursor': 'hand2',
-        'padx': 12,
-        'pady': 4
-    }
-
 
 # ============================================================================
 # Performance Settings
@@ -154,8 +146,7 @@ WINDOW_SIZES = {
     'export_neutron': "400x375",
     'export_xrd': "400x425",
     'gif': "400x425",
-    'progress': "300x100",
-    'time': "400x200"
+    'progress': "300x100"
 }
 
 # ============================================================================
@@ -164,7 +155,6 @@ WINDOW_SIZES = {
 
 XRAY_WAVELENGTH = 1.5406  # Cu K-alpha Angstroms
 SYNCHROTRON_WAVELENGTH = 0.495
-ECHEM_TIME_TOLERANCE = 300  # 5 minutes
 
 # ============================================================================
 # Export Settings
@@ -172,22 +162,6 @@ ECHEM_TIME_TOLERANCE = 300  # 5 minutes
 
 EXCEL_ENGINE = "openpyxl"
 CSV_ENCODING = "utf-8"
-
-# ============================================================================
-# File Type Settings
-# ============================================================================
-
-SUPPORTED_EXTENSIONS = {
-    "xrd_1d": [".dat", ".xy"],
-    "xrd_2d": [".edf", ".hdf"],
-    "metadata": [".nxs"],
-    "echem": [".txt"],
-    "archive": [".zip"],
-}
-
-ALL_SUPPORTED_EXTENSIONS = []
-for exts in SUPPORTED_EXTENSIONS.values():
-    ALL_SUPPORTED_EXTENSIONS.extend(exts)
 
 # ============================================================================
 # Application Info

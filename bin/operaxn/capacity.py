@@ -3,8 +3,8 @@ Capacity analysis over operando echem data: charge/discharge/rest phase
 classification, cycle detection, and cumulative capacity integration.
 
 Operates on the echem DataFrame provided by the input adapter
-(columns: timestamp, echem_data, current). Consumed by the Capacity
-Analysis window (gui.py) and the ICI window (ici.py).
+(columns: timestamp, echem_data, current); shared by the analysis
+windows.
 
 Ported from the OperaXN-ICI fork (Joe Arroyo).
 """
@@ -100,29 +100,6 @@ def compute_capacity(df: pd.DataFrame) -> np.ndarray:
     i_mid = np.concatenate(([i_mA[0]], (i_mA[:-1] + i_mA[1:]) / 2))
     capacity = np.cumsum(i_mid * dt) / 3600.0  # mAh
     return capacity
-
-
-def parse_cycle_selection(input_str, available_cycles):
-    """Parse a cycle-selection string ('all', '3', '1,3,5', '1-5', or a mix)
-    into a sorted list of cycle numbers present in available_cycles."""
-    s = input_str.strip().lower()
-    if s in ("all", "0", ""):
-        return list(available_cycles)
-    selected = set()
-    for part in s.split(","):
-        part = part.strip()
-        if "-" in part:
-            try:
-                a, b = part.split("-", 1)
-                selected.update(range(int(a), int(b) + 1))
-            except ValueError:
-                pass
-        else:
-            try:
-                selected.add(int(part))
-            except ValueError:
-                pass
-    return sorted(c for c in selected if c in available_cycles)
 
 
 def plot_capacity_vs_voltage(ax, echem_df, mass_mg=0.0, cycles_to_plot=None):
