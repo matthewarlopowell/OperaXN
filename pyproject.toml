@@ -66,6 +66,9 @@ dependencies = [
 test = [
     "pytest>=7.0",
     "lxml>=4.9",
+    # Static undefined-name sweep (see tests/test_pipeline.py): a name deleted
+    # as unused while later code still references it must fail loudly.
+    "pyflakes>=3.0",
     # NeXus schema validation of generated files. Pinned to the minor the
     # definitions were validated against, so an upstream validator change
     # cannot redden CI on its own.
