@@ -34,6 +34,8 @@ from .config import (
     XRAY_WAVELENGTH,
 )
 
+logger = logging.getLogger(__name__)
+
 
 # ============================================================================
 # Result Dataclasses

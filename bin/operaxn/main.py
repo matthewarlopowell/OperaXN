@@ -643,7 +643,8 @@ class ApplicationManager:
             self._show_error(
                 "Missing required dependencies:\n\n" +
                 "\n".join(f"• {dep}" for dep in missing_required) +
-                "\n\nPlease install using:\npip install --upgrade operaxn"
+                "\n\nPlease install using:\npip install -r requirements.txt"
+                "\n(from the OperaXN repository root)"
             )
             return False
 
@@ -806,7 +807,8 @@ def display_dependency_check() -> int:
         for dep in missing_required:
             print(f"   - {dep}")
         print("\nPlease install using:")
-        print("   pip install --upgrade operaxn")
+        print("   pip install -r requirements.txt")
+        print("   (from the OperaXN repository root)")
         return 1
     else:
         print("✓ All required dependencies installed")

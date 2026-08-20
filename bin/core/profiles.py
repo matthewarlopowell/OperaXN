@@ -51,7 +51,7 @@ DEFAULT_PROFILES: Dict[DataSourceType, Dict[str, Any]] = {
         "source_name": "laboratory X-ray source",
         "source_type": "Fixed Tube X-ray",
         "probe": "x-ray",
-        "instrument_name": "in-house diffractometer",
+        "instrument_name": "laboratory diffractometer",
     },
     DataSourceType.SYNCHROTRON: {
         "source_name": "synchrotron",

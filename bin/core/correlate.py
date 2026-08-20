@@ -61,13 +61,19 @@ class EchemParser:
             has_header = any(h in lines[0].lower() for h in self.HEADER_KEYWORDS)
 
             if has_header:
-                columns = self._detect_columns(lines[0])
+                data_rows = [ln for ln in lines[1:] if ln.strip()]
+                columns = self._detect_columns(
+                    lines[0],
+                    data_rows[0] if data_rows else None,
+                    data_rows[-1] if data_rows else None)
+                current_scale = self._current_unit_scale(lines[0], columns)
                 data_lines = lines[1:]
             else:
                 columns = {"time": 0, "voltage": 1, "current": 2}
+                current_scale = 1.0
                 data_lines = lines
 
-            data = self._parse_data_lines(data_lines, columns)
+            data = self._parse_data_lines(data_lines, columns, current_scale)
 
             if data:
                 return pd.DataFrame(data)
@@ -78,8 +84,12 @@ class EchemParser:
             logger.error(f"Failed to parse echem file: {e}")
             return None
 
-    def _detect_columns(self, header_line: str) -> Dict[str, int]:
-        """Map column names to indices via keyword matching."""
+    def _detect_columns(self, header_line: str,
+                        sample_line: Optional[str] = None,
+                        last_sample_line: Optional[str] = None) -> Dict[str, int]:
+        """Map column names to indices via keyword matching; the first and
+        last data rows validate that a date-named column really carries
+        per-row timestamps."""
         header_parts = [part.strip().lower() for part in header_line.strip().split("\t")]
 
         detected: Dict[str, int] = {}
@@ -89,24 +99,68 @@ class EchemParser:
             for pattern in patterns:
                 column_mapping[pattern] = col_type
 
+        time_matches = []
+        matched_indices = set()
         for i, part in enumerate(header_parts):
             clean_part = part.replace("(", "").replace(")", "").replace("/", "").replace(" ", "")
 
             if clean_part in column_mapping:
                 detected[column_mapping[clean_part]] = i
+                matched_indices.add(i)
+                if column_mapping[clean_part] == "time":
+                    time_matches.append((i, part))
                 continue
 
             for key, value in column_mapping.items():
                 if key in part:
                     detected[value] = i
+                    matched_indices.add(i)
+                    if value == "time":
+                        time_matches.append((i, part))
                     break
+
+        # When several columns match time keywords, prefer a date-named one:
+        # cycler exports (e.g. Arbin) pair Date_Time with an elapsed-seconds
+        # Test_Time(s) column that must not win the timestamp slot. Among
+        # date candidates, only one whose data carries a time of day (':')
+        # AND varies across the file qualifies: a bare date would collapse
+        # rows to midnight, and a constant metadata datetime (Start_Date)
+        # would silently break correlation.
+        date_matches = [i for i, part in time_matches if "date" in part]
+        if date_matches:
+            first_parts = (sample_line.strip().split("\t")
+                           if sample_line else [])
+            last_parts = (last_sample_line.strip().split("\t")
+                          if last_sample_line else [])
+            for i in date_matches:
+                if not first_parts:
+                    detected["time"] = i
+                    break
+                first_cell = first_parts[i] if i < len(first_parts) else ""
+                last_cell = last_parts[i] if i < len(last_parts) else ""
+                has_clock = ":" in first_cell or ":" in last_cell
+                varies = (not last_parts or last_sample_line is sample_line
+                          or first_cell != last_cell)
+                if has_clock and varies:
+                    detected["time"] = i
+                    break
+            else:
+                # No date candidate qualified: if a bare/constant date column
+                # holds the slot via last-match-wins, hand it to a non-date
+                # candidate so the file fails safe instead of collapsing every
+                # row to midnight
+                non_date = [i for i, part in time_matches if "date" not in part]
+                if detected.get("time") in date_matches and non_date:
+                    detected["time"] = non_date[-1]
 
         # Default positional indices for undetected columns
         columns = {"time": 0, "voltage": 1, "current": 2}
         columns.update(detected)
 
-        # Resolve index collisions between defaults and detected columns
-        used_indices = set(detected.values())
+        # Resolve index collisions between defaults and detected columns.
+        # Every keyword-matched index counts as occupied, so a column vacated
+        # by the date promotion can never be re-bound by a positional default
+        used_indices = set(detected.values()) | matched_indices
         for col_name in columns:
             if col_name not in detected and columns[col_name] in used_indices:
                 logger.warning(
@@ -118,7 +172,21 @@ class EchemParser:
         return columns
 
     @staticmethod
-    def _parse_data_lines(lines: List[str], columns: Dict[str, int]) -> List[Dict[str, Any]]:
+    def _current_unit_scale(header_line: str, columns: Dict[str, int]) -> float:
+        """1000.0 when a current-named column is unit-labelled in amps, e.g.
+        Arbin's 'Current(A)'; stored current values are milliamps."""
+        idx = columns.get("current", -1)
+        parts = [p.strip().lower() for p in header_line.strip().split("\t")]
+        if 0 <= idx < len(parts):
+            part = parts[idx].replace(" ", "")
+            if "(a)" in part and ("current" in part or part.startswith("i(")
+                                  or part.startswith("i/")):
+                return 1000.0
+        return 1.0
+
+    @staticmethod
+    def _parse_data_lines(lines: List[str], columns: Dict[str, int],
+                          current_scale: float = 1.0) -> List[Dict[str, Any]]:
         """Rows as dicts, skipping unparseable lines and placeholder rows;
         ambiguous dates are read day-first (UK convention, by design)."""
         # A disabled time/voltage column (-1) would silently index parts[-1]
@@ -146,8 +214,19 @@ class EchemParser:
                     continue
 
                 try:
-                    timestamp = pd.to_datetime(ts_str, dayfirst=True)
+                    if ts_str[:4].isdigit() and ts_str[4:5] in ("-", "/"):
+                        # Year-first strings, e.g. converted xlsx dates:
+                        # dayfirst=True silently swaps month and day on these
+                        timestamp = pd.to_datetime(ts_str.replace("/", "-"),
+                                                   format="ISO8601")
+                    else:
+                        timestamp = pd.to_datetime(ts_str, dayfirst=True)
                 except (ValueError, TypeError):
+                    continue
+
+                # Blank cells parse to NaT without raising; a NaT row would
+                # win the nearest-timestamp match and void every correlation
+                if pd.isna(timestamp):
                     continue
 
                 try:
@@ -158,7 +237,7 @@ class EchemParser:
                 current = None
                 if 0 <= columns["current"] < len(parts):
                     try:
-                        current = float(parts[columns["current"]])
+                        current = float(parts[columns["current"]]) * current_scale
                     except (ValueError, IndexError):
                         pass
 
@@ -249,13 +328,19 @@ class ScanProcessor:
 
     def _process_echem_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Parse all echem files, concatenate, and sort by timestamp."""
-        echem_paths = df[df["echem"].notna()]["echem"].tolist()
+        echem_rows = df[df["echem"].notna()]
+        echem_paths = echem_rows["echem"].tolist()
+        # source_file records the user's file, not a converted temp copy
+        if "original_path" in df.columns:
+            originals = echem_rows["original_path"].tolist()
+        else:
+            originals = echem_paths
         echem_dfs = []
 
-        for e_path in echem_paths:
+        for e_path, orig in zip(echem_paths, originals):
             e_df = self.echem_parser.parse(e_path)
             if e_df is not None:
-                e_df["source_file"] = e_path
+                e_df["source_file"] = orig if pd.notna(orig) else e_path
                 echem_dfs.append(e_df)
 
         if echem_dfs:
@@ -384,7 +469,7 @@ class ScanProcessor:
                 )
                 scan_list.append(scan)
         else:
-            # In-house: pair 1D and 2D by matching timestamps
+            # Laboratory: pair 1D and 2D by matching timestamps
             oned_df = df[df["oned"].notna()]
             twod_df = df[df["twod"].notna()]
 
