@@ -1,6 +1,6 @@
 """Generate a small synthetic operando dataset to try OperaXN with.
 
-Creates example_data/inhouse (3 laboratory XRD scans + electrochemistry)
+Creates example_data/laboratory (3 laboratory XRD scans + electrochemistry)
 and example_data/neutron (one logbook entry, 2 detector banks in TOF and
 d-spacing + electrochemistry) next to this script. See README.md for the
 walkthrough.
@@ -27,7 +27,7 @@ def write_echem(path):
         f.write("\n".join(rows) + "\n")
 
 
-def make_inhouse(dirpath):
+def make_laboratory(dirpath):
     """3 XRD scans (10:05/10:10/10:15, 120 s exposure) + the echem log."""
     os.makedirs(dirpath, exist_ok=True)
     x = np.linspace(10, 80, 50)
@@ -65,13 +65,13 @@ def make_neutron(dirpath):
 
 def main():
     """Generate both datasets and print what to expect when loading them."""
-    make_inhouse(os.path.join(OUT, "inhouse"))
+    make_laboratory(os.path.join(OUT, "laboratory"))
     make_neutron(os.path.join(OUT, "neutron"))
     print(f"Example data written to {OUT}")
-    print("  inhouse/  3 XRD scans (10:05, 10:10, 10:15) + echem")
-    print("            expected correlation: scan 1 -> 3.76 V")
-    print("  neutron/  scan 123456 (10:00-10:30), banks 1-2, TOF + d + echem")
-    print("            expected correlation: midpoint 10:15 -> 3.85 V")
+    print("  laboratory/  3 XRD scans (10:05, 10:10, 10:15) + echem")
+    print("               expected correlation: scan 1 -> 3.76 V")
+    print("  neutron/     scan 123456 (10:00-10:30), banks 1-2, TOF + d + echem")
+    print("               expected correlation: midpoint 10:15 -> 3.85 V")
     print("Launch `operaxn` and load either folder from the upload dialog.")
 
 

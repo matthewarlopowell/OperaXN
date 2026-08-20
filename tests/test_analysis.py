@@ -1,5 +1,6 @@
 """Echem analysis checks: capacity/ICI/heatmap maths and GUI wiring."""
 import inspect
+import os
 import time
 import warnings
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ tk = pytest.importorskip("tkinter")
 
 import operaxn
 import operaxn.gui as gui_module
+import operaxn.output as output_module
 from operaxn.capacity import (
     _assign_time, classify_phases, assign_cycles, compute_capacity,
     plot_capacity_vs_voltage, plot_time_vs_voltage,
@@ -492,3 +494,257 @@ def test_heatmap_window_renders_and_toggles(tk_root):
         assert bool(hm.ax_v.lines), "voltage track must be plotted"
     finally:
         hm.destroy()
+
+
+# ============================================================================
+# Plot-cache staleness (placeholder branches, GIF frames, clear-all)
+# ============================================================================
+
+@pytest.fixture(autouse=True)
+def _clean_plot_cache():
+    """Plot cache is keyed on id(ax) and test axes are freed constantly."""
+    operaxn.clear_plot_cache()
+    yield
+    operaxn.clear_plot_cache()
+
+
+def test_oned_guard_heals_raw_clear():
+    """A raw ax.clear() must not leave the next plot updating a detached line."""
+    ax = Figure().subplots()
+    x = np.linspace(10, 80, 50)
+    operaxn.plot_oned_data(ax, x, np.arange(50.0), 1)
+    ax.clear()
+    operaxn.plot_oned_data(ax, x, np.arange(50.0) + 5, 2)
+    assert len(ax.lines) == 1, "detached cached line took the update path"
+    assert np.allclose(ax.lines[0].get_ydata(), np.arange(50.0) + 5)
+
+
+def test_twod_guard_evicts_foreign_artist():
+    """A cache entry pointing at another axes' image is evicted, not updated."""
+    img = np.arange(1.0, 65.0).reshape(8, 8)
+    ax_a = Figure().subplots()
+    im_a = operaxn.plot_twod_data(ax_a, img, 1)
+    ax_b = Figure().subplots()
+    output_module._plot_cache.set(f"twod_{id(ax_b)}", im_a)
+    operaxn.plot_twod_data(ax_b, img, 1)
+    assert ax_b.images, "no image drawn on the new axes"
+    assert ax_b.images[0] is not im_a, "foreign artist reused"
+
+
+def test_echem_recreates_after_raw_clear():
+    """The echem update path must not trust a line detached by a raw clear."""
+    ax = Figure().subplots()
+    t = np.arange(10.0)
+    v = 3.7 + 0.01 * np.arange(10)
+    operaxn.plot_echem_data(ax, t, v)
+    ax.clear()
+    operaxn.plot_echem_data(ax, t, v)
+    assert ax.lines, "voltage trace not recreated after a raw clear"
+
+
+def test_oned_plot_recovers_after_placeholder():
+    """A no-1D scan must not blank every later 1D scan (19 Aug field report)."""
+    ax = Figure().subplots()
+    x = np.linspace(10, 80, 50)
+    y1, y3 = np.arange(50.0), np.arange(50.0) + 7
+    fake = SimpleNamespace(
+        axes={"oned": ax},
+        state=SimpleNamespace(oned_arrays={1: {"x": x, "y": y1},
+                                           3: {"x": x, "y": y3}}),
+        config=operaxn.VisualiserConfig(),
+    )
+    OPERAXN._update_oned_plot(fake, 1, {})
+    assert len(ax.lines) == 1
+    OPERAXN._update_oned_plot(fake, 2, {})
+    assert not ax.lines
+    assert any("No 1D data" in t.get_text() for t in ax.texts)
+    OPERAXN._update_oned_plot(fake, 3, {})
+    assert len(ax.lines) == 1, "scan after placeholder rendered blank"
+    assert np.allclose(ax.lines[0].get_ydata(), y3)
+    assert not any("No 1D data" in t.get_text() for t in ax.texts), "stale placeholder"
+
+
+def test_twod_plot_recovers_and_colorbar_singular():
+    """The 2D pane recovers after a 2D-less scan with exactly one live colorbar."""
+    fig = Figure()
+    ax = fig.subplots()
+    img = np.arange(1.0, 65.0).reshape(8, 8)
+    fake = SimpleNamespace(
+        axes={"twod": ax},
+        state=SimpleNamespace(twod_arrays={1: {"image": img}, 3: {"image": img * 2}},
+                              current_scan_idx=0, intensity_limits={}),
+        controls=SimpleNamespace(update_intensity_range=lambda *a: None),
+        config=operaxn.VisualiserConfig(),
+        twod_image=None,
+    )
+    fake._calculate_intensity_limits = OPERAXN._calculate_intensity_limits.__get__(fake)
+    OPERAXN._update_twod_plot(fake, 1, {})
+    assert len(ax.images) == 1 and len(fig.axes) == 2, "image + colorbar expected"
+    OPERAXN._update_twod_plot(fake, 2, {})
+    assert not ax.images
+    assert len(fig.axes) == 1, "orphaned colorbar axes left behind"
+    OPERAXN._update_twod_plot(fake, 3, {})
+    assert len(ax.images) == 1, "scan after placeholder rendered blank"
+    assert len(fig.axes) == 2, "colorbar missing or stacked"
+    assert not any("No 2D data" in t.get_text() for t in ax.texts)
+
+
+def test_echem_plot_recovers_after_placeholder():
+    """The echem pane recovers after an echem-less dataset was shown."""
+    ax = Figure().subplots()
+    with_data = {"x": np.arange(10.0) * 60.0, "y": 3.7 + 0.01 * np.arange(10)}
+    fake = SimpleNamespace(
+        axes={"echem": ax},
+        state=SimpleNamespace(echem_arrays=with_data, scans=[],
+                              echem_df=pd.DataFrame(), time_method="absolute",
+                              current_scan_idx=0),
+        config=operaxn.VisualiserConfig(),
+    )
+    OPERAXN._update_echem_plot(fake)
+    assert ax.lines
+    fake.state.echem_arrays = {"x": np.array([])}
+    OPERAXN._update_echem_plot(fake)
+    assert any("No echem data" in t.get_text() for t in ax.texts)
+    fake.state.echem_arrays = with_data
+    OPERAXN._update_echem_plot(fake)
+    assert ax.lines, "echem trace not recreated after placeholder"
+    assert not any("No echem data" in t.get_text() for t in ax.texts)
+
+
+def test_gif_frame_leaves_cache_clean(monkeypatch, tmp_path):
+    """GIF frames must not cache artists keyed on their throwaway axes."""
+    x = np.linspace(10, 80, 50)
+    monkeypatch.setattr(gui_module, "get_correlated_data",
+                        lambda *a, **k: {"scan_num": 1,
+                                         "oned": {"x": x, "y": np.arange(50.0)},
+                                         "twod": None})
+    fake = SimpleNamespace(
+        state=SimpleNamespace(data_source=gui_module.DataSourceType.INHOUSE,
+                              scans=[], echem_df=pd.DataFrame(),
+                              echem_arrays={"x": np.array([])},
+                              intensity_limits={}, time_method="absolute"),
+        config=operaxn.VisualiserConfig(),
+    )
+    frame = OPERAXN._create_gif_frame(fake, str(tmp_path), 0, {"scan_num": 1}, dpi=50)
+    assert frame is not None and os.path.isfile(frame)
+    assert output_module._plot_cache.cache == {}, \
+        f"GIF frame cached artists on freed axes: {list(output_module._plot_cache.cache)}"
+
+
+def test_clear_all_clears_plot_cache():
+    """Clear-all evicts the cache entries keyed on the axes it destroys."""
+    output_module._plot_cache.set("sentinel", object())
+    fake = SimpleNamespace(
+        state=SimpleNamespace(scans=[], dialog_windows=[], reset=lambda: None),
+        plot_container=SimpleNamespace(winfo_children=lambda: []),
+        _show_empty_state=lambda: None,
+        file_list=SimpleNamespace(update_items=lambda items: None),
+        scan_selector=SimpleNamespace(set_range=lambda a, b: None,
+                                      set_value=lambda v: None),
+        button_panel=SimpleNamespace(update_states=lambda states: None),
+        controls=SimpleNamespace(grid_remove=lambda: None),
+        fig=None, axes={}, canvas=None, twod_image=None,
+    )
+    OPERAXN._clear_all(fake)
+    assert output_module._plot_cache.cache == {}, "clear-all left cache entries"
+
+
+def test_needs_recreate_current_rebuild_matrix():
+    """A wanted current trace whose cache entry is gone or whose line is
+    detached always forces a rebuild, never a set_data no-op."""
+    plotter = output_module._echem_plotter
+    t = np.arange(10.0)
+
+    # Current-only layout, cache wiped mid-session
+    ax = Figure().subplots()
+    plotter._recreate_plot(ax, t, np.array([]), 0.1 + 0.0 * t, False, True)
+    operaxn.clear_plot_cache()
+    assert plotter._needs_recreate(ax, False, True), \
+        "cleared cache with wanted current must force a rebuild"
+
+    # Both-traces layout, current line detached from its twin
+    ax = Figure().subplots()
+    operaxn.plot_echem_data(ax, t, 3.7 + 0.01 * t, 0.1 + 0.0 * t)
+    current_line = output_module._plot_cache.get(f"echem_c_{id(ax)}")
+    assert current_line is not None
+    current_line.remove()
+    assert plotter._needs_recreate(ax, True, True), \
+        "detached current line must force a rebuild"
+
+
+def test_scan_time_positions_align_with_scans():
+    """The positions list is 1:1 with scans, None for untimestamped ones."""
+    echem = pd.DataFrame({"timestamp": pd.date_range("2026-06-01 10:00", periods=5,
+                                                     freq="60s"),
+                          "echem_data": np.linspace(3.0, 3.4, 5)})
+    scans = [
+        {"scan_num": 1, "timestamp": "2026-06-01 10:00:00"},
+        {"scan_num": 2, "timestamp": None},
+        {"scan_num": 3, "timestamp": "2026-06-01 10:02:00"},
+    ]
+    positions = operaxn.get_scan_time_positions(scans, echem, "absolute")
+    assert len(positions) == 3, "must stay aligned with the scan list"
+    assert positions[0] == 0.0 and positions[1] is None and positions[2] == 120.0
+
+
+def test_scan_marker_skips_none_position():
+    """A None position hides the marker instead of crashing or misplacing it."""
+    ax = Figure().subplots()
+    t = np.arange(10.0) * 3600.0
+    v = 3.7 + 0.01 * np.arange(10)
+    operaxn.plot_echem_data(ax, t, v, scan_times=[0.0, None, 7200.0],
+                            current_scan_idx=0)
+    marker = output_module._plot_cache.get(f"echem_marker_{id(ax)}")
+    assert marker is not None and marker.get_visible()
+    operaxn.plot_echem_data(ax, t, v, scan_times=[0.0, None, 7200.0],
+                            current_scan_idx=1)
+    assert not marker.get_visible(), "None position must hide the marker"
+    operaxn.plot_echem_data(ax, t, v, scan_times=[0.0, None, 7200.0],
+                            current_scan_idx=2)
+    assert marker.get_visible(), "marker must reappear for a timed scan"
+    assert marker.get_xdata()[0] == 2.0, f"got {marker.get_xdata()[0]}"
+
+
+def test_gif_frame_marks_scan_position_not_frame_index(monkeypatch, tmp_path):
+    """A sub-range GIF must mark each frame at its own scan's time."""
+    x = np.linspace(10, 80, 50)
+    captured = {}
+
+    def spy_plot_echem(ax, tx, ty, current, scan_times, idx, plot_config=None):
+        captured["idx"] = idx
+
+    monkeypatch.setattr(gui_module, "get_correlated_data",
+                        lambda *a, **k: {"scan_num": 5,
+                                         "oned": {"x": x, "y": np.arange(50.0)},
+                                         "twod": None})
+    monkeypatch.setattr(gui_module, "plot_echem_data", spy_plot_echem)
+    monkeypatch.setattr(gui_module, "get_scan_time_positions",
+                        lambda *a, **k: [float(i) for i in range(10)])
+    fake = SimpleNamespace(
+        state=SimpleNamespace(data_source=gui_module.DataSourceType.INHOUSE,
+                              scans=[{"scan_num": n} for n in range(1, 11)],
+                              echem_df=pd.DataFrame({"timestamp": [1]}),
+                              echem_arrays={"x": np.arange(5.0),
+                                            "y": 3.7 + np.arange(5.0)},
+                              intensity_limits={}, time_method="absolute"),
+        config=operaxn.VisualiserConfig(),
+    )
+    frame = OPERAXN._create_gif_frame(fake, str(tmp_path), 0, {"scan_num": 5}, dpi=50)
+    assert frame is not None
+    assert captured["idx"] == 4, \
+        f"frame 0 of a range starting at scan 5 must mark index 4, got {captured['idx']}"
+
+
+def test_current_only_refresh_never_spawns_empty_twin():
+    """Repeated current-only refreshes update in place with no phantom twin."""
+    fig = Figure()
+    ax = fig.subplots()
+    t = np.arange(10.0)
+    c = 0.1 + 0.01 * np.arange(10)
+    cfg = {"show_voltage": False, "show_current": True}
+    for _ in range(3):
+        operaxn.plot_echem_data(ax, t, np.array([]), c, plot_config=cfg)
+    assert not hasattr(ax, "_ax2"), "empty twin axes spawned on refresh"
+    assert len(fig.axes) == 1, f"got {len(fig.axes)} axes"
+    data_lines = [ln for ln in ax.lines if len(ln.get_xdata()) == 10]
+    assert len(data_lines) == 1, "current trace duplicated or lost"

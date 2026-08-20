@@ -65,6 +65,7 @@ from .output import (
     create_figure_layout,
     export_single_scan,
     clear_plot_cache,
+    clear_plot_axes,
     get_scan_time_positions,
     PlotConfig
 )
@@ -104,6 +105,7 @@ __all__ = [
     'create_figure_layout',
     'export_single_scan',
     'clear_plot_cache',
+    'clear_plot_axes',
 
     # Echem analysis
     'classify_phases',

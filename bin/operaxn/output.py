@@ -109,8 +109,9 @@ class PlotConfig:
             'is_neutron': False
         }
 
-        for key, value in defaults.items():
-            config_dict.setdefault(key, value)
+        # Merge onto a copy: mutating the caller's dict would surprise
+        # callers that reuse or serialise their config
+        config_dict = {**defaults, **config_dict}
 
         return cls(**{k: v for k, v in config_dict.items()
                       if k in cls.__dataclass_fields__})
@@ -444,6 +445,13 @@ class OneDPlotter(BasePlotter):
         cache_key = self._get_cache_key(ax, "oned")
         plot_line = _plot_cache.get(cache_key)
 
+        # A cached line detached by a raw ax.clear() (or an id-reuse
+        # collision) must not take the update path: set_data on it draws
+        # nothing and leaves any placeholder text in place
+        if plot_line is not None and plot_line not in ax.lines:
+            _plot_cache.remove(cache_key)
+            plot_line = None
+
         if plot_line and config.use_cache:
             self._update_plot(ax, plot_line, x_data, y_data, config)
         else:
@@ -528,12 +536,32 @@ class TwoDPlotter(BasePlotter):
         cache_key = self._get_cache_key(ax, "twod")
         image_plot = _plot_cache.get(cache_key)
 
+        # Same staleness guard as OneDPlotter: never update a detached image
+        if image_plot is not None and image_plot not in ax.images:
+            _plot_cache.remove(cache_key)
+            image_plot = None
+
         if image_plot and config.use_cache:
             return self._update_plot(ax, image_plot, cropped_image,
                                      intensity_limits, extent)
         else:
             return self._create_plot(ax, cropped_image, intensity_limits,
                                      extent, cache_key, config)
+
+    def clear(self, ax: plt.Axes, cache_prefix: Optional[str] = None) -> None:
+        """Clear axes and cache entry, removing any companion colorbar axes
+        (ax.clear() leaves the _colorbar_ax attribute and its axes behind)."""
+        super().clear(ax, cache_prefix)
+        if hasattr(ax, '_colorbar_ax'):
+            try:
+                ax._colorbar_ax.remove()
+            except (AttributeError, KeyError, ValueError, NotImplementedError):
+                pass
+            delattr(ax, '_colorbar_ax')
+            # The divider locator would keep reserving the colorbar strip,
+            # and the image's aspect lock would narrow the placeholder pane
+            ax.set_axes_locator(None)
+            ax.set_aspect('auto')
 
     def _calculate_extent(self, image_data: np.ndarray,
                           config: PlotConfig) -> Tuple[float, float, float, float]:
@@ -688,12 +716,12 @@ class EchemPlotter(BasePlotter):
 
         if self._needs_recreate(ax, show_voltage, show_current) or not config.use_cache:
             self._recreate_plot(ax, time_hours, voltage_data, current_data,
-                                show_voltage, show_current)
+                                show_voltage, show_current, config)
         else:
             self._update_existing_plot(ax, time_hours, voltage_data, current_data,
                                        show_voltage, show_current)
 
-        self._update_scan_marker(ax, scan_times, current_scan_idx)
+        self._update_scan_marker(ax, scan_times, current_scan_idx, config)
 
         if show_voltage or show_current:
             ax.set_xlabel("Time (hours)", fontsize=LABEL_FONT_SIZE)
@@ -715,34 +743,53 @@ class EchemPlotter(BasePlotter):
                 len(current_data) > 0 and
                 not np.all(np.isnan(current_data)))
 
+    @staticmethod
+    def _line_attached(line: Any, ax: plt.Axes) -> bool:
+        """True when the cached line still belongs to this axes or its twin
+        (a raw ax.clear() detaches lines without evicting the cache)."""
+        if line is None:
+            return False
+        if line in ax.lines:
+            return True
+        ax2 = getattr(ax, '_ax2', None)
+        return ax2 is not None and line in ax2.lines
+
     def _needs_recreate(self, ax: plt.Axes, show_voltage: bool,
                         show_current: bool) -> bool:
         """Return True if the plot must be rebuilt from scratch."""
         voltage_line = _plot_cache.get(self._get_cache_key(ax, "echem_v"))
         current_line = _plot_cache.get(self._get_cache_key(ax, "echem_c"))
 
-        has_voltage = voltage_line is not None and voltage_line.get_visible()
-        has_current = current_line is not None and current_line.get_visible()
+        voltage_attached = self._line_attached(voltage_line, ax)
+        current_attached = self._line_attached(current_line, ax)
+        has_voltage = voltage_attached and voltage_line.get_visible()
+        has_current = current_attached and current_line.get_visible()
         has_secondary = hasattr(ax, '_ax2')
 
+        # A wanted-but-detached current line forces a rebuild (an attached
+        # invisible one is just re-shown by the update path, keeping zoom)
         return ((show_voltage and show_current and not has_secondary) or
                 (not show_voltage and not show_current) or
                 (show_voltage != has_voltage) or
+                (show_current and not current_attached) or
                 (show_current != has_current and has_secondary))
 
     def _recreate_plot(self, ax: plt.Axes, time_hours: np.ndarray,
                        voltage_data: np.ndarray, current_data: Optional[np.ndarray],
-                       show_voltage: bool, show_current: bool) -> None:
+                       show_voltage: bool, show_current: bool,
+                       config: Optional[PlotConfig] = None) -> None:
         """Clear and rebuild the echem plot from scratch."""
+        if config is None:
+            config = PlotConfig()
         self.clear(ax)
         ax.grid(False)
 
         if show_voltage and show_current:
-            self._plot_both(ax, time_hours, voltage_data, current_data)
+            self._plot_both(ax, time_hours, voltage_data, current_data, config)
         elif show_voltage:
-            self._plot_voltage_only(ax, time_hours, voltage_data)
+            self._plot_voltage_only(ax, time_hours, voltage_data, config)
         elif show_current:
-            self._plot_current_only(ax, time_hours, current_data)
+            self._plot_current_only(ax, time_hours, current_data, config)
         else:
             self.formatter.clear_with_message(ax, "No data selected for display")
 
@@ -762,7 +809,11 @@ class EchemPlotter(BasePlotter):
             voltage_line.set_visible(False)
 
         if show_current:
-            if not hasattr(ax, '_ax2'):
+            if current_line is not None and current_line in ax.lines:
+                # Current-only layout: the trace lives on the primary axes,
+                # so style that axes rather than spawning an empty twin
+                ax2 = ax
+            elif not hasattr(ax, '_ax2'):
                 ax2 = ax.twinx()
                 ax._ax2 = ax2
             else:
@@ -792,29 +843,34 @@ class EchemPlotter(BasePlotter):
             delattr(ax, '_ax2')
 
     def _plot_voltage_only(self, ax: plt.Axes, time_hours: np.ndarray,
-                           voltage_data: np.ndarray) -> None:
+                           voltage_data: np.ndarray,
+                           config: Optional[PlotConfig] = None) -> None:
         """Plot voltage trace on primary axis."""
         color = "tab:red"
         ax.set_ylabel("Voltage (V)", color=color, fontsize=LABEL_FONT_SIZE)
         line, = ax.plot(time_hours, voltage_data, color=color,
                         linewidth=1.5, label="Voltage")
         ax.tick_params(axis="y", labelcolor=color, labelsize=TICK_FONT_SIZE)
-        _plot_cache.set(self._get_cache_key(ax, "echem_v"), line)
+        if config is None or config.use_cache:
+            _plot_cache.set(self._get_cache_key(ax, "echem_v"), line)
 
     def _plot_current_only(self, ax: plt.Axes, time_hours: np.ndarray,
-                           current_data: np.ndarray) -> None:
+                           current_data: np.ndarray,
+                           config: Optional[PlotConfig] = None) -> None:
         """Plot current trace on primary axis."""
         color = "tab:blue"
         ax.set_ylabel("Current (mA)", color=color, fontsize=LABEL_FONT_SIZE)
         line, = ax.plot(time_hours, current_data, color=color,
                         linewidth=1.5, label="Current")
         ax.tick_params(axis="y", labelcolor=color, labelsize=TICK_FONT_SIZE)
-        _plot_cache.set(self._get_cache_key(ax, "echem_c"), line)
+        if config is None or config.use_cache:
+            _plot_cache.set(self._get_cache_key(ax, "echem_c"), line)
 
     def _plot_both(self, ax: plt.Axes, time_hours: np.ndarray,
-                   voltage_data: np.ndarray, current_data: np.ndarray) -> None:
+                   voltage_data: np.ndarray, current_data: np.ndarray,
+                   config: Optional[PlotConfig] = None) -> None:
         """Plot voltage on primary and current on secondary axis."""
-        self._plot_voltage_only(ax, time_hours, voltage_data)
+        self._plot_voltage_only(ax, time_hours, voltage_data, config)
 
         ax2 = ax.twinx()
         ax._ax2 = ax2
@@ -824,27 +880,37 @@ class EchemPlotter(BasePlotter):
                           linewidth=1.5, label="Current")
         ax2.tick_params(axis="y", labelcolor=color, labelsize=TICK_FONT_SIZE)
 
-        _plot_cache.set(self._get_cache_key(ax, "echem_c"), line2)
+        if config is None or config.use_cache:
+            _plot_cache.set(self._get_cache_key(ax, "echem_c"), line2)
 
         ax.set_zorder(ax2.get_zorder() + 1)
         ax.patch.set_visible(False)
 
     def _update_scan_marker(self, ax: plt.Axes, scan_times: Optional[List[float]],
-                            current_scan_idx: Optional[int]) -> None:
+                            current_scan_idx: Optional[int],
+                            config: Optional[PlotConfig] = None) -> None:
         """Add or update vertical scan-position marker line."""
         cache_key = self._get_cache_key(ax, "echem_marker")
         marker_line = _plot_cache.get(cache_key)
 
+        # A marker detached by a clear must be recreated, not moved
+        if marker_line is not None and marker_line not in ax.lines:
+            _plot_cache.remove(cache_key)
+            marker_line = None
+
         if (scan_times and current_scan_idx is not None and
-                current_scan_idx < len(scan_times)):
+                current_scan_idx < len(scan_times) and
+                scan_times[current_scan_idx] is not None):
             scan_time_hours = self.transformer.time_to_hours(scan_times[current_scan_idx])
 
             if marker_line:
                 marker_line.set_xdata([scan_time_hours, scan_time_hours])
+                marker_line.set_visible(True)
             else:
                 marker_line = ax.axvline(x=scan_time_hours, color="red",
                                          linestyle="--", alpha=1.0, linewidth=2)
-                _plot_cache.set(cache_key, marker_line)
+                if config is None or config.use_cache:
+                    _plot_cache.set(cache_key, marker_line)
         elif marker_line:
             marker_line.set_visible(False)
 
@@ -1109,8 +1175,8 @@ def export_single_scan(scan_data: Dict[str, Any], output_path: str,
     if plot_types is None:
         plot_types = {"oned": True, "twod": True, "echem": True}
 
-    config = PlotConfig.from_dict(plot_config) if plot_config else PlotConfig()
-    config.use_cache = False  # Disable cache for export
+    # Exports draw on throwaway figures: never cache their artists
+    export_config = {**(plot_config or {}), "use_cache": False}
 
     has_oned = scan_data.get("oned") is not None and plot_types.get("oned", True)
     has_twod = scan_data.get("twod") is not None and plot_types.get("twod", True)
@@ -1127,33 +1193,35 @@ def export_single_scan(scan_data: Dict[str, Any], output_path: str,
         scan_num=scan_data["scan_num"],
         echem_value=echem_value,
         current_value=current_value,
-        plot_config=plot_config
+        plot_config=export_config
     )
 
     if has_oned and "oned" in axes:
         plot_oned_data(
             axes["oned"], scan_data["oned"]["x"], scan_data["oned"]["y"],
             scan_data["scan_num"], scan_data.get("echem_value"),
-            scan_data.get("current_value"), plot_config
+            scan_data.get("current_value"), export_config
         )
 
     if has_twod and "twod" in axes:
         plot_twod_data(
             axes["twod"], scan_data["twod"], scan_data["scan_num"],
             scan_data.get("echem_value"), scan_data.get("current_value"),
-            intensity_limits, plot_config, extent
+            intensity_limits, export_config, extent
         )
 
     if has_neutron and scan_data.get("neutron"):
         plot_neutron_data(
             fig, axes, scan_data["neutron"], scan_data["scan_num"],
             scan_data.get("echem_value"), scan_data.get("current_value"),
-            plot_config
+            export_config
         )
 
-    fig.savefig(output_path, dpi=export_dpi, bbox_inches="tight",
-                facecolor='white', edgecolor='none')
-    plt.close(fig)
+    try:
+        fig.savefig(output_path, dpi=export_dpi, bbox_inches="tight",
+                    facecolor='white', edgecolor='none')
+    finally:
+        plt.close(fig)
 
 
 def clear_plot_cache() -> None:
@@ -1161,26 +1229,42 @@ def clear_plot_cache() -> None:
     _plot_cache.clear()
 
 
+def clear_plot_axes(ax: plt.Axes, kind: str) -> None:
+    """Clear axes via the owning plotter so cache entries and companion
+    axes (colorbar, twinx) are removed with the artists."""
+    if kind == "oned":
+        _oned_plotter.clear(ax, "oned")
+    elif kind == "twod":
+        _twod_plotter.clear(ax, "twod")
+    elif kind == "echem":
+        _echem_plotter.clear(ax)
+    else:
+        raise ValueError(f"Unknown plot kind: {kind}")
+
+
 def get_scan_time_positions(scans: List[Dict[str, Any]],
                             echem_df: pd.DataFrame,
-                            time_method: str = "absolute") -> List[float]:
-    """Compute scan timestamps in seconds for echem plot markers."""
+                            time_method: str = "absolute") -> List[Optional[float]]:
+    """Scan timestamps in seconds for echem plot markers, aligned 1:1 with
+    `scans` (None for scans without a usable timestamp, so index i always
+    refers to scan i)."""
     if echem_df is None or echem_df.empty:
         return []
 
-    scan_times = []
+    scan_times: List[Optional[float]] = []
 
     if time_method == "relative":
         for scan in scans:
-            if scan.get("timestamp"):
-                ts = scan["timestamp"]
-                if isinstance(ts, str) and ":" in ts:
-                    parts = ts.split(":")
-                    seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-                    scan_times.append(seconds)
+            seconds = None
+            ts = scan.get("timestamp")
+            if ts and isinstance(ts, str) and ":" in ts:
+                parts = ts.split(":")
+                seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            scan_times.append(seconds)
     else:
         echem_start = pd.to_datetime(echem_df["timestamp"].min())
         for scan in scans:
+            time_diff = None
             if scan.get("timestamp"):
                 # Prefer the midpoint-adjusted timestamp so the marker lands on
                 # the echem point the scan was correlated against
@@ -1188,6 +1272,6 @@ def get_scan_time_positions(scans: List[Dict[str, Any]],
                 if scan_time is None:
                     scan_time = pd.to_datetime(scan["timestamp"])
                 time_diff = (pd.to_datetime(scan_time) - echem_start).total_seconds()
-                scan_times.append(time_diff)
+            scan_times.append(time_diff)
 
     return scan_times

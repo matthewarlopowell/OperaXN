@@ -1,6 +1,7 @@
 """Checks for the operaxn.input adapter (GUI contract over the core pipeline)."""
 import os
 import shutil
+import zipfile
 
 import numpy as np
 import pandas as pd
@@ -323,6 +324,156 @@ def test_cache_user_nxs_never_deleted(inhouse_dir, tmp_path):
     _discard(core.default_cache_path([inhouse_dir]))
 
 
+# ============================================================================
+# ZIP 2D sidecar lifecycle (persist -> resolve -> export -> cleanup)
+# ============================================================================
+
+def _write_twod_zip(tmp_path):
+    """A ZIP holding one XRD .dat and one EDF image at the same timestamp."""
+    return _builders.write_twod_zip(str(tmp_path / "cell.zip"), tmp_path)
+
+
+@needs_fabio
+def test_cache_zip_images_dir_cleaned(tmp_path):
+    """The images dir persisted for a ZIP input is removed with its cache file."""
+    zpath = _write_twod_zip(tmp_path)
+    process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    cache_file = get_loaded_nxs_path()
+    images_dir = os.path.splitext(cache_file)[0] + "_images"
+    assert os.path.isdir(images_dir), "images dir not persisted for ZIP input"
+    cleanup_session_cache()
+    assert not os.path.exists(cache_file)
+    assert not os.path.isdir(images_dir)
+
+
+@needs_fabio
+def test_export_copies_zip_images_sidecar(tmp_path):
+    """Exporting a ZIP-loaded experiment carries its 2D images sidecar along."""
+    zpath = _write_twod_zip(tmp_path)
+    process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    dest = str(tmp_path / "kept.nxs")
+    ok, _ = export_nxs(dest)
+    assert ok
+    dest_images = str(tmp_path / "kept_images")
+    assert os.path.isdir(dest_images), "sidecar not copied on export"
+    edfs = [f for _, _, fs in os.walk(dest_images) for f in fs if f.endswith(".edf")]
+    assert edfs == ["image_001.edf"], f"got {edfs}"
+
+
+@needs_fabio
+def test_exported_zip_twod_resolves_after_cache_cleanup(tmp_path):
+    """An exported ZIP experiment shows its 2D via the sibling images dir even
+    after the session cache copy of the images is gone."""
+    zpath = _write_twod_zip(tmp_path)
+    process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    cache_images = os.path.splitext(get_loaded_nxs_path())[0] + "_images"
+    dest = str(tmp_path / "kept.nxs")
+    ok, _ = export_nxs(dest)
+    assert ok
+    shutil.rmtree(cache_images)  # simulate the cache being cleaned later
+    scans, _, _ = process_paths([dest], time_method=TimeMethod.ABSOLUTE,
+                                data_source=DataSourceType.INHOUSE)
+    arrays = make_twod_arrays(scans)
+    assert 1 in arrays and arrays[1]["image"].shape == (8, 8), \
+        "2D not resolved from the exported sibling images dir"
+
+
+@needs_fabio
+def test_exported_session_cleanup_drops_cache_sidecar_keeps_nxs(tmp_path):
+    """Exported sessions keep the cache .nxs but not the bulky images sidecar
+    (the export carries its own copy; %TEMP% must not accumulate 2D sets)."""
+    zpath = _write_twod_zip(tmp_path)
+    process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    cache_file = get_loaded_nxs_path()
+    cache_images = os.path.splitext(cache_file)[0] + "_images"
+    dest = str(tmp_path / "kept.nxs")
+    ok, _ = export_nxs(dest)
+    assert ok and os.path.isdir(cache_images)
+    cleanup_session_cache()  # exported flag still True: app-exit behaviour
+    assert os.path.isfile(cache_file), "exported cache .nxs must be kept"
+    assert not os.path.isdir(cache_images), "cache sidecar must not leak"
+    assert os.path.isdir(str(tmp_path / "kept_images")), "export copy intact"
+    _discard(cache_file)
+
+
+@needs_fabio
+def test_foreign_images_dir_preserved_and_never_served(tmp_path):
+    """A user's own folder named like the sidecar is never deleted by export
+    and never used for display; the skipped copy is reported as a warning."""
+    zpath = _write_twod_zip(tmp_path)
+    process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    cache_images = os.path.splitext(get_loaded_nxs_path())[0] + "_images"
+    dest = str(tmp_path / "kept.nxs")
+    foreign = tmp_path / "kept_images"
+    os.makedirs(foreign)
+    (foreign / "precious.txt").write_text("user data")
+    (foreign / "image_001.edf").write_bytes(b"not an image")
+    ok, msgs = export_nxs(dest)
+    assert ok, "export itself must still succeed"
+    assert any(m.startswith("Warning") for m in msgs), \
+        "sidecar copy failure must be reported to the caller"
+    assert (foreign / "precious.txt").read_text() == "user data", \
+        "user's folder was clobbered by the sidecar copy"
+    shutil.rmtree(cache_images)
+    scans, _, _ = process_paths([dest], time_method=TimeMethod.ABSOLUTE,
+                                data_source=DataSourceType.INHOUSE)
+    assert make_twod_arrays(scans) == {}, \
+        "foreign unmarked folder must not be served as 2D data"
+
+
+@needs_fabio
+def test_working_copy_carries_images_sidecar(tmp_path):
+    """Add-echem to a reopened export keeps 2D viewable in the next export."""
+    zpath = _write_twod_zip(tmp_path)
+    process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    v1 = str(tmp_path / "master_v1.nxs")
+    ok, _ = export_nxs(v1)
+    assert ok
+    process_paths([v1], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    extra = str(tmp_path / "extra_echem.txt")
+    _builders.write_echem_txt(extra, n_rows=5)
+    added = add_standard_echem_files([extra])
+    assert added, "standard echem must append"
+    v2 = str(tmp_path / "master_v2.nxs")
+    ok, _ = export_nxs(v2)
+    assert ok
+    assert os.path.isdir(str(tmp_path / "master_v2_images")), \
+        "sidecar lost through the working-copy flow"
+    scans, _, _ = process_paths([v2], time_method=TimeMethod.ABSOLUTE,
+                                data_source=DataSourceType.INHOUSE)
+    arrays = make_twod_arrays(scans)
+    assert 1 in arrays and arrays[1]["image"].shape == (8, 8), \
+        "2D not viewable in the second-generation export"
+
+
+@needs_fabio
+def test_resolution_handles_foreign_separator_paths(tmp_path):
+    """A recorded path with the other OS's separators still resolves."""
+    zpath = _write_twod_zip(tmp_path)
+    process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    dest = str(tmp_path / "kept.nxs")
+    ok, _ = export_nxs(dest)
+    assert ok
+    process_paths([dest], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    recorded = "/tmp/operaxn_cache/cell_images/image_001.edf"  # POSIX form
+    resolved = gui_input._resolve_twod_source(recorded)
+    assert resolved and resolved.endswith("image_001.edf") and \
+        os.path.isfile(resolved), f"got {resolved}"
+
+
+# ============================================================================
+# Session cache lifecycle
+# ============================================================================
+
 def test_cache_replaced_by_new_load(inhouse_dir, neutron_dir):
     """Loading a new dataset removes the previous unsaved cache file."""
     process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
@@ -442,3 +593,5 @@ def test_display_size_caps_stored_synchrotron_images(tmp_path):
     assert m_syn.scans[0].twod is not None, "no stored image"
     assert m_syn.scans[0].twod.shape == (8, 8), str(m_syn.scans[0].twod.shape)
     assert m_syn.scans[0].echem == 3.76, f"got {m_syn.scans[0].echem}"
+
+

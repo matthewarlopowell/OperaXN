@@ -51,9 +51,9 @@ ProgressCallback = Optional[Callable[[str], None]]
 # Tabular format conversion
 # ============================================================================
 
-def convert_tabular_to_txt(path: str) -> str:
+def convert_tabular_to_txt(path: str, dest_dir: Optional[str] = None) -> str:
     """Convert .xlsx/.csv to tab-delimited .txt; returns original path otherwise
-    or on failure."""
+    or on failure. `dest_dir` places the temp file in a caller-managed dir."""
     lower = path.lower()
     if lower.endswith('.xlsx'):
         read = pd.read_excel
@@ -62,16 +62,23 @@ def convert_tabular_to_txt(path: str) -> str:
     else:
         return path
 
+    txt_path = None
     try:
         df = read(path)
         base_name = os.path.splitext(os.path.basename(path))[0]
-        fd, txt_path = tempfile.mkstemp(prefix=f"{base_name}_", suffix=".txt")
+        fd, txt_path = tempfile.mkstemp(prefix=f"{base_name}_", suffix=".txt",
+                                        dir=dest_dir)
         os.close(fd)
         df.to_csv(txt_path, sep='\t', index=False)
         logger.info(f"Converted {os.path.basename(path)} to txt format")
         return txt_path
     except Exception as e:
         logger.error(f"Error converting tabular file {path}: {e}")
+        if txt_path is not None:
+            try:
+                os.remove(txt_path)
+            except OSError:
+                pass
         return path
 
 
@@ -167,10 +174,10 @@ class FileProcessor:
         logger.info(f"Collected {len(all_files)} total files")
         return all_files
 
-    @staticmethod
-    def _convert_files_to_txt(files: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-        """Convert .xlsx and .csv to tab-delimited .txt for uniform parsing."""
-        return [(convert_tabular_to_txt(extracted), original)
+    def _convert_files_to_txt(self, files: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        """Convert .xlsx and .csv to tab-delimited .txt for uniform parsing;
+        converted files live in the session tempdir so __exit__ removes them."""
+        return [(convert_tabular_to_txt(extracted, dest_dir=self.tempdir), original)
                 for extracted, original in files]
 
     def _extract_zip_files(self, zip_path: str) -> List[Tuple[str, str]]:
@@ -330,6 +337,63 @@ def process_raw(input_paths: List[str],
                              progress_callback, time_method)
 
 
+def _persist_zip_twod_sources(scans: List[Scan], output_path: str,
+                              tempdir: Optional[str],
+                              messages: Optional[List[str]] = None) -> Optional[str]:
+    """Copy zip-extracted 2D images to a <stem>_images dir beside output_path
+    and repoint the scans: the extraction tempdir dies with the processor, so
+    by-reference 2D from a ZIP would otherwise never be viewable."""
+    if not tempdir:
+        return None
+    temp_root = os.path.realpath(tempdir)
+    pending = [s for s in scans if s.twod and
+               os.path.realpath(str(s.twod)).startswith(temp_root + os.sep)]
+    if not pending:
+        return None
+
+    images_dir = os.path.splitext(output_path)[0] + "_images"
+    marker = os.path.join(images_dir, ".operaxn_images")
+    if os.path.isdir(images_dir):
+        # Only replace a directory this tool created (marker file present):
+        # a user's own folder with this name must never be deleted
+        if os.path.isfile(marker):
+            shutil.rmtree(images_dir, ignore_errors=True)
+        else:
+            logger.warning(f"Existing directory {images_dir} was not created by "
+                           "OperaXN; ZIP 2D references will not be persisted")
+            if messages is not None:
+                messages.append(
+                    f"Warning: {os.path.basename(images_dir)} already exists "
+                    "and was not created by OperaXN, so 2D images from the "
+                    "ZIP will not be viewable")
+            return None
+
+    copied: Dict[str, str] = {}
+    try:
+        os.makedirs(images_dir, exist_ok=True)
+        with open(marker, "w") as f:
+            f.write("Created by OperaXN alongside the matching .nxs file.\n")
+        for scan in pending:
+            src = os.path.realpath(str(scan.twod))
+            if src not in copied:
+                dest = os.path.join(images_dir, os.path.relpath(src, temp_root))
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy2(src, dest)
+                copied[src] = dest
+            scan.twod = copied[src]
+    except OSError as e:
+        # Never abort generation over the sidecar: repointed scans keep
+        # their valid copies, the rest keep the (temporary) extracted paths
+        logger.warning(f"Could not persist zip-extracted 2D images: {e}")
+        if messages is not None:
+            messages.append("Warning: some 2D images from the ZIP could not "
+                            "be copied and will not be viewable")
+        return images_dir if copied else None
+
+    logger.info(f"Persisted {len(copied)} zip-extracted 2D images to {images_dir}")
+    return images_dir
+
+
 def validate(scans: List[Scan], echem_df: pd.DataFrame) -> List[str]:
     """Return validation messages; entries starting with 'Warning' are non-fatal."""
     errors: List[str] = []
@@ -383,10 +447,23 @@ def generate(input_paths: List[str],
             if progress_callback:
                 progress_callback("Writing NeXus file...")
 
-            # Convert standard echem xlsx/csv the same way as everything else
+            # ZIP-extracted 2D references must outlive the extraction tempdir
+            if not include_2d_images:
+                images_dir = _persist_zip_twod_sources(scans, output_path,
+                                                       processor.tempdir,
+                                                       messages)
+                if images_dir:
+                    messages.append(
+                        f"Warning: 2D images copied to "
+                        f"{os.path.basename(images_dir)} so ZIP references "
+                        f"stay viewable")
+
+            # Convert standard echem xlsx/csv the same way as everything else,
+            # keeping the original path for provenance
             std_files = None
             if standard_echem_files:
-                std_files = [convert_tabular_to_txt(p) for p in standard_echem_files]
+                std_files = [(convert_tabular_to_txt(p, dest_dir=processor.tempdir), p)
+                             for p in standard_echem_files]
 
             writer = NXSWriter(data_source,
                                include_2d_images=include_2d_images,

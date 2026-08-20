@@ -22,8 +22,10 @@ examples/make_example_data.py duplicates these writers (deliberately
 standalone) -- keep the two in sync when changing values here.
 """
 import os
+import zipfile
 
 import numpy as np
+import pandas as pd
 
 import core
 
@@ -60,6 +62,20 @@ def write_echem_txt(path, n_rows=40, v0=3.7, dv=0.01, i0=0.1, di=0.001,
         rows.append(f"{date} {hour}:{m:02d}:00\t{v0 + m * dv:.4f}\t{i0 + m * di:.4f}")
     with open(path, "w") as f:
         f.write("\n".join(rows) + "\n")
+
+
+def write_arbin_xlsx(path, n_rows=40, v0=3.7, dv=0.01, i0=0.1, di=0.001):
+    """Arbin-style echem .xlsx: absolute Date_Time plus an elapsed-seconds
+    Test_Time(s) trap column; values match write_echem_txt's anchors."""
+    times = pd.date_range("2024-02-05 10:00:00", periods=n_rows, freq="60s")
+    df = pd.DataFrame({
+        "Data_Point": np.arange(1, n_rows + 1),
+        "Date_Time": times,
+        "Test_Time(s)": np.arange(n_rows, dtype=float) * 60.0,
+        "Current(A)": i0 + di * np.arange(n_rows),
+        "Voltage(V)": v0 + dv * np.arange(n_rows),
+    })
+    df.to_excel(path, index=False)
 
 
 def write_inhouse_dir(dirpath):
@@ -126,6 +142,23 @@ def write_edf_image(path, timestamp, offset=1.0):
                 "DetectorModel": "PILATUS3 100K", "Monitor": "0",
                 "pilct1": "155717", "Comment": "Cell_TEST"})
     img.write(path)
+
+
+def write_twod_dir(dirpath):
+    """One XRD .dat plus one EDF image at the same timestamp (2D fixtures)."""
+    os.makedirs(dirpath, exist_ok=True)
+    write_xrd_dat(os.path.join(dirpath, "scan_001.dat"), SCAN_TIMES[0])
+    write_edf_image(os.path.join(dirpath, "image_001.edf"), SCAN_TIMES[0])
+
+
+def write_twod_zip(zip_path, workdir):
+    """ZIP holding write_twod_dir's files, staged under workdir."""
+    src = os.path.join(str(workdir), "twod_src")
+    write_twod_dir(src)
+    with zipfile.ZipFile(zip_path, "w") as z:
+        for name in os.listdir(src):
+            z.write(os.path.join(src, name), name)
+    return str(zip_path)
 
 
 def write_detailed_inhouse_dir(dirpath):

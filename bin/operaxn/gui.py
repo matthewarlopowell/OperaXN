@@ -74,7 +74,7 @@ from .output import (
     plot_oned_data, plot_twod_data, plot_echem_data,
     create_figure_layout, export_single_scan,
     get_scan_time_positions, plot_neutron_data,
-    clear_plot_cache
+    clear_plot_cache, clear_plot_axes
 )
 
 try:
@@ -1067,7 +1067,7 @@ class OPERAXN(tk.Frame):
             self.state.synchrotron_max_size = options.display_size
 
         source_name = {
-            DataSourceType.INHOUSE: "in-house",
+            DataSourceType.INHOUSE: "laboratory",
             DataSourceType.SYNCHROTRON: "synchrotron",
             DataSourceType.NEUTRON: "neutron"
         }.get(options.data_source, "unknown")
@@ -1219,7 +1219,7 @@ class OPERAXN(tk.Frame):
         # Show success message
         source_type = {
             DataSourceType.SYNCHROTRON: "synchrotron",
-            DataSourceType.INHOUSE: "in-house",
+            DataSourceType.INHOUSE: "laboratory",
             DataSourceType.NEUTRON: "neutron"
         }.get(self.state.data_source, "unknown")
 
@@ -1327,7 +1327,7 @@ class OPERAXN(tk.Frame):
         return text
 
     def _format_inhouse_scan(self, scan: Dict[str, Any], text: str) -> str:
-        """Append 1D/2D filenames, timestamp, and echem to an in-house row."""
+        """Append 1D/2D filenames, timestamp, and echem to a laboratory row."""
         filenames = []
 
         if scan.get("oned"):
@@ -1544,7 +1544,7 @@ class OPERAXN(tk.Frame):
         if scan_num in self.state.oned_arrays:
             data = self.state.oned_arrays[scan_num]
             if data.get("error"):
-                self.axes["oned"].clear()
+                clear_plot_axes(self.axes["oned"], "oned")
                 self.axes["oned"].text(
                     0.5, 0.5, "Error reading 1D data — try reopening dataset",
                     ha="center", va="center", transform=self.axes["oned"].transAxes,
@@ -1557,7 +1557,7 @@ class OPERAXN(tk.Frame):
                     plot_config=self.config.to_dict()
                 )
         else:
-            self.axes["oned"].clear()
+            clear_plot_axes(self.axes["oned"], "oned")
             self.axes["oned"].text(
                 0.5, 0.5, "No 1D data for this scan",
                 ha="center", va="center", transform=self.axes["oned"].transAxes,
@@ -1572,7 +1572,7 @@ class OPERAXN(tk.Frame):
         if scan_num in self.state.twod_arrays:
             data = self.state.twod_arrays[scan_num]
             if data.get("error"):
-                self.axes["twod"].clear()
+                clear_plot_axes(self.axes["twod"], "twod")
                 self.axes["twod"].text(
                     0.5, 0.5, "Error reading 2D data — try reopening dataset",
                     ha="center", va="center", transform=self.axes["twod"].transAxes,
@@ -1599,7 +1599,7 @@ class OPERAXN(tk.Frame):
                     (cmin, cmax), plot_config=self.config.to_dict()
                 )
         else:
-            self.axes["twod"].clear()
+            clear_plot_axes(self.axes["twod"], "twod")
             self.axes["twod"].text(
                 0.5, 0.5, "No 2D data for this scan",
                 ha="center", va="center", transform=self.axes["twod"].transAxes,
@@ -1669,7 +1669,7 @@ class OPERAXN(tk.Frame):
                 plot_config=self.config.to_dict()
             )
         else:
-            self.axes["echem"].clear()
+            clear_plot_axes(self.axes["echem"], "echem")
             self.axes["echem"].text(
                 0.5, 0.5, "No echem data available",
                 ha="center", va="center", transform=self.axes["echem"].transAxes,
@@ -2481,13 +2481,17 @@ class OPERAXN(tk.Frame):
 
             has_echem = self.state.echem_arrays.get("x", []).size > 0
 
+            # Frames use throwaway figures: caching their artists would fill
+            # the plot cache with entries keyed on freed axes (cf. export_single_scan)
+            frame_config = {**self.config.to_dict(), "use_cache": False}
+
             fig, axes = create_figure_layout(
                 has_oned, has_twod, has_echem, has_neutron,
                 figure_dpi=150,
                 scan_num=scan_data["scan_num"],
                 echem_value=scan_data.get("echem_value"),
                 current_value=scan_data.get("current_value"),
-                plot_config=self.config.to_dict()
+                plot_config=frame_config
             )
 
             # Plot data
@@ -2495,30 +2499,33 @@ class OPERAXN(tk.Frame):
                 plot_oned_data(
                     axes["oned"], scan_data["oned"]["x"], scan_data["oned"]["y"],
                     scan_data["scan_num"], scan_data.get("echem_value"),
-                    scan_data.get("current_value"), plot_config=self.config.to_dict()
+                    scan_data.get("current_value"), plot_config=frame_config
                 )
 
             if has_twod and "twod" in axes:
                 plot_twod_data(
                     axes["twod"], scan_data["twod"], scan_data["scan_num"],
                     scan_data.get("echem_value"), scan_data.get("current_value"),
-                    intensity_limits, plot_config=self.config.to_dict()
+                    intensity_limits, plot_config=frame_config
                 )
 
             if has_neutron and "neutron" in scan_data:
                 plot_neutron_data(
                     fig, axes, scan_data["neutron"], scan_data["scan_num"],
                     scan_data.get("echem_value"), scan_data.get("current_value"),
-                    plot_config=self.config.to_dict()
+                    plot_config=frame_config
                 )
 
             if has_echem and "echem" in axes:
                 scan_times = get_scan_time_positions(self.state.scans, self.state.echem_df,
                                                      self.state.time_method)
+                # scan_times aligns with state.scans, so index by scan number,
+                # not by frame position (a sub-range GIF starts at any scan)
                 plot_echem_data(
                     axes["echem"], self.state.echem_arrays["x"], self.state.echem_arrays["y"],
-                    self.state.echem_arrays.get("current"), scan_times, index,
-                    plot_config=self.config.to_dict()
+                    self.state.echem_arrays.get("current"), scan_times,
+                    scan_data["scan_num"] - 1,
+                    plot_config=frame_config
                 )
 
             fig.savefig(frame_file, dpi=dpi, bbox_inches="tight",
@@ -2544,7 +2551,7 @@ class OPERAXN(tk.Frame):
                     default_filename = {
                         DataSourceType.NEUTRON: "Neutron_Diffraction_Data.xlsx",
                         DataSourceType.SYNCHROTRON: "Synchrotron_XRD_Data.xlsx",
-                        DataSourceType.INHOUSE: "In-House_XRD_Data.xlsx"
+                        DataSourceType.INHOUSE: "Laboratory_XRD_Data.xlsx"
                     }.get(self.state.data_source, "XRD_Data.xlsx")
 
                     filename = filedialog.asksaveasfilename(
@@ -2567,7 +2574,7 @@ class OPERAXN(tk.Frame):
                         data_type = {
                             DataSourceType.NEUTRON: "neutron diffraction",
                             DataSourceType.SYNCHROTRON: "synchrotron XRD",
-                            DataSourceType.INHOUSE: "in-house XRD"
+                            DataSourceType.INHOUSE: "laboratory XRD"
                         }.get(self.state.data_source, "")
 
                         self.after(0, lambda: self._show_message(
@@ -2911,7 +2918,8 @@ class OPERAXN(tk.Frame):
 
         self.controls.grid_remove()
 
-        # Reset plot objects
+        # Reset plot objects (evict cache entries keyed on the dying axes)
+        clear_plot_cache()
         self.fig = None
         self.axes = {}
         self.canvas = None

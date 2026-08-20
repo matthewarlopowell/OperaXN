@@ -51,7 +51,7 @@ values verbatim.
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import h5py
 import numpy as np
@@ -392,7 +392,8 @@ class NXSWriter:
     # --- top level ---
 
     def write(self, output_path: str, scans: List[Scan], echem_df: pd.DataFrame,
-              standard_echem_files: Optional[List[str]] = None) -> None:
+              standard_echem_files: Optional[List[Union[str, Tuple[str, str]]]] = None
+              ) -> None:
         """Write the full canonical file: metadata, scans, and echem layers."""
         harvest = self._harvest_experiment_metadata(scans)
 
@@ -443,7 +444,7 @@ class NXSWriter:
 
         first = scans[0] if scans else None
         if first is not None:
-            # In-house: EDF header of the first 2D file
+            # Laboratory: EDF header of the first 2D file
             twod = first.twod
             if twod and str(twod).lower().endswith('.edf'):
                 edf = extract_edf_scan_fields(str(twod))
@@ -981,23 +982,28 @@ class NXSWriter:
         entry.attrs['default'] = 'operando_electrochemistry'
 
     def _write_standard_echem(self, entry: h5py.Group,
-                              standard_echem_files: Optional[List[str]]) -> None:
+                              standard_echem_files: Optional[List[Union[str, Tuple[str, str]]]]
+                              ) -> None:
         """standard_electrochemistry NXenvironment: one file_NNN NXdata per
-        parseable additional echem file."""
+        parseable additional echem file; items are paths or
+        (parse_path, display_path) pairs."""
         if not standard_echem_files:
             return
 
         datasets = []
-        for std_echem_path in standard_echem_files:
-            if not os.path.isfile(std_echem_path):
+        for item in standard_echem_files:
+            # (parse_path, display_path) pairs keep the user's filename as
+            # provenance when the parsed file is a converted temp copy
+            parse_path, display_path = item if isinstance(item, tuple) else (item, item)
+            if not os.path.isfile(parse_path):
                 continue
-            standard_echem_df = self.echem_parser.parse(std_echem_path)
+            standard_echem_df = self.echem_parser.parse(parse_path)
             if standard_echem_df is None or standard_echem_df.empty:
                 continue
-            datasets.append({'source_file': os.path.basename(std_echem_path),
+            datasets.append({'source_file': os.path.basename(display_path),
                              'data': standard_echem_df})
             logger.info(f"Added standard electrochemistry file"
-                        f" {os.path.basename(std_echem_path)}"
+                        f" {os.path.basename(display_path)}"
                         f" ({len(standard_echem_df)} points)")
 
         if datasets:

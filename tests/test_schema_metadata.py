@@ -5,6 +5,7 @@ import pytest
 
 import core
 
+import _builders
 from _helpers import s, wall, tz_aware, assert_pynxtools_valid
 
 
@@ -101,6 +102,38 @@ def test_raw_data_file_defaults_to_echem_sources(tmp_path, inhouse_src):
     with h5py.File(out) as f:
         assert s(f["entry/cycling_protocol/raw_data_file"]) == "echem.txt"
     assert_pynxtools_valid(out, "auto raw_data_file")
+
+
+def test_raw_data_file_uses_original_xlsx_name(tmp_path):
+    """xlsx echem provenance records the user's filename, not the temp copy."""
+    src = tmp_path / "xlsx_src"
+    src.mkdir()
+    for i, ts in enumerate(_builders.SCAN_TIMES, start=1):
+        _builders.write_xrd_dat(str(src / f"scan_{i:03d}.dat"), ts,
+                                y=_builders.inhouse_scan_y(i))
+    _builders.write_arbin_xlsx(str(src / "cellA.xlsx"))
+    out = str(tmp_path / "xlsx_raw.nxs")
+    ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE,
+                             cycling_protocol={"technique": "GCPL"})
+    assert ok, str(msgs)
+    with h5py.File(out) as f:
+        assert s(f["entry/cycling_protocol/raw_data_file"]) == "cellA.xlsx"
+    assert_pynxtools_valid(out, "xlsx raw_data_file")
+
+
+def test_standard_echem_xlsx_provenance(tmp_path, inhouse_src):
+    """A standard-echem .xlsx keeps its own filename as source_file."""
+    xlsx = tmp_path / "reference.xlsx"
+    _builders.write_arbin_xlsx(str(xlsx), n_rows=10)
+    out = str(tmp_path / "std_xlsx.nxs")
+    ok, msgs = core.generate([inhouse_src], out, core.DataSourceType.INHOUSE,
+                             standard_echem_files=[str(xlsx)])
+    assert ok, str(msgs)
+    with h5py.File(out) as f:
+        group = f["entry/standard_electrochemistry/file_001"]
+        assert group.attrs["source_file"] == "reference.xlsx"
+        assert group["voltage"].shape == (10,)
+    assert_pynxtools_valid(out, "standard-echem xlsx")
 
 
 def test_sample_preparation_date(protocol_nxs):

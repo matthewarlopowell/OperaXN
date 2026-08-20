@@ -58,23 +58,34 @@ _session: Dict[str, Any] = {
 
 
 def cleanup_session_cache() -> None:
-    """Delete the session's auto-generated cache .nxs if it was never exported.
+    """Delete the session's auto-generated cache .nxs if it was never
+    exported, plus its 2D images sidecar (removed even for exported
+    sessions: the export carries its own copy).
 
     Never touches user files: only paths inside the cache directory that came
     from a raw-data load are eligible. Called on app exit and whenever a new
     load replaces the session.
     """
     path = _session.get("nxs_path")
-    if not path or _session.get("exported"):
+    if not path:
         return
     if _session.get("input_paths") is None:
         return  # direct .nxs upload: the file is the user's own
 
     try:
         in_cache = os.path.dirname(os.path.abspath(path)) == os.path.abspath(cache_dir())
-        if in_cache and os.path.isfile(path):
+        if not in_cache:
+            return
+        if not _session.get("exported") and os.path.isfile(path):
             os.remove(path)
             logger.debug(f"Removed unsaved cache file: {path}")
+        # The 2D images sidecar goes even for exported sessions: the export
+        # carries its own copy, and bulky image sets must not pile up in the
+        # cache (the exported file resolves them from its sibling dir)
+        images_dir = os.path.splitext(path)[0] + "_images"
+        if os.path.isdir(images_dir):
+            shutil.rmtree(images_dir, ignore_errors=True)
+            logger.debug(f"Removed cache images dir: {images_dir}")
     except OSError as e:
         logger.debug(f"Could not remove cache file {path}: {e}")
 
@@ -99,8 +110,8 @@ def _scan_to_dict(sd: ScanData) -> Dict[str, Any]:
                     entry[key] = bank[key].get("source") or f"bank_{meas}_{key}.dat"
             neutron_files[meas] = entry
 
-    twod_available = sd.twod is not None or bool(
-        sd.twod_source and os.path.isfile(str(sd.twod_source)))
+    twod_available = (sd.twod is not None or
+                      _resolve_twod_source(sd.twod_source) is not None)
 
     timestamp_for_correlation = None
     for candidate in (sd.midpoint_timestamp, sd.timestamp):
@@ -240,6 +251,12 @@ def process_paths(selected_paths: List[str],
         if not success:
             logger.error(f"NeXus generation failed: {messages}")
             return empty
+        if progress_callback:
+            # Non-fatal warnings (e.g. a 2D sidecar that could not be
+            # persisted) would otherwise never reach the user on success
+            for msg in messages:
+                if msg.startswith("Warning"):
+                    progress_callback(msg)
 
     _session["nxs_path"] = os.path.abspath(nxs_path)
     _session["input_paths"] = None if direct_nxs else paths
@@ -350,6 +367,18 @@ def add_standard_echem_files(paths: List[str]) -> List[Dict[str, Any]]:
         stem = os.path.splitext(os.path.basename(nxs_path))[0]
         working_path = os.path.join(cache_dir(), f"{stem}_working.nxs")
         shutil.copy2(nxs_path, working_path)
+        # Carry an OperaXN 2D images sidecar along with the working copy so
+        # later exports keep their by-reference images viewable
+        src_images = os.path.splitext(nxs_path)[0] + "_images"
+        if (os.path.isdir(src_images) and
+                os.path.isfile(os.path.join(src_images, ".operaxn_images"))):
+            work_images = os.path.splitext(working_path)[0] + "_images"
+            try:
+                if os.path.isdir(work_images):
+                    shutil.rmtree(work_images, ignore_errors=True)
+                shutil.copytree(src_images, work_images)
+            except OSError as e:
+                logger.warning(f"Could not copy 2D images sidecar: {e}")
         nxs_path = working_path
         _session["nxs_path"] = nxs_path
         _session["input_paths"] = [os.path.abspath(paths[0])]
@@ -364,18 +393,40 @@ def export_nxs(destination: str,
                progress_callback: Optional[Callable] = None) -> tuple:
     """Save the loaded experiment's canonical .nxs to `destination`.
 
-    A plain copy: the file already contains everything chosen at generation
-    time (standard echem, 2D images or references). Returns (success, messages)."""
+    Copies the file, plus the <stem>_images sidecar when a ZIP load persisted
+    2D sources next to the cache file. Returns (success, messages)."""
     source = _session["nxs_path"]
     if not source or not os.path.isfile(source):
         return False, ["No experiment loaded"]
 
     if progress_callback:
         progress_callback("Exporting NeXus file...")
+    messages = ["NeXus file exported"]
     if os.path.abspath(source) != os.path.abspath(destination):
         shutil.copyfile(source, destination)
+        # ZIP loads persist their 2D sources in a sidecar folder; copy it so
+        # the exported file stays viewable after the session cache is cleaned
+        images_dir = os.path.splitext(source)[0] + "_images"
+        if os.path.isdir(images_dir):
+            dest_images = os.path.splitext(destination)[0] + "_images"
+            try:
+                if os.path.isdir(dest_images):
+                    # Only replace a sidecar this tool created; never a
+                    # user's own folder that happens to share the name
+                    if os.path.isfile(os.path.join(dest_images, ".operaxn_images")):
+                        shutil.rmtree(dest_images, ignore_errors=True)
+                    else:
+                        raise OSError(f"existing directory {dest_images} "
+                                      "was not created by OperaXN")
+                shutil.copytree(images_dir, dest_images)
+            except OSError as e:
+                logger.warning(f"Could not copy 2D images sidecar: {e}")
+                messages.append(
+                    "Warning: the 2D images folder was not copied "
+                    f"({os.path.basename(dest_images)}); the exported file "
+                    "may not display 2D images elsewhere")
     _session["exported"] = True
-    return True, ["NeXus file exported"]
+    return True, messages
 
 
 # ============================================================================
@@ -387,14 +438,45 @@ def _scan_data(scan: Dict[str, Any]) -> Optional[ScanData]:
     return scan.get("_data")
 
 
+def _resolve_twod_source(path: Any) -> Optional[str]:
+    """Resolve a recorded 2D source path to a readable file, preferring the
+    OperaXN-marked <stem>_images sidecar next to the opened .nxs (it travels
+    with the file, while the recorded absolute path may be a stale cache
+    location)."""
+    if not path:
+        return None
+    path = str(path)
+    nxs = _session.get("nxs_path")
+    if nxs:
+        # Recorded paths may carry the other OS's separators
+        norm = (path.replace("/", os.sep) if os.sep == "\\"
+                else path.replace("\\", os.sep))
+        token = f"_images{os.sep}"
+        idx = norm.find(token)
+        if idx != -1:
+            images_root = os.path.splitext(nxs)[0] + "_images"
+            sibling = os.path.join(images_root, norm[idx + len(token):])
+            # Only trust a sidecar OperaXN created (marker file), and prefer
+            # it only over a missing path or a cache location a later load
+            # may have repopulated; a live user-owned path stays authoritative
+            if (os.path.isfile(os.path.join(images_root, ".operaxn_images"))
+                    and os.path.isfile(sibling)):
+                recorded_live = os.path.isfile(path)
+                in_cache = os.path.abspath(path).startswith(
+                    os.path.abspath(cache_dir()) + os.sep)
+                if not recorded_live or in_cache:
+                    return sibling
+    return path if os.path.isfile(path) else None
+
+
 def _load_twod_image(sd: ScanData, state: Any = None) -> Optional[np.ndarray]:
     """Return the 2D image: embedded array, or lazy-load the referenced source
     file (2D is stored by reference unless embedding was requested)."""
     if sd.twod is not None:
         return sd.twod
 
-    path = sd.twod_source
-    if not path or not os.path.isfile(str(path)):
+    path = _resolve_twod_source(sd.twod_source)
+    if not path:
         return None
 
     try:
