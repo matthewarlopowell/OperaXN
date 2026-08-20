@@ -13,8 +13,8 @@ directly and read by any HDF5/NeXus tool.
 
 ## Statement of need
 
-*Operando* diffraction experiments — where a battery or other electrochemical
-cell is cycled while diffraction patterns are collected — produce two streams
+*Operando* diffraction experiments, where a battery or other electrochemical
+cell is cycled while diffraction patterns are collected, produce two streams
 of data in unrelated formats: diffraction files whose layout depends on the
 instrument (laboratory diffractometer, synchrotron beamline or neutron
 spallation source), and electrochemistry logs from a separate potentiostat.
@@ -23,7 +23,7 @@ requires aligning these streams in time, which is usually done ad hoc with
 per-experiment scripts and is rarely preserved with the data. OperaXN gives
 experimentalists a single tool that classifies the raw files, performs the
 time correlation, stores the combined experiment in a standardised,
-self-describing NeXus file, and visualises it — so the correlated dataset,
+self-describing NeXus file, and visualises it, so the correlated dataset,
 not just the raw files, is what gets analysed, shared and archived.
 
 ## Features
@@ -38,8 +38,9 @@ not just the raw files, is what gets analysed, shared and archived.
   TOF/d-spacing) diffraction data with electrochemical cycling
 - Operando heatmap (stacked patterns vs scan/time with the voltage track),
   capacity analysis and ICI (intermittent current interruption) analysis
-- Export publication-quality figures (PNG, PDF, SVG), animated GIFs, and
-  Excel summaries
+- Export the diffraction plots as publication-quality figures (PNG, PDF, SVG)
+  or animated GIFs, and the correlated data and analysis results as Excel
+  summaries and CSV
 - Supports `.nxs`, `.dat`, `.xy`, `.edf`, `.hdf`, `.txt`, `.xlsx`, `.csv`
   and `.zip` inputs
 
@@ -163,7 +164,7 @@ OperaXN/
 
 ## Contributing
 
-Bug reports, feature requests and pull requests are welcome — see
+Bug reports, feature requests and pull requests are welcome. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Citing

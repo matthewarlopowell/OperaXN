@@ -4,7 +4,7 @@ type: software
 title: "OperaXN"
 abstract: >-
   Visualise operando diffraction experiments and produce standardised
-  NeXus files.
+  NeXus files
 authors:
   - family-names: Powell
     given-names: Matthew A.

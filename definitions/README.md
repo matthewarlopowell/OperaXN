@@ -6,23 +6,23 @@ electrochemical cells, as described in the OperaXN perspective paper
 Systems*, ACS Energy Lett.,
 [doi:10.1021/acsenergylett.6c01791](https://doi.org/10.1021/acsenergylett.6c01791)):
 
-- **`NXoperando_monopd.nxdl.xml`** — monochromatic X-ray/neutron diffraction
+- **`NXoperando_monopd.nxdl.xml`**: monochromatic X-ray/neutron diffraction
   (modelled on NXmonopd)
-- **`NXoperando_tofnpd.nxdl.xml`** — time-of-flight neutron diffraction
+- **`NXoperando_tofnpd.nxdl.xml`**: time-of-flight neutron diffraction
   (modelled on NXtofnpd)
 
 Both hold a single `NXentry` with experiment-level instrument/sample metadata
 and the full electrochemical cycling record, plus one `NXsubentry` per
 diffraction acquisition (`scan_000001` ...) carrying the electrochemical
-state of the cell during that acquisition. Status: draft, not yet submitted
-upstream to nexusformat/definitions or FAIRmat-NFDI.
+state of the cell during that acquisition. Status: proposed definitions, not
+yet submitted upstream to nexusformat/definitions or FAIRmat-NFDI.
 
 OperaXN writes files conforming to these definitions; see below for how to
 validate a generated file independently.
 
 ## Version
 
-**1.0.0** — first release, shipped with OperaXN 2.0.0. Follows the published
+**1.0.0**: first release, shipped with OperaXN 2.0.0. Follows the published
 specification (Figure 4 of the perspective paper). The version is stamped on
 `entry/definition@version` in every generated file.
 
@@ -51,7 +51,7 @@ a human-entered field that will be made required at NIAC submission.
 | `MONITOR` / `DATA` placement | printed at subentry indent in Fig. 4 (the parents define them at entry level) | one per acquisition subentry | OperaXN stores one monitor and one data group per acquisition subentry. | structural choice |
 | `SUBENTRY/instrument` | link | HDF5 soft link with `@target` (documented, not declared) | NXDL links cannot be optional (XSD); pynxtools traverses the soft link and checks `@target` but does not match a `<link>` against a linked group, so declaring one fails every conforming file. Linking avoids N copies of the invariant instrument. | forced |
 | `environment/capacity` | optional | optional | Plumbed through model/writer/reader/NXDL but not computed (semantics ambiguous); reserved. | reserved |
-| `pre_sample_flightpath` (tofnpd) | required | optional | Not in reduced files; supplied from the per-instrument profile, whose POLARIS values are TODO placeholders — the writer skips `None`. | forced until profile values supplied |
+| `pre_sample_flightpath` (tofnpd) | required | optional | Not in reduced files; supplied from the per-instrument profile, whose POLARIS values are TODO placeholders, so the writer skips `None`. | forced until profile values supplied |
 
 Additions beyond Figure 4 (all optional or recommended, so a file carrying
 only the Figure 4 content still validates): `definition@version` and
@@ -71,7 +71,7 @@ arrays.
 
 | Item | Parent | Here | Forced/Choice | Reason |
 |---|---|---|---|---|
-| Intensities (`data`) | NX_INT | NX_NUMBER | forced | Azimuthally averaged / focussed, normalised — processed data, not raw counts. |
+| Intensities (`data`) | NX_INT | NX_NUMBER | forced | Azimuthally averaged / focussed, normalised: processed data, not raw counts. |
 | `errors` field | absent | optional NX_NUMBER, `[nP]` in monopd (tofnpd leaves it undimensioned: bank lengths vary) | choice (addition) | Carries the propagated uncertainties (Sigma_I) that reduction software exports. |
 | Per-bank axes (tofnpd) | single `time_of_flight` `[nTimeChan]` | one NXdata per bank, `bank_N` (time-of-flight) and optional sibling `bank_N_d` (d-spacing) | choice | Focussed banks have different native axes and lengths. |
 | `data` XOR `image_source` (monopd) | `data` required | at least one of `data` / `image_source` (writer-enforced) | forced | Image-only acquisitions have no 1-D pattern yet must be recorded. |

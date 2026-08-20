@@ -20,8 +20,8 @@ minimal excerpt), that makes reproduction much easier.
 
 ## Seeking support
 
-Questions about using OperaXN — loading data, time correlation, the NeXus
-output — can also be raised on the issue tracker.
+Questions about using OperaXN (loading data, time correlation, the NeXus
+output) can also be raised on the issue tracker.
 
 ## Contributing changes
 
@@ -65,8 +65,8 @@ Notes:
 The `[test]` extra includes FAIRmat's pynxtools, so the NeXus
 schema-validation tests run by default; they skip only if it is missing.
 Those tests copy the two NXDL files from `definitions/` into pynxtools'
-installed `contributed_definitions` directory — the validator cannot resolve
-`NXoperando_monopd` / `NXoperando_tofnpd` otherwise. Run them in a virtual
+installed `contributed_definitions` directory, because the validator cannot
+resolve `NXoperando_monopd` / `NXoperando_tofnpd` otherwise. Run them in a virtual
 environment rather than against a system Python install.
 
 Pull requests should keep `pytest` green; CI runs the suite on
@@ -74,7 +74,7 @@ Python 3.10–3.13 on Linux (plus Python 3.12 on Windows) on every push to
 main and every pull request.
 
 Support for additional instruments, beamlines and file formats is
-particularly welcome — an issue describing the format (ideally with an
+particularly welcome. An issue describing the format (ideally with an
 example file) is a good place to start. Contributed public example
 datasets are equally valuable: see the layout in
 [examples/README.md](examples/README.md) and extend the real-data
