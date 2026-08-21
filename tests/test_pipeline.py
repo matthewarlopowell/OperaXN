@@ -98,13 +98,30 @@ def test_echem_unparseable_current_is_none(tmp_path):
 
 ARBIN_HEADER = "Data_Point\tDate_Time\tTest_Time(s)\tCurrent(A)\tVoltage(V)"
 
+# Full MITS-style export: derived columns (dV/dt carries the 'v/' substring)
+# must never steal a slot from the real Voltage/Current columns
+ARBIN_FULL_HEADER = ("Data_Point\tTest_Time(s)\tDate_Time\tCurrent(A)\t"
+                     "Voltage(V)\tCharge_Capacity(Ah)\tDischarge_Capacity(Ah)\t"
+                     "Charge_Energy(Wh)\tDischarge_Energy(Wh)\tdV/dt(V/s)\t"
+                     "Internal_Resistance(Ohm)\tStep_Time(s)\tStep_Index\t"
+                     "Cycle_Index")
+
 
 @pytest.mark.parametrize("header,sample,expected", [
     (ARBIN_HEADER, None, {"time": 1, "voltage": 4, "current": 3}),
     ("time/s\tEwe/V\tI/mA", None, {"time": 0, "voltage": 1, "current": 2}),
     ("Absolute Time\tVoltage\tCurrent", None, {"time": 0, "voltage": 1, "current": 2}),
     ("Date\tTime\tVoltage\tCurrent", "05/02/2024\t10:00:00\t3.7\t0.1", {"time": 1}),
-], ids=["arbin-date-time", "biologic", "simple", "split-date-clock"])
+    (ARBIN_FULL_HEADER, None, {"time": 2, "voltage": 4, "current": 3}),
+    ("dV/dt(V/s)\tDate_Time\tVoltage(V)\tCurrent(A)", None,
+     {"time": 1, "voltage": 2, "current": 3}),
+    ("Date_Time\tVoltage(V)\tCurrent(A)\tAux_Voltage_1(V)\tVoltage_Range"
+     "\tCurrent_Range", None, {"time": 0, "voltage": 1, "current": 2}),
+    ("Date_Time\tAux_Voltage_1(V)\tCurrent_Range\tVoltage(V)\tCurrent(A)",
+     None, {"time": 0, "voltage": 3, "current": 4}),
+], ids=["arbin-date-time", "biologic", "simple", "split-date-clock",
+        "arbin-full-export", "derived-column-first", "aux-and-range-after",
+        "aux-and-range-before"])
 def test_detect_columns_time_slot(header, sample, expected):
     """One matrix for the time-slot rules: Arbin's Date_Time beats the
     elapsed-seconds column, single-time headers are untouched, and a bare
@@ -128,6 +145,23 @@ def test_arbin_header_txt_parses(tmp_path):
     assert np.allclose(df["echem_data"].values, 3.7 + 0.01 * np.arange(10))
     assert np.allclose(df["current"].values, 1000 * (0.1 + 0.001 * np.arange(10))), \
         "Current(A) values must be scaled to the stored milliamp convention"
+
+
+def test_arbin_full_export_parses_real_voltage(tmp_path):
+    """A full MITS-style export keeps the real Voltage(V) column: the dV/dt
+    derived column must not be silently correlated as the cell voltage."""
+    rows = [ARBIN_FULL_HEADER]
+    rows += [f"{m + 1}\t{m * 60.0:.1f}\t2024-02-05 10:{m:02d}:00"
+             f"\t{0.1 + m * 0.001:.4f}\t{3.7 + m * 0.01:.4f}\t0.001\t0\t0.004"
+             f"\t0\t-0.0001\t0.05\t0\t2\t1" for m in range(5)]
+    path = tmp_path / "arbin_full.txt"
+    path.write_text("\n".join(rows) + "\n")
+    df = core.EchemParser().parse(str(path))
+    assert df is not None and len(df) == 5
+    assert np.allclose(df["echem_data"].values, 3.7 + 0.01 * np.arange(5)), \
+        f"dV/dt hijacked the voltage slot: {list(df['echem_data'])}"
+    assert np.allclose(df["current"].values, 1000 * (0.1 + 0.001 * np.arange(5)))
+    assert df["timestamp"].iloc[0] == pd.Timestamp("2024-02-05 10:00:00")
 
 
 _TS = [f"2024-02-05 10:{m:02d}:00" for m in range(5)]
