@@ -99,24 +99,41 @@ class EchemParser:
             for pattern in patterns:
                 column_mapping[pattern] = col_type
 
+        # Match strength ranks, so derived or auxiliary columns can never
+        # steal a slot from the real one regardless of column order:
+        # exact clean name (4) > keyword plus at most a unit letter, e.g.
+        # Voltage(V) -> 'voltagev' (3) > keyword inside a longer name, e.g.
+        # Aux_Voltage or Test_Time (2) > slashed shorthand 'v/', 'i/', as in
+        # dV/dt(V/s) (1); equal strengths keep last-match-wins
         time_matches = []
         matched_indices = set()
+        strengths: Dict[str, int] = {}
+
+        def _claim(col_type, i, part, strength):
+            matched_indices.add(i)
+            if col_type == "time":
+                time_matches.append((i, part))
+            if strength >= strengths.get(col_type, 0):
+                detected[col_type] = i
+                strengths[col_type] = strength
+
         for i, part in enumerate(header_parts):
             clean_part = part.replace("(", "").replace(")", "").replace("/", "").replace(" ", "")
 
             if clean_part in column_mapping:
-                detected[column_mapping[clean_part]] = i
-                matched_indices.add(i)
-                if column_mapping[clean_part] == "time":
-                    time_matches.append((i, part))
+                _claim(column_mapping[clean_part], i, part, 4)
                 continue
 
             for key, value in column_mapping.items():
                 if key in part:
-                    detected[value] = i
-                    matched_indices.add(i)
-                    if value == "time":
-                        time_matches.append((i, part))
+                    if "/" in key:
+                        strength = 1
+                    elif (clean_part.startswith(key) and
+                          len(clean_part) <= len(key) + 2):
+                        strength = 3
+                    else:
+                        strength = 2
+                    _claim(value, i, part, strength)
                     break
 
         # When several columns match time keywords, prefer a date-named one:
