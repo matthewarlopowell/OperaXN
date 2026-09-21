@@ -88,21 +88,11 @@ class Scan:
     timestamp_for_correlation: Optional[pd.Timestamp] = None
     # Harvested logbook extras (run_title, users, proposal, full_line)
     logbook: Optional[Dict[str, Any]] = None
-    # Echem summary over the acquisition window [start, end]
+    # Echem extrema over the acquisition window [start, end] (Figure 4)
     voltage_min: Optional[float] = None
     voltage_max: Optional[float] = None
     current_min: Optional[float] = None
     current_max: Optional[float] = None
-    # 0-based positional window into the operando echem arrays (inclusive end)
-    echem_index_start: Optional[int] = None
-    echem_index_end: Optional[int] = None
-    # Echem stream segment spanning the window (long acquisitions):
-    # {"start": iso_str, "time_s": ndarray, "voltage": ndarray,
-    #  "current": Optional[ndarray]}
-    echem_segment: Optional[Dict[str, Any]] = None
-    # Capacity (mAh); reserved — written when set, the core does not
-    # compute it yet
-    capacity: Optional[float] = None
 
 
 @dataclass
@@ -120,14 +110,13 @@ class ScanData:
     echem: Optional[float] = None            # voltage (V)
     current: Optional[float] = None          # current (mA)
     echem_timestamp: Optional[str] = None
-    # Echem summary over the acquisition window, when present in the file
+    # Echem extrema over the acquisition window, when present in the file
     voltage_min: Optional[float] = None
     voltage_max: Optional[float] = None
     current_min: Optional[float] = None
     current_max: Optional[float] = None
-    echem_index_start: Optional[int] = None
-    echem_index_end: Optional[int] = None
-    capacity: Optional[float] = None         # capacity (mAh), when stored
+    # Beam monitor record (mode/preset/integral + raw counters), if present
+    monitor: Optional[Dict[str, Any]] = None
     # 1D XRD: {"x": ndarray, "y": ndarray, "e": ndarray?, "source": str} or None
     oned: Optional[Dict[str, Any]] = None
     # 2D XRD: embedded image array, or None
@@ -138,8 +127,6 @@ class ScanData:
     neutron: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
     neutron_start: Optional[str] = None
     neutron_end: Optional[str] = None
-    # Beam monitor record (mode/preset/integral + raw counters), if present
-    monitor: Optional[Dict[str, Any]] = None
 
 
 @dataclass

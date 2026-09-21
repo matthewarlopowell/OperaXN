@@ -17,13 +17,16 @@ import operaxn
 from operaxn import input as gui_input
 from operaxn.dialog import UploadOptions, UploadOptionsDialog
 from operaxn.gui import OPERAXN, ButtonPanel
+from operaxn.main import main as cli_main
 from operaxn.input import (
     DataSourceType,
     TimeMethod,
     add_standard_echem_files,
     cleanup_session_cache,
+    experiment_metadata_rows,
     export_nxs,
     get_correlated_data,
+    get_experiment_metadata,
     get_loaded_nxs_path,
     make_echem_arrays,
     make_neutron_arrays,
@@ -595,3 +598,46 @@ def test_display_size_caps_stored_synchrotron_images(tmp_path):
     assert m_syn.scans[0].echem == 3.76, f"got {m_syn.scans[0].echem}"
 
 
+def test_experiment_metadata_rows_bank_geometry(polaris_src):
+    """The Excel Experiment sheet lists the profile geometry: the flight
+    path and one row per detector bank; a scalar detector field (the
+    laboratory EDF distance) yields no bank rows."""
+    assert experiment_metadata_rows({}) == []
+    lab = {"instrument": {"name": "lab", "detector": {"distance": 0.1}}}
+    assert [r["field"] for r in experiment_metadata_rows(lab)] == ["instrument"]
+    synthetic = {"pre_sample_flightpath": 14.0,
+                 "instrument": {"detector": {"detector_number": np.array([1, 2]),
+                                             "distance": np.array([2.248, 1.783]),
+                                             "polar_angle": np.array([10.4, 25.99])}},
+                 "monitor": {"mode": "timer", "detector_number": np.array([671]),
+                             "distance": np.array([3.27]),
+                             "polar_angle": np.array([0.0])}}
+    assert experiment_metadata_rows(synthetic) == [
+        {"field": "pre_sample_flightpath", "value": "14.0"},
+        {"field": "detector bank 1", "value": "L2 2.248 m, 2theta 10.40 deg"},
+        {"field": "detector bank 2", "value": "L2 1.783 m, 2theta 25.99 deg"},
+        {"field": "monitor mode", "value": "timer"},
+        {"field": "monitor 671", "value": "3.270 m, 2theta 0.00 deg"}]
+
+    process_paths([polaris_src], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.NEUTRON)
+    fields = {r["field"]: r["value"]
+              for r in experiment_metadata_rows(get_experiment_metadata())}
+    assert fields["instrument"] == "POLARIS", str(fields)
+    assert fields["pre_sample_flightpath"] == "14.0", str(fields)
+    assert fields["detector bank 5"] == "L2 1.251 m, 2theta 146.72 deg", str(fields)
+    assert fields["monitor mode"] == "timer", str(fields)
+    assert fields["monitor 611"] == "7.641 m, 2theta 180.00 deg", str(fields)
+
+
+def test_cli_profile_option(tmp_path, capsys):
+    """operaxn --profile prints the INSTRUMENT_PROFILES block derived from a
+    Mantid-processed file and exits 1 for an unreadable one."""
+    path = str(tmp_path / "TESTINST1-2.nxs")
+    _builders.write_mantid_processed_file(path)
+    assert cli_main(["--profile", path]) == 0
+    out = capsys.readouterr().out
+    assert '"testinst": {' in out and '"pre_sample_flightpath_m": 14.0' in out
+    assert '"monitor_mode": None' in out and '"monitors": {' in out
+    assert cli_main(["--profile", str(tmp_path / "missing.nxs")]) == 1
+    assert "error:" in capsys.readouterr().err

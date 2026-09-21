@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
 import h5py
+import numpy as np
 import pandas as pd
 
 from .config import MAX_EXPOSURE_TIME, SCAN_ID_MAX_DIGITS, SCAN_ID_MIN_DIGITS
@@ -28,6 +29,8 @@ if FABIO_AVAILABLE:
 logger = logging.getLogger(__name__)
 
 WEEKDAYS = ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"]
+# Logbook user field: surnames, optionally comma-separated ("Perez", "Smith,Jones")
+USER_TOKEN_RE = re.compile(r"[A-Za-z ,.\-']+")
 LOGBOOK_TIME_FORMAT = '%a %b %d %H:%M:%S %Y'
 
 
@@ -74,12 +77,13 @@ def parse_mantid_header(path: str) -> Dict[str, Any]:
     return info
 
 
-# EDF header fields that vary per exposure and feed the per-scan MONITOR and
-# detector description in schema v4. Deliberately overlaps EDF_EXCLUDE_FIELDS
-# in nxs_writer: excluded from *global* metadata because they are per-scan,
-# harvested here precisely because they are per-scan.
-EDF_MONITOR_KEYS = ['Monitor', 'Intensity1', 'SumForIntensity1',
-                    'TransmittedFlux', 'pilct0', 'pilct1', 'pilai0', 'pilai1']
+# EDF header counter that feeds the per-scan monitor integral: the beam
+# monitor reading of one exposure (zero on instruments without a monitor).
+# The Pilatus counters (pilct*, pilai*) are the detector's own totals and the
+# Intensity/TransmittedFlux entries SPEC-derived values; none is recorded.
+EDF_MONITOR_KEYS = ['Monitor']
+# EDF header fields that describe the instrument, harvested from the first
+# image for the entry-level NXinstrument
 EDF_INSTRUMENT_KEYS = {
     # header key -> nexus-ish name
     'WaveLength': 'wavelength_m',
@@ -398,18 +402,28 @@ class NeutronMetadataParser:
             if title and not title.isdigit() and not any(d in title for d in WEEKDAYS):
                 extras["run_title"] = title
 
-        for part in parts[2:]:
+        proposal_idx = None
+        for idx, part in enumerate(parts[2:], start=2):
             token = part.strip().strip('"')
             if not token or any(d in token for d in WEEKDAYS):
                 continue
-            # Users: alphabetic, comma-separated surnames (e.g. "Smith,Jones")
+            # Users: comma-separated surnames (e.g. "Smith,Jones")
             if ("users" not in extras and "," in token
-                    and re.fullmatch(r"[A-Za-z ,.\-']+", token)):
+                    and USER_TOKEN_RE.fullmatch(token)):
                 extras["users"] = token
             # Proposal / experiment number: long numeric field that is not the run
             elif ("proposal" not in extras and token.isdigit()
                   and len(token) >= 6 and token != scan_id):
                 extras["proposal"] = token
+                proposal_idx = idx
+
+        # A single surname carries no comma; in every logbook layout seen so
+        # far the user field is the one just before the proposal number
+        if "users" not in extras and proposal_idx is not None and proposal_idx >= 3:
+            token = parts[proposal_idx - 1].strip().strip('"')
+            if (token and not any(d in token for d in WEEKDAYS)
+                    and USER_TOKEN_RE.fullmatch(token)):
+                extras["users"] = token
 
         return extras
 
@@ -682,3 +696,255 @@ class NexusMetadataExtractor:
                 base_time = base_time.split('.')[0]
             return base_time.replace('T', ' ')
         return timestamp_str
+
+
+# ============================================================================
+# Instrument profile derivation (Mantid-processed files)
+# ============================================================================
+# Derives the geometry block of a config.INSTRUMENT_PROFILES entry from a
+# Mantid SaveNexusProcessed file: one focussed bank per mantid_workspace_N
+# and L1 from the embedded instrument definition. `operaxn --profile FILE`
+# prints the result ready to paste into config.py.
+
+_WORKSPACE_RE = re.compile(r"mantid_workspace_(\d+)$")
+# Below this ratio of mean transverse unit vector to mean transverse extent
+# a bank surrounds the beam (a ring) and has no meaningful azimuth
+_AZIMUTH_COHERENCE_MIN = 0.5
+
+
+def _mantid_text(node: Any) -> Optional[str]:
+    """Decode a Mantid string dataset (fixed-length bytes, shape (1,) or scalar)."""
+    if node is None:
+        return None
+    try:
+        value = node[()]
+    except Exception:
+        return None
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return None
+        value = value.ravel()[0]
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    text = str(value).strip()
+    return text or None
+
+
+def _idf_facts(idf: str) -> Dict[str, Any]:
+    """Identity and source-to-sample distance of a Mantid IDF (XML text)."""
+    facts: Dict[str, Any] = {"idf_name": None, "idf_valid_from": None,
+                             "source_type_name": None,
+                             "pre_sample_flightpath_m": None}
+    head = re.search(r"<instrument\b[^>]*>", idf)
+    if head:
+        for key, attr in (("idf_name", "name"), ("idf_valid_from", "valid-from")):
+            m = re.search(r'\s%s="([^"]*)"' % attr, head.group(0))
+            if m:
+                facts[key] = m.group(1).strip() or None
+
+    def component_z(role: str) -> Optional[float]:
+        """z (metres, along the beam) of the component whose type declares
+        is="<role>"; 0.0 for a placed component without a z, None if absent."""
+        for tag in re.findall(r"<type\b[^>]*>", idf):
+            if not re.search(r'\bis="%s"' % role, tag, re.I):
+                continue
+            name = re.search(r'\bname="([^"]+)"', tag)
+            if not name:
+                continue
+            if role == "Source":
+                facts["source_type_name"] = name.group(1)
+            comp = re.search(r'<component\s+type="%s"[^>]*>\s*<location\b([^>]*)>'
+                             % re.escape(name.group(1)), idf)
+            if not comp:
+                return None
+            z = re.search(r'\bz="\s*(-?[0-9.eE+-]+)\s*"', comp.group(1))
+            return float(z.group(1)) if z else 0.0
+        return None
+
+    z_source = component_z("Source")
+    if z_source is not None:
+        z_sample = component_z("SamplePos") or 0.0
+        facts["pre_sample_flightpath_m"] = round(abs(z_sample - z_source), 3)
+    return facts
+
+
+def _bank_from_positions(positions: Any) -> Dict[str, Any]:
+    """Nominal bank geometry from Mantid detector_positions rows
+    (distance, 2theta, phi); {} when the array has no usable rows."""
+    pos = np.asarray(positions, dtype=float)
+    if pos.ndim != 2 or pos.shape[0] == 0 or pos.shape[1] < 3:
+        return {}
+    r, two_theta, phi = pos[:, 0], pos[:, 1], pos[:, 2]
+    # Azimuth only for a bank localised in azimuth: the mean transverse unit
+    # vector is as long as the mean transverse extent for a single panel and
+    # vanishes for a ring around the beam
+    sin_t = np.sin(np.radians(two_theta))
+    x, y = np.cos(np.radians(phi)) * sin_t, np.sin(np.radians(phi)) * sin_t
+    extent = float(sin_t.mean())
+    coherence = float(np.hypot(x.mean(), y.mean()) / extent) if extent > 0 else 0.0
+    azimuth = (round(float(np.degrees(np.arctan2(y.mean(), x.mean()))), 2)
+               if coherence >= _AZIMUTH_COHERENCE_MIN else None)
+    return {
+        "distance_m": round(float(r.mean()), 3),
+        "polar_angle_deg": round(float(two_theta.mean()), 2),
+        "azimuthal_angle_deg": azimuth,
+        "info": {
+            "elements": int(pos.shape[0]),
+            "distance_range_m": (round(float(r.min()), 3), round(float(r.max()), 3)),
+            "polar_angle_range_deg": (round(float(two_theta.min()), 2),
+                                      round(float(two_theta.max()), 2)),
+            "azimuthal_coherence": round(coherence, 3),
+        },
+    }
+
+
+def _monitor_table(monitors: h5py.Group) -> Dict[int, Dict[str, Any]]:
+    """Profile monitors table from a Mantid physical_monitors group: one row
+    per detector number with distance (m), 2theta and azimuth (degrees); a
+    missing angle dataset leaves that key None. {} without distances/IDs."""
+    distance = monitors.get("distance")
+    numbers = monitors.get("detector_number")
+    if not isinstance(distance, h5py.Dataset) or not isinstance(numbers, h5py.Dataset):
+        return {}
+    distance = np.asarray(distance[()], dtype=float).ravel()
+    numbers = np.asarray(numbers[()]).ravel()
+    if distance.size != numbers.size:
+        return {}
+
+    def column(name: str) -> Optional[np.ndarray]:
+        ds = monitors.get(name)
+        if not isinstance(ds, h5py.Dataset):
+            return None
+        values = np.asarray(ds[()], dtype=float).ravel()
+        return values if values.size == distance.size else None
+
+    polar, azimuth = column("polar_angle"), column("azimuthal_angle")
+    table: Dict[int, Dict[str, Any]] = {}
+    for i, number in enumerate(numbers):
+        table[int(number)] = {
+            "distance_m": round(float(distance[i]), 3),
+            "polar_angle_deg": round(float(polar[i]), 2) if polar is not None else None,
+            "azimuthal_angle_deg": (round(float(azimuth[i]), 2)
+                                    if azimuth is not None else None),
+        }
+    return table
+
+
+def profile_from_mantid_nexus(path: str) -> Dict[str, Any]:
+    """Derive the geometry block of an instrument profile from a Mantid
+    SaveNexusProcessed file: one focussed bank per mantid_workspace_N
+    (bank N = workspace number) and L1 from the embedded IDF.
+
+    Returns {instrument_name, pre_sample_flightpath_m, detector_banks,
+    monitor_mode, monitors, provenance, info}; monitor_mode is always None
+    (not in the file), monitors is the physical_monitors table keyed by
+    detector number, and info carries per-bank ranges and element counts
+    and the IDF identity and is never written to files.
+    Unknown values are None. Raises ValueError for a file without
+    mantid_workspace_N entries."""
+    profile: Dict[str, Any] = {
+        "instrument_name": None,
+        "pre_sample_flightpath_m": None,
+        "detector_banks": {},
+        "monitor_mode": None,
+        "monitors": {},
+        "provenance": None,
+        "info": {"banks": {}, "source_file": os.path.basename(path)},
+    }
+    idf_text = None
+    mantid_version = None
+    with h5py.File(path, "r") as f:
+        workspaces = []
+        for key in f:
+            m = _WORKSPACE_RE.match(key)
+            if m and isinstance(f[key], h5py.Group):
+                workspaces.append((int(m.group(1)), key))
+        if not workspaces:
+            raise ValueError(f"{path}: no mantid_workspace_N entries "
+                             "(not a Mantid processed file)")
+        for number, key in sorted(workspaces):
+            ws = f[key]
+            inst = ws.get("instrument")
+            if not isinstance(inst, h5py.Group):
+                continue
+            if profile["instrument_name"] is None:
+                profile["instrument_name"] = _mantid_text(inst.get("name"))
+            positions = inst.get("detector/detector_positions")
+            if isinstance(positions, h5py.Dataset):
+                bank = _bank_from_positions(positions[()])
+                if bank:
+                    profile["info"]["banks"][number] = bank.pop("info")
+                    profile["detector_banks"][number] = bank
+            if idf_text is None:
+                idf_text = _mantid_text(inst.get("instrument_xml/data"))
+            monitors = inst.get("physical_monitors")
+            if not profile["monitors"] and isinstance(monitors, h5py.Group):
+                profile["monitors"] = _monitor_table(monitors)
+            if mantid_version is None:
+                env = _mantid_text(ws.get("process/MantidEnvironment/data"))
+                m = re.search(r"Framework Version:\s*(\S+)", env or "")
+                if m:
+                    mantid_version = m.group(1)
+
+    facts = _idf_facts(idf_text) if idf_text else {}
+    profile["pre_sample_flightpath_m"] = facts.get("pre_sample_flightpath_m")
+    for key in ("idf_name", "idf_valid_from", "source_type_name"):
+        profile["info"][key] = facts.get(key)
+    profile["info"]["mantid_version"] = mantid_version
+
+    parts: List[str] = []
+    if facts.get("idf_name"):
+        idf = f"Mantid IDF {facts['idf_name']}"
+        if facts.get("idf_valid_from"):
+            idf += f" (valid-from {facts['idf_valid_from']})"
+        parts.append(idf)
+    origin = f"read from {profile['info']['source_file']}"
+    if mantid_version:
+        origin += f" (Mantid {mantid_version})"
+    parts.append(origin)
+    profile["provenance"] = ", ".join(parts)
+    return profile
+
+
+def format_profile_block(profile: Dict[str, Any]) -> str:
+    """Paste-ready config.INSTRUMENT_PROFILES entry (Python literal) with
+    the informational values as comments."""
+    name = profile.get("instrument_name")
+    info = profile.get("info") or {}
+    banks = profile.get("detector_banks") or {}
+    lines = [f'"{(name or "instrument").lower()}": {{']
+    lines.append(f'    "instrument_name": {name!r},')
+    lines.append(f'    # {profile.get("provenance") or "provenance unknown"}')
+    lines.append(f'    "pre_sample_flightpath_m": {profile.get("pre_sample_flightpath_m")!r},')
+    for bank in sorted(banks):
+        b = (info.get("banks") or {}).get(bank, {})
+        lo_r, hi_r = b.get("distance_range_m", (None, None))
+        lo_t, hi_t = b.get("polar_angle_range_deg", (None, None))
+        lines.append(f'    # bank {bank}: {b.get("elements")} elements, '
+                     f'L2 {lo_r}-{hi_r} m, 2theta {lo_t}-{hi_t} deg, '
+                     f'azimuthal coherence {b.get("azimuthal_coherence")}')
+    lines.append('    "detector_banks": {')
+    for bank in sorted(banks):
+        spec = banks[bank]
+        lines.append(f'        {bank}: {{"distance_m": {spec.get("distance_m")!r}, '
+                     f'"polar_angle_deg": {spec.get("polar_angle_deg")!r}, '
+                     f'"azimuthal_angle_deg": {spec.get("azimuthal_angle_deg")!r}}},')
+    lines.append('    },')
+    lines.append('    # Counting mode is not in the file: "timer" (runs end on the clock)')
+    lines.append('    # or "monitor" (runs end on monitor counts), from the run records')
+    lines.append(f'    "monitor_mode": {profile.get("monitor_mode")!r},')
+    monitors = profile.get("monitors") or {}
+    if monitors:
+        lines.append('    # Every beam-monitor element of the IDF (physical_monitors):')
+        lines.append('    # 2theta 180 is upstream of the sample, 0 downstream')
+        lines.append('    "monitors": {')
+        for number in sorted(monitors):
+            spec = monitors[number]
+            lines.append(f'        {number}: {{"distance_m": {spec.get("distance_m")!r}, '
+                         f'"polar_angle_deg": {spec.get("polar_angle_deg")!r}, '
+                         f'"azimuthal_angle_deg": {spec.get("azimuthal_angle_deg")!r}}},')
+        lines.append('    },')
+    if info.get("source_type_name"):
+        lines.append(f'    # IDF source type: {info["source_type_name"]}')
+    lines.append('},')
+    return "\n".join(lines)

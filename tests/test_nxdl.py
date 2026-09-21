@@ -105,16 +105,38 @@ def test_figure4_elements_present(path):
 
     scan = _one(entry, "nx:group[@name='SCAN'][@type='NXsubentry']")
     env = _one(scan, "nx:group[@name='environment']")
-    cap = _one(env, "nx:field[@name='capacity']")
-    assert (cap.get("type"), cap.get("units"), cap.get("optional")) == (
-        "NX_FLOAT", "NX_CHARGE", "true")
+    # Window extrema are declared optional (Figure 4 requires them); the
+    # index pointers, log slices and capacity are not declared at all
+    for name, units in (("voltage_min", "NX_VOLTAGE"), ("voltage_max", "NX_VOLTAGE"),
+                        ("current_min", "NX_CURRENT"), ("current_max", "NX_CURRENT")):
+        f = _one(env, f"nx:field[@name='{name}']")
+        assert (f.get("type"), f.get("units"), f.get("optional")) == (
+            "NX_FLOAT", units, "true"), name
+    for name in ("capacity", "echem_index_first", "echem_index_last"):
+        assert not env.xpath(f"nx:field[@name='{name}']", namespaces=NS), name
+    assert not env.xpath("nx:group[@type='NXlog']", namespaces=NS)
     assert _required(_one(env, "nx:field[@name='scan_timestamp']"))
 
-    assert _required(_one(entry, "nx:field[@name='program_name']"))
+    assert not entry.xpath("nx:field[@name='program_name']", namespaces=NS), \
+        "program_name duplicates process/program"
     process = _one(entry, "nx:group[@name='process']")
     assert _required(process)
     assert _required(_one(process, "nx:field[@name='correlation_method']"))
-    assert _required(_one(scan, "nx:group[@name='monitor'][@type='NXmonitor']"))
+    # A subentry holds its environment (with the acquisition window) and its
+    # data: no definition/title/time fields, no declared link. Only monopd
+    # declares a per-scan monitor (the integral of an acquisition with a
+    # beam-monitor reading), optional; mode and preset sit at entry level.
+    for name in ("definition", "title", "start_time", "end_time"):
+        assert not scan.xpath(f"nx:field[@name='{name}']", namespaces=NS), name
+    scan_monitors = scan.xpath("nx:group[@type='NXmonitor']", namespaces=NS)
+    if root.get("name") == "NXoperando_monopd":
+        assert len(scan_monitors) == 1 and scan_monitors[0].get("optional") == "true"
+        assert _required(_one(scan_monitors[0], "nx:field[@name='integral']"))
+        assert not scan_monitors[0].xpath("nx:field[@name='mode']", namespaces=NS)
+    else:
+        assert not scan_monitors
+    assert _required(_one(env, "nx:field[@name='start_time']"))
+    assert _one(env, "nx:field[@name='end_time']").get("recommended") == "true"
     assert _one(entry, "nx:field[@name='end_time']").get("optional") == "true"
     assert not root.xpath("//nx:link", namespaces=NS)
 
@@ -133,3 +155,27 @@ def test_figure4_elements_present(path):
             dim = _one(f, "nx:dimensions[@rank='1']/nx:dim")
             assert dim.get("value") == "nBank"
         _one(root, "nx:symbols/nx:symbol[@name='nBank']")
+        mon = _one(entry, "nx:group[@name='monitor'][@type='NXmonitor']")
+        assert mon.get("optional") == "true"
+        mode = _one(mon, "nx:field[@name='mode']")
+        assert _required(mode)
+        assert [i.get("value") for i in
+                mode.xpath("nx:enumeration/nx:item", namespaces=NS)] == ["monitor", "timer"]
+        for name, typ, units in (("detector_number", "NX_INT", None),
+                                 ("distance", "NX_FLOAT", "NX_LENGTH"),
+                                 ("polar_angle", "NX_FLOAT", "NX_ANGLE"),
+                                 ("azimuthal_angle", "NX_FLOAT", "NX_ANGLE")):
+            f = _one(mon, f"nx:field[@name='{name}']")
+            assert (f.get("type"), f.get("units"), f.get("optional")) == (
+                typ, units, "true"), name
+            assert _one(f, "nx:dimensions[@rank='1']/nx:dim").get("value") == "nMon"
+        _one(root, "nx:symbols/nx:symbol[@name='nMon']")
+        for name in ("preset", "integral", "data", "time_of_flight"):
+            assert not mon.xpath(f"nx:field[@name='{name}']", namespaces=NS), name
+    else:
+        mon = _one(entry, "nx:group[@name='monitor'][@type='NXmonitor']")
+        assert mon.get("optional") == "true"
+        assert _required(_one(mon, "nx:field[@name='mode']"))
+        preset = _one(mon, "nx:field[@name='preset']")
+        assert (preset.get("type"), preset.get("optional")) == ("NX_FLOAT", "true")
+        assert not mon.xpath("nx:field[@name='integral']", namespaces=NS)

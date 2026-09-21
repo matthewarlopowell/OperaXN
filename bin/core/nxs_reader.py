@@ -48,7 +48,7 @@ def _entry_is_canonical(entry) -> bool:
     """True when /entry carries our provenance or scan_ subgroups."""
     return (entry is not None and isinstance(entry, h5py.Group)
             and ('generator' in entry.attrs
-                 or 'program_name' in entry
+                 or 'process' in entry
                  or 'definition' in entry
                  or any(_SCAN_GROUP_RE.fullmatch(k) for k in entry.keys())))
 
@@ -114,8 +114,8 @@ def _load_v3(entry: h5py.Group, model: ExperimentModel) -> None:
 
 def _read_global_metadata_v3(entry: h5py.Group, model: ExperimentModel) -> None:
     """Entry fields/attrs + instrument/sample/user groups -> flat metadata.
-    v4 provenance (program_name, process) lands on the same keys the v3
-    entry attrs used, so GUI consumers see one shape for both schemas."""
+    v4 provenance (process/program, process/version, ...) lands on the same
+    keys the v3 entry attrs used, so GUI consumers see one shape for both."""
     out: Dict[str, Any] = {}
 
     for attr_name, attr_val in entry.attrs.items():
@@ -130,24 +130,29 @@ def _read_global_metadata_v3(entry: h5py.Group, model: ExperimentModel) -> None:
         if field in out:
             out[field] = _display_ts(out[field])
 
-    # v4 provenance: program_name/@version + process fields
-    program = entry.get('program_name')
-    if isinstance(program, h5py.Dataset):
-        out['generator'] = _decode(program[()])
-        version = program.attrs.get('version')
-        if version is not None:
-            out['generator_version'] = _decode(version)
-
+    # v4 provenance: the process group (program/version map onto the
+    # generator keys). Files written before 17 Sep 2026 carried the program
+    # as entry/program_name with @version instead.
     process = entry.get('process')
     if isinstance(process, h5py.Group):
-        for field in ('data_source', 'correlation_method', 'total_scans',
-                      'twod_included', 'twod_max_display_size',
-                      'echem_time_tolerance', 'date'):
+        for field, key in (('program', 'generator'),
+                           ('version', 'generator_version'),
+                           ('data_source', 'data_source'),
+                           ('correlation_method', 'correlation_method'),
+                           ('total_scans', 'total_scans'),
+                           ('date', 'date')):
             val = _dataset_scalar(process, field)
             if val is not None:
-                out[field] = _decode(val)
+                out[key] = _decode(val)
+    if 'generator' not in out:
+        program = entry.get('program_name')
+        if isinstance(program, h5py.Dataset):
+            out['generator'] = _decode(program[()])
+            version = program.attrs.get('version')
+            if version is not None:
+                out['generator_version'] = _decode(version)
 
-    for group_name in ('instrument', 'sample', 'user', 'cycling_protocol'):
+    for group_name in ('instrument', 'sample', 'user', 'cycling_protocol', 'monitor'):
         grp = entry.get(group_name)
         if isinstance(grp, h5py.Group):
             out[group_name] = _flatten_group(grp)
@@ -176,12 +181,22 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
     scan_num = int(_SCAN_GROUP_RE.fullmatch(name).group(1))
     scan = ScanData(scan_num=int(sub.attrs.get('scan_number', scan_num)))
 
-    start = _display_ts(_decode(_dataset_scalar(sub, 'start_time')))
-    end = _display_ts(_decode(_dataset_scalar(sub, 'end_time')))
+    # Acquisition window: environment/start_time, end_time. Files written
+    # before the subentry was slimmed to environment + data carried them at
+    # subentry level, so that location is the fallback.
+    env = sub.get('environment')
+    env = env if isinstance(env, h5py.Group) else None
+
+    def window(name: str) -> Any:
+        val = _dataset_scalar(env, name) if env is not None else None
+        if val is None:
+            val = _dataset_scalar(sub, name)
+        return _display_ts(_decode(val))
+
+    start, end = window('start_time'), window('end_time')
 
     # Environment: correlated electrochemistry + timestamps
-    env = sub.get('environment')
-    if isinstance(env, h5py.Group):
+    if env is not None:
         scan.timestamp = _display_ts(
             _decode(_dataset_scalar(env, 'scan_timestamp'))) or start
         scan.midpoint_timestamp = _display_ts(_decode(
@@ -197,18 +212,14 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
         scan.voltage_max = _float_or_none(_dataset_scalar(env, 'voltage_max'))
         scan.current_min = _float_or_none(_dataset_scalar(env, 'current_min'))
         scan.current_max = _float_or_none(_dataset_scalar(env, 'current_max'))
-        scan.echem_index_start = _int_or_none(
-            _first_scalar(env, 'echem_index_first', 'echem_index_start'))
-        scan.echem_index_end = _int_or_none(
-            _first_scalar(env, 'echem_index_last', 'echem_index_end'))
-        scan.capacity = _float_or_none(_dataset_scalar(env, 'capacity'))
     else:
         scan.timestamp = start
 
     # Neutron acquisition window (both bounds written only for neutron scans;
     # v4 XRD scans carry end_time = start + exposure, which is not a window).
-    # Gated on the NXtofnpd definition (bank groups as fallback) so an XRD
-    # scan whose data failed to read is not misread as a neutron window.
+    # Gated on the bank groups (or the subentry definition of pre-release
+    # files) so an XRD scan whose data failed to read is not misread as a
+    # neutron window.
     definition = _decode(_dataset_scalar(sub, 'definition'))
     is_neutron = (definition == 'NXtofnpd' if definition else
                   any(_BANK_GROUP_RE.fullmatch(k) for k in sub.keys()))
@@ -216,7 +227,7 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
         scan.neutron_start = start
         scan.neutron_end = end
 
-    # Monitor record
+    # Monitor record (in-house EDF counters), when present
     mon = sub.get('monitor')
     if isinstance(mon, h5py.Group):
         monitor: Dict[str, Any] = {}
@@ -253,12 +264,12 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
         b = sub[key]
         bank_num, is_d = m.group(1), bool(m.group(2))
         if is_d:
-            trace = _read_bank_trace(b, 'd_spacing', 'data', 'errors',
+            trace = _read_bank_trace(b, 'd_spacing', 'data', 'data_errors',
                                      ('source_file',))
             if trace:
                 banks.setdefault(bank_num, {})['d'] = trace
         else:
-            trace = _read_bank_trace(b, 'time_of_flight', 'data', 'errors',
+            trace = _read_bank_trace(b, 'time_of_flight', 'data', 'data_errors',
                                      ('source_file', 'tof_source_file'))
             if trace:
                 banks.setdefault(bank_num, {})['tof'] = trace
@@ -283,7 +294,9 @@ def _read_xrd_v3(grp: h5py.Group, scan: ScanData) -> None:
             "y": np.asarray(y, dtype=float),
             "source": _decode(grp.attrs.get('oned_source_file')),
         }
-        e = _dataset_1d(grp, 'errors')
+        e = _dataset_1d(grp, 'data_errors')
+        if e is None:
+            e = _dataset_1d(grp, 'errors')  # files written before the data_errors name
         if e is not None and len(e) == len(x):
             oned["e"] = np.asarray(e, dtype=float)
         scan.oned = oned
@@ -315,6 +328,8 @@ def _read_bank_trace(b: h5py.Group, x_name: str, y_name: str, e_name: str,
              "y": np.asarray(y, dtype=float),
              "source": source}
     e = _dataset_1d(b, e_name)
+    if e is None:
+        e = _dataset_1d(b, 'errors')  # files written before the data_errors name
     if e is not None and len(e) == len(x):
         trace["e"] = np.asarray(e, dtype=float)
     return trace
@@ -522,15 +537,6 @@ def _first_scalar(grp: h5py.Group, *names: str) -> Optional[Any]:
             return val
     return None
 
-
-def _int_or_none(value: Any) -> Optional[int]:
-    """Value as int, or None when missing or non-numeric."""
-    if value is None:
-        return None
-    try:
-        return int(np.array(value).squeeze())
-    except (ValueError, TypeError):
-        return None
 
 
 def _dataset_1d(grp: h5py.Group, name: str) -> Optional[np.ndarray]:

@@ -33,7 +33,9 @@ not just the raw files, is what gets analysed, shared and archived.
 - Generation of NeXus files conforming to the
   `NXoperando_monopd` / `NXoperando_tofnpd` application definitions
   (see [definitions/](definitions)), including per-scan electrochemical
-  state alongside the full cycling record
+  state alongside the full cycling record and, for profiled instruments
+  (POLARIS), the nominal instrument geometry (flight path and per-bank
+  distance/scattering angle)
 - Simultaneous visualisation of X-ray (1D and 2D) and neutron (per-bank
   TOF/d-spacing) diffraction data with electrochemical cycling
 - Operando heatmap (stacked patterns vs scan/time with the voltage track),
@@ -89,6 +91,7 @@ operaxn --help          # Show all options
 operaxn --version       # Print the version
 operaxn --debug         # Enable debug logging
 operaxn --check-deps    # Verify dependencies
+operaxn --profile FILE  # Print an instrument-profile block derived from a Mantid-processed .nxs
 ```
 
 ## Time correlation
@@ -98,9 +101,15 @@ Two modes are available (selected at load time):
 
 - **Absolute** -> scan timestamps are matched directly to echem timestamps via
   nearest-neighbour lookup at the exposure midpoint.
-- **Relative** -> both datasets are zeroed to their respective first timestamps
-  and correlated by elapsed time. Useful when diffraction and echem clocks are
-  not synchronised.
+- **Relative** -> both streams are correlated by elapsed time: the first echem
+  point is taken as simultaneous with the first scan's exposure midpoint (its
+  correlation timestamp), and the stored `voltage_timestamp` values stay in the
+  echem clock. Useful when diffraction and echem clocks are not synchronised.
+
+Echem timestamps are read day-first (the UK convention). Arbin exports use US
+month/day order: a date whose day is 12 or below is then read with month and
+day swapped, so an Arbin file correlates correctly only when every day number
+in it is above 12.
 
 Correlation runs once at generation; the results are stored in the `.nxs`
 file alongside the full cycling record.

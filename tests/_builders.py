@@ -24,6 +24,7 @@ standalone) -- keep the two in sync when changing values here.
 import os
 import zipfile
 
+import h5py
 import numpy as np
 import pandas as pd
 
@@ -132,14 +133,15 @@ CYCLING_PROTOCOL = {
 }
 
 
-def write_edf_image(path, timestamp, offset=1.0):
-    """8x8 EDF image carrying the header fields the writer harvests."""
+def write_edf_image(path, timestamp, offset=1.0, monitor="0"):
+    """8x8 EDF image carrying the header fields the writer harvests;
+    ``monitor`` is the beam-monitor counter (0: no monitor)."""
     import fabio
     img = fabio.edfimage.EdfImage(
         data=np.arange(64, dtype=np.float32).reshape(8, 8) + offset,
         header={"Date": timestamp, "ExposureTime": "120.0",
                 "WaveLength": "1.541891e-10", "SampleDistance": "0.177",
-                "DetectorModel": "PILATUS3 100K", "Monitor": "0",
+                "DetectorModel": "PILATUS3 100K", "Monitor": monitor,
                 "pilct1": "155717", "Comment": "Cell_TEST"})
     img.write(path)
 
@@ -199,3 +201,67 @@ def write_detailed_neutron_dir(dirpath):
             f.write("\n".join(f"{x:.6f} {70.0 + bank + i:.6f} {0.2:.6f}"
                               for i, x in enumerate(DETAILED_D_X)) + "\n")
     write_echem_txt(os.path.join(dirpath, "echem.txt"))
+
+
+# Minimal Mantid IDF: source 14 m upstream of a sample at the origin
+MANTID_IDF = """<?xml version="1.0" encoding="UTF-8" ?>
+<instrument xmlns="http://www.mantidproject.org/IDF/1.0" name="Test_upgrade"
+            valid-from="2020-01-01 00:00:00" valid-to="2099-12-31 23:59:59">
+  <component type="H2O_moderator">
+    <location z="-14.0" />
+  </component>
+  <component type="sample_holder">
+    <location x="0.0" y="0.0" z="0.0"/>
+  </component>
+  <type name="H2O_moderator" is="Source"></type>
+  <type name="sample_holder" is="SamplePos"></type>
+  <type name="bank1" />
+</instrument>
+"""
+
+
+def _mantid_string(group, name, text):
+    """Mantid stores strings as a shape-(1,) fixed-length bytes dataset."""
+    raw = text.encode()
+    group.create_dataset(name, data=np.array([raw], dtype=f"S{len(raw)}"))
+
+
+def write_mantid_processed_file(path):
+    """Mantid SaveNexusProcessed lookalike with two focussed banks: bank 1 a
+    ring of 8 elements at 2theta 10 deg, bank 2 a single panel of 4 elements
+    around phi 90 deg at 2theta 90 deg; instrument TESTINST, IDF above."""
+    ring = np.array([[2.25, 10.0, phi] for phi in range(0, 360, 45)], dtype=float)
+    panel = np.array([[1.0, 88.0, 80.0], [1.0, 92.0, 80.0],
+                      [1.0, 88.0, 100.0], [1.0, 92.0, 100.0]], dtype=float)
+    with h5py.File(path, "w") as f:
+        for number, positions in ((1, ring), (2, panel)):
+            ws = f.create_group(f"mantid_workspace_{number}")
+            ws.attrs["NX_class"] = "NXentry"
+            inst = ws.create_group("instrument")
+            _mantid_string(inst, "name", "TESTINST")
+            inst.create_dataset("detector/detector_positions", data=positions)
+            _mantid_string(inst.create_group("instrument_xml"), "data", MANTID_IDF)
+            mon = inst.create_group("physical_monitors")
+            mon.create_dataset("detector_number", data=np.array([11, 12, 21], dtype=np.int32))
+            mon.create_dataset("distance", data=np.array([7.6, 7.6, 3.3]))
+            mon.create_dataset("polar_angle", data=np.array([180.0, 180.0, 0.0]))
+            mon.create_dataset("azimuthal_angle", data=np.array([0.0, 0.0, 0.0]))
+            _mantid_string(ws.create_group("process/MantidEnvironment"), "data",
+                           "Framework Version: 6.16.1\nOS name: Windows NT\n")
+
+
+def write_synchrotron_scan(dirpath, scan_id, start, end, count_time=None):
+    """GDA-style scan .nxs (entry1 start/end times; an NXdetector named after
+    the device, pixium_hdf, carrying count_time when given) plus its
+    integrated .xy, grouped by the trailing numeric ID."""
+    with h5py.File(os.path.join(dirpath, f"i11-1-{scan_id}.nxs"), "w") as f:
+        f["/entry1/start_time"] = start.encode()
+        f["/entry1/end_time"] = end.encode()
+        det = f.create_group("/entry1/instrument/pixium_hdf")
+        det.attrs["NX_class"] = "NXdetector"
+        if count_time is not None:
+            det["count_time"] = np.array([count_time])
+    xy = os.path.join(dirpath, f"i11-1-{scan_id}_integration_tth_0000.xy")
+    with open(xy, "w") as f:
+        f.write("\n".join(f"{x:.4f} {v:.4f}"
+                          for x, v in zip(ONED_X, inhouse_scan_y(1))) + "\n")

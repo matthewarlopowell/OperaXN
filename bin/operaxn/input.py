@@ -298,6 +298,113 @@ def get_experiment_metadata() -> Dict[str, Any]:
     return dict(_session.get("global_metadata") or {})
 
 
+def experiment_metadata_rows(meta: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Experiment-level metadata as {field, value} rows for the Excel
+    Experiment sheet: entry fields, instrument/sample/user, the tofnpd
+    instrument geometry (flight path and per-bank distance/2theta from the
+    instrument profile), the beam monitor and the cycling protocol."""
+    rows: List[Dict[str, str]] = []
+    if not meta:
+        return rows
+
+    for key in ("title", "start_time", "end_time", "experiment_identifier",
+                "data_source", "correlation_method", "generator",
+                "generator_version", "total_scans"):
+        if meta.get(key) is not None:
+            rows.append({"field": key, "value": str(meta[key])})
+
+    for group in ("instrument", "sample", "user"):
+        info = meta.get(group)
+        if isinstance(info, dict):
+            if info.get("name"):
+                rows.append({"field": group, "value": str(info["name"])})
+            source = info.get("source")
+            if group == "instrument" and isinstance(source, dict):
+                for key in ("name", "type", "probe"):
+                    if source.get(key):
+                        rows.append({"field": f"source {key}",
+                                     "value": str(source[key])})
+
+    sample = meta.get("sample")
+    if isinstance(sample, dict):
+        for key in ("description", "preparation_date"):
+            if sample.get(key):
+                rows.append({"field": f"sample {key}",
+                             "value": str(sample[key])})
+
+    if meta.get("pre_sample_flightpath") is not None:
+        rows.append({"field": "pre_sample_flightpath",
+                     "value": str(meta["pre_sample_flightpath"])})
+    instrument = meta.get("instrument")
+    if isinstance(instrument, dict):
+        rows.extend(_bank_geometry_rows(instrument.get("detector")))
+    monitor = meta.get("monitor")
+    if isinstance(monitor, dict):
+        if monitor.get("mode") is not None:
+            rows.append({"field": "monitor mode", "value": str(monitor["mode"])})
+        if monitor.get("preset") is not None:
+            rows.append({"field": "monitor preset",
+                         "value": f"{float(monitor['preset']):g} s"})
+        rows.extend(_monitor_rows(monitor))
+
+    # Known dataset names only (the flattened group also carries NX_class)
+    protocol = meta.get("cycling_protocol")
+    if isinstance(protocol, dict):
+        for key in ("technique", "voltage_window_lower",
+                    "voltage_window_upper", "C_rate", "instrument",
+                    "software", "raw_data_file"):
+            if protocol.get(key) is not None:
+                rows.append({"field": f"cycling protocol {key}",
+                             "value": str(protocol[key])})
+    return rows
+
+
+def _bank_geometry_rows(detector: Any) -> List[Dict[str, str]]:
+    """One row per detector bank from the tofnpd per-bank geometry arrays;
+    [] when the arrays are absent or incomplete (e.g. the scalar laboratory
+    detector distance)."""
+    if not isinstance(detector, dict):
+        return []
+    numbers = detector.get("detector_number")
+    distance = detector.get("distance")
+    polar = detector.get("polar_angle")
+    if numbers is None or distance is None or polar is None:
+        return []
+    try:
+        numbers = [int(n) for n in np.atleast_1d(numbers)]
+        distance = [float(d) for d in np.atleast_1d(distance)]
+        polar = [float(p) for p in np.atleast_1d(polar)]
+    except (TypeError, ValueError):
+        return []
+    if not len(numbers) == len(distance) == len(polar):
+        return []
+    return [{"field": f"detector bank {n}",
+             "value": f"L2 {d:.3f} m, 2theta {p:.2f} deg"}
+            for n, d, p in zip(numbers, distance, polar)]
+
+
+def _monitor_rows(monitor: Any) -> List[Dict[str, str]]:
+    """One row per beam-monitor element from the tofnpd monitor arrays
+    (distance and 2theta); [] when the arrays are absent or incomplete."""
+    if not isinstance(monitor, dict):
+        return []
+    numbers = monitor.get("detector_number")
+    distance = monitor.get("distance")
+    polar = monitor.get("polar_angle")
+    if numbers is None or distance is None or polar is None:
+        return []
+    try:
+        numbers = [int(n) for n in np.atleast_1d(numbers)]
+        distance = [float(d) for d in np.atleast_1d(distance)]
+        polar = [float(p) for p in np.atleast_1d(polar)]
+    except (TypeError, ValueError):
+        return []
+    if not len(numbers) == len(distance) == len(polar):
+        return []
+    return [{"field": f"monitor {n}", "value": f"{d:.3f} m, 2theta {p:.2f} deg"}
+            for n, d, p in zip(numbers, distance, polar)]
+
+
 def get_standard_echem() -> List[Dict[str, Any]]:
     """Standard (non-operando) echem datasets stored in the loaded .nxs.
 

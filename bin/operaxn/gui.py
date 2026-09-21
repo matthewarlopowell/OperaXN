@@ -68,7 +68,8 @@ from .input import (
     process_paths, make_oned_arrays, make_twod_arrays,
     make_echem_arrays, get_correlated_data, make_neutron_arrays,
     NeutronFileGrouper, SynchrotronFileGrouper, export_nxs, get_loaded_nxs_path,
-    add_standard_echem_files, get_experiment_metadata, get_standard_echem
+    add_standard_echem_files, experiment_metadata_rows, get_experiment_metadata,
+    get_standard_echem
 )
 from .output import (
     plot_oned_data, plot_twod_data, plot_echem_data,
@@ -2755,50 +2756,7 @@ class OPERAXN(tk.Frame):
 
     def _add_experiment_sheet(self, writer: pd.ExcelWriter) -> None:
         """Experiment-level metadata from the canonical NeXus file."""
-        meta = get_experiment_metadata()
-        if not meta:
-            return
-
-        rows = []
-        for key in ("title", "start_time", "end_time", "experiment_identifier",
-                    "data_source", "correlation_method", "generator",
-                    "generator_version", "total_scans"):
-            if meta.get(key) is not None:
-                rows.append({"field": key, "value": str(meta[key])})
-
-        for group in ("instrument", "sample", "user"):
-            info = meta.get(group)
-            if isinstance(info, dict):
-                if info.get("name"):
-                    rows.append({"field": group, "value": str(info["name"])})
-                source = info.get("source")
-                if group == "instrument" and isinstance(source, dict):
-                    for key in ("name", "type", "probe"):
-                        if source.get(key):
-                            rows.append({"field": f"source {key}",
-                                         "value": str(source[key])})
-
-        sample = meta.get("sample")
-        if isinstance(sample, dict):
-            for key in ("description", "preparation_date"):
-                if sample.get(key):
-                    rows.append({"field": f"sample {key}",
-                                 "value": str(sample[key])})
-
-        if meta.get("pre_sample_flightpath") is not None:
-            rows.append({"field": "pre_sample_flightpath",
-                         "value": str(meta["pre_sample_flightpath"])})
-
-        # Known dataset names only (the flattened group also carries NX_class)
-        protocol = meta.get("cycling_protocol")
-        if isinstance(protocol, dict):
-            for key in ("technique", "voltage_window_lower",
-                        "voltage_window_upper", "C_rate", "instrument",
-                        "software", "raw_data_file"):
-                if protocol.get(key) is not None:
-                    rows.append({"field": f"cycling protocol {key}",
-                                 "value": str(protocol[key])})
-
+        rows = experiment_metadata_rows(get_experiment_metadata())
         if not rows:
             return
         out = pd.DataFrame(rows)
