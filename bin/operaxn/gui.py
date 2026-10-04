@@ -1,11 +1,9 @@
 """
-OperaXN main window: toolbar, scan list, matplotlib canvas, scan
-navigation, and the figure/Excel/GIF/NeXus export flows.
+OperaXN main window: toolbar, scan list, plot canvas, scan navigation and exports.
 
-Consumes scan dictionaries and echem data from the input adapter
-(input.py); its own processing is limited to display and export
-shaping (intensity percentiles, summary tables, capacity CSV rows) —
-the reduction pipeline itself lives in core.
+Consumes scan dictionaries and echem data from the input adapter (input.py) and
+only shapes them for display and the figure/Excel/GIF/NeXus exports (intensity
+percentiles, summary tables, capacity CSV rows); the reduction pipeline lives in core.
 """
 
 import logging
@@ -15,11 +13,9 @@ import threading
 import time
 import tkinter as tk
 import traceback
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from queue import Queue, Empty
 from tkinter import filedialog, messagebox, simpledialog
 from typing import Optional, List, Tuple, Callable, Dict, Any
 
@@ -44,7 +40,6 @@ from .config import (
     FIGURE_DPI,
     INTENSITY_SAMPLE_SIZE,
     LARGE_IMAGE_THRESHOLD,
-    MAX_WORKERS,
     OPERAXNTheme,
     PLOT_UPDATE_DELAY_MS,
     SYNCHROTRON_MAX_DISPLAY_SIZE,
@@ -57,25 +52,25 @@ from .capacity import (
 from .dialog import (
     PlotSettingsDialog, ExportOptionsDialog, ExportOptions,
     GIFSettingsDialog, GIFSettings, ProgressDialog,
-    UploadOptionsDialog, UploadOptions
+    UploadOptionsDialog, UploadOptions, parse_scan_range
 )
 from .heatmap import HeatmapWindow
 from .ici import (
     ICIWindow, echem_source_button, embed_figure, maximise_window,
-    sync_figure_to_widget
+    watch_figure_sync
 )
 from .input import (
     process_paths, make_oned_arrays, make_twod_arrays,
     make_echem_arrays, get_correlated_data, make_neutron_arrays,
     NeutronFileGrouper, SynchrotronFileGrouper, export_nxs, get_loaded_nxs_path,
     add_standard_echem_files, experiment_metadata_rows, get_experiment_metadata,
-    get_standard_echem
+    get_standard_echem, clear_global_cache, cleanup_session_cache
 )
 from .output import (
     plot_oned_data, plot_twod_data, plot_echem_data,
     create_figure_layout, export_single_scan,
     get_scan_time_positions, plot_neutron_data,
-    clear_plot_cache, clear_plot_axes
+    clear_plot_cache, clear_plot_axes, FigureLayoutManager
 )
 
 try:
@@ -177,7 +172,7 @@ class ApplicationState:
 # ============================================================================
 
 class PerformanceMonitor:
-    """Records timing/memory metrics per operation (memory in debug only)."""
+    """Per-operation timing and memory recorder (memory sampled in debug mode only)."""
 
     def __init__(self) -> None:
         self.metrics = {}
@@ -187,20 +182,13 @@ class PerformanceMonitor:
     def measure(self, operation: str):
         """Time the wrapped block and record the metrics under `operation`."""
         start_time = time.time()
-
-        if self.enabled and psutil:
-            start_memory = psutil.virtual_memory().used
-        else:
-            start_memory = 0
+        start_memory = psutil.virtual_memory().used if self.enabled else 0
 
         yield
 
         elapsed = time.time() - start_time
-
-        if self.enabled and psutil:
-            memory_delta = psutil.virtual_memory().used - start_memory
-        else:
-            memory_delta = 0
+        memory_delta = (psutil.virtual_memory().used - start_memory
+                        if self.enabled else 0)
 
         self.metrics[operation] = {'time': elapsed, 'memory': memory_delta}
 
@@ -209,7 +197,7 @@ class PerformanceMonitor:
 
 
 class DebouncedUpdate:
-    """Coalesces rapid updates so only the last scheduled callback runs."""
+    """Debouncer that runs only the last callback scheduled within its delay."""
 
     def __init__(self, widget: tk.Widget, delay_ms: int = 50):
         self.widget = widget
@@ -230,13 +218,6 @@ class DebouncedUpdate:
             self._pending_func()
             self._pending_func = None
             self._after_id = None
-
-    def cancel(self) -> None:
-        """Cancel the pending after() callback, if any."""
-        if self._after_id:
-            self.widget.after_cancel(self._after_id)
-            self._after_id = None
-            self._pending_func = None
 
 
 # ============================================================================
@@ -326,7 +307,7 @@ class ButtonPanel(BaseUIComponent):
         self._create_buttons()
 
     def _create_buttons(self) -> None:
-        """Create control buttons."""
+        """Create the toolbar buttons, pushing Clear to the right with a spacer."""
         container = tk.Frame(self, bg=OPERAXNTheme.COLORS['bg_primary'])
         container.pack(fill="x", padx=OPERAXNTheme.PADDING['medium'], pady=3)
 
@@ -401,7 +382,6 @@ class FileListPanel(BaseUIComponent):
             self.listbox.yview_scroll(-1 if event.delta > 0 else 1, "units")
             return "break"
 
-        # Bind mousewheel events
         self.listbox.bind("<MouseWheel>", on_mousewheel)  # Windows/Mac
         self.listbox.bind("<Button-4>", lambda e: self.listbox.yview_scroll(-1, "units"))  # Linux up
         self.listbox.bind("<Button-5>", lambda e: self.listbox.yview_scroll(1, "units"))  # Linux down
@@ -494,7 +474,7 @@ class ScanSelector(BaseUIComponent):
         self.slider.config(from_=min_val, to=max_val)
 
     def get_value(self) -> int:
-        """The currently selected scan number (1-based)."""
+        """Return the selected scan number (1-based)."""
         return self.scan_var.get()
 
     def set_value(self, value: int) -> None:
@@ -521,7 +501,6 @@ class PlotControls(BaseUIComponent):
 
     def _create_widgets(self) -> None:
         """Assemble settings button, echem, intensity, and source rows."""
-        # Settings button
         self.settings_btn = tk.Button(
             self,
             text="Plot Settings",
@@ -642,8 +621,8 @@ class PlotControls(BaseUIComponent):
             font=OPERAXNTheme.FONTS['body']
         ).pack(side="left", padx=4)
 
-        setattr(self, var_name, tk.DoubleVar(value=default))
-        var = getattr(self, var_name)
+        var = tk.DoubleVar(value=default)
+        setattr(self, var_name, var)
 
         entry = tk.Entry(
             parent,
@@ -661,7 +640,7 @@ class PlotControls(BaseUIComponent):
             try:
                 value = float(entry.get())
                 var.set(value)
-                self._on_intensity_change()
+                self.on_intensity_update()
             except ValueError:
                 pass  # Ignore invalid input
 
@@ -694,7 +673,7 @@ class PlotControls(BaseUIComponent):
             self.min_entry.insert(0, f"{self.intensity_min_var.get():.2f}")
             self.max_entry.delete(0, tk.END)
             self.max_entry.insert(0, f"{self.intensity_max_var.get():.2f}")
-        self._on_intensity_change()
+        self.on_intensity_update()
 
     def _on_echem_change(self) -> None:
         """Sync config from the checkboxes and debounce on_echem_update."""
@@ -702,10 +681,6 @@ class PlotControls(BaseUIComponent):
         self.config.show_current = self.show_current_var.get()
         if self.on_echem_update:
             self.echem_debouncer.schedule(self.on_echem_update)
-
-    def _on_intensity_change(self) -> None:
-        """Forward to the owner's intensity-update callback."""
-        self.on_intensity_update()
 
     def _apply_to_all(self) -> None:
         """Confirm, then push the current min/max to every scan."""
@@ -745,7 +720,7 @@ class PlotControls(BaseUIComponent):
             self.intensity_max_var.set(current_max)
 
     def get_intensity_limits(self) -> Tuple[float, float]:
-        """Current (min, max) limits, or (0, 100) before widgets exist."""
+        """Return the current (min, max) limits, or (0, 100) before the widgets exist."""
         if hasattr(self, 'intensity_min_var'):
             return self.intensity_min_var.get(), self.intensity_max_var.get()
         return 0, 100
@@ -772,64 +747,37 @@ class OPERAXN(tk.Frame):
     """Top-level frame that wires up data loading, plotting, and export."""
 
     def __init__(self, master: Optional[tk.Tk] = None) -> None:
-        # Setup master window
         if master is None:
             master = tk.Tk()
         self.master = master
         self._setup_window()
 
-        # Initialise parent frame
         super().__init__(self.master, bg=OPERAXNTheme.COLORS['bg_primary'])
         self.pack(fill="both", expand=True)
 
-        # Initialise state
         self.state = ApplicationState()
         self.config = VisualiserConfig()
         self.performance = PerformanceMonitor()
 
-        # Initialise plot components
         self.fig = None
         self.axes = {}
         self.canvas = None
         self.twod_image = None
 
-        # Thread management
-        self._worker_running = False
-        self.worker_thread = None
-        self.executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-
-        # Build UI
         self._build_ui()
 
-        # Start background worker
-        self._start_background_worker()
-
-        # Setup cleanup on close
         self.master.protocol("WM_DELETE_WINDOW", self._on_closing)
 
-        # Update management
         self._update_debouncer = DebouncedUpdate(self, self.config.plot_update_delay)
 
     def _setup_window(self) -> None:
         """Title the window and start maximised, with platform fallbacks."""
         self.master.configure(bg=OPERAXNTheme.COLORS['bg_primary'])
         self.master.title(f"OperaXN v{APP_VERSION}")
-
-        # Start maximised
-        try:
-            self.master.state('zoomed')
-        except tk.TclError:
-            try:
-                self.master.attributes('-zoomed', True)
-            except tk.TclError:
-                # Fallback to screen dimensions
-                width = self.master.winfo_screenwidth()
-                height = self.master.winfo_screenheight()
-                self.master.geometry(f"{width}x{height}+0+0")
+        maximise_window(self.master)
 
     def _build_ui(self) -> None:
         """Create all main-window rows; only the canvas row is stretchable."""
-        # Configure grid weights
         self.grid_rowconfigure(0, weight=0)  # header
         self.grid_rowconfigure(1, weight=0)  # buttons
         self.grid_rowconfigure(2, weight=0)  # file list
@@ -838,7 +786,6 @@ class OPERAXN(tk.Frame):
         self.grid_rowconfigure(5, weight=0)  # controls
         self.grid_columnconfigure(0, weight=1)
 
-        # Create UI components
         self._create_header()
         self._create_button_panel()
         self._create_file_list_panel()
@@ -847,7 +794,7 @@ class OPERAXN(tk.Frame):
         self._create_controls_panel()
 
     def _create_header(self) -> None:
-        """Create application header."""
+        """Create the header with the two-colour OperaXN wordmark and subtitle."""
         header = tk.Frame(self, bg=OPERAXNTheme.COLORS['bg_secondary'], height=40)
         header.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
         header.grid_propagate(False)
@@ -951,7 +898,7 @@ class OPERAXN(tk.Frame):
         self._show_empty_state()
 
     def _show_empty_state(self) -> None:
-        """Dark placeholder shown in the plot area when no data is loaded."""
+        """Show the dark no-data placeholder in the plot area."""
         hint = tk.Frame(self.plot_container, bg=OPERAXNTheme.COLORS['canvas_bg'])
         hint.pack(fill="both", expand=True)
         tk.Label(
@@ -989,38 +936,8 @@ class OPERAXN(tk.Frame):
         controls.on_echem_update = self._update_echem_display
         return controls
 
-    def _start_background_worker(self) -> None:
-        """Start the daemon thread that drains task_queue; None stops it."""
-        self._worker_running = True
-        self.task_queue = Queue()
-
-        def worker():
-            while self._worker_running:
-                try:
-                    task = self.task_queue.get(timeout=0.1)
-                    if task is None:
-                        break
-                    func, args, kwargs = task
-                    func(*args, **kwargs)
-                except Empty:
-                    continue
-                except Exception as e:
-                    logger.debug("Worker error: %s", e)
-
-        self.worker_thread = threading.Thread(target=worker, daemon=True)
-        self.worker_thread.start()
-
     def _on_closing(self) -> None:
-        """Stop worker and executor, close dialogs, destroy the window."""
-        # Stop worker thread
-        self._worker_running = False
-        if self.task_queue:
-            self.task_queue.put(None)
-
-        # Shutdown thread pool
-        self.executor.shutdown(wait=False)
-
-        # Close any open dialogs
+        """Close dialogs, clear caches and the unsaved session file, then destroy the window."""
         for dialog in self.state.dialog_windows[:]:
             try:
                 if dialog.winfo_exists():
@@ -1028,7 +945,13 @@ class OPERAXN(tk.Frame):
             except tk.TclError:
                 pass
 
-        # Destroy main window
+        try:
+            clear_plot_cache()
+            clear_global_cache()
+            cleanup_session_cache()
+        except Exception as e:
+            logger.debug("Error clearing caches on close: %s", e)
+
         self.master.destroy()
 
     # ========================================================================
@@ -1038,15 +961,8 @@ class OPERAXN(tk.Frame):
     def _upload_files(self) -> None:
         """Open the combined upload dialog and process the selection."""
         # Non-modal: lift an already-open dialog instead of duplicating it
-        existing = getattr(self, "_upload_dialog", None)
-        if existing is not None:
-            try:
-                if existing.winfo_exists():
-                    existing.lift()
-                    existing.focus_set()
-                    return
-            except tk.TclError:
-                pass
+        if self._lift_existing_dialog('_upload_dialog'):
+            return
 
         self._upload_dialog = UploadOptionsDialog(
             self.master, has_loaded_data=bool(self.state.scans))
@@ -1172,7 +1088,8 @@ class OPERAXN(tk.Frame):
                         sample_name=options.sample_name,
                         sample_description=options.sample_description,
                         sample_preparation_date=options.sample_preparation_date,
-                        cycling_protocol=options.cycling_protocol
+                        cycling_protocol=options.cycling_protocol,
+                        echem_time_tolerance=options.echem_time_tolerance
                     )
 
                 if not self.state.scans:
@@ -1190,8 +1107,7 @@ class OPERAXN(tk.Frame):
             finally:
                 self.state.ui_state = UIState.IDLE
 
-        thread = threading.Thread(target=process, daemon=True)
-        thread.start()
+        threading.Thread(target=process, daemon=True).start()
 
     def _create_data_arrays(self) -> None:
         """Build plot arrays on the Tk thread, then configure the data UI."""
@@ -1217,7 +1133,6 @@ class OPERAXN(tk.Frame):
         self._update_file_list()
         self._configure_ui_for_data()
 
-        # Show success message
         source_type = {
             DataSourceType.SYNCHROTRON: "synchrotron",
             DataSourceType.INHOUSE: "laboratory",
@@ -1232,7 +1147,7 @@ class OPERAXN(tk.Frame):
         self._show_message("Success", message, "info")
 
     def _check_data_availability(self) -> bool:
-        """Check if any valid (non-error) data is available."""
+        """True when any valid (non-error) scan data is loaded."""
         if self.state.data_source == DataSourceType.NEUTRON:
             return bool(self.state.neutron_arrays)
         has_oned = any(not d.get("error") for d in self.state.oned_arrays.values())
@@ -1261,14 +1176,11 @@ class OPERAXN(tk.Frame):
 
     def _update_file_list(self) -> None:
         """Rebuild the scan list rows from the loaded scans."""
-        items = []
-        for scan in self.state.scans:
-            text = self._format_scan_text(scan)
-            items.append(text)
-        self.file_list.update_items(items)
+        self.file_list.update_items(
+            [self._format_scan_text(scan) for scan in self.state.scans])
 
     def _format_scan_text(self, scan: Dict[str, Any]) -> str:
-        """Compose a scan's listbox row, dispatching on data source."""
+        """Compose a scan's listbox row: source-specific part, timestamp, echem."""
         text = f"Scan {scan['scan_num']}"
 
         if self.state.data_source == DataSourceType.NEUTRON:
@@ -1278,23 +1190,6 @@ class OPERAXN(tk.Frame):
         else:
             text = self._format_inhouse_scan(scan, text)
 
-        return text
-
-    def _format_neutron_scan(self, scan: Dict[str, Any], text: str) -> str:
-        """Append scan ID, timestamp, and echem readings to a neutron row."""
-        # Extract scan ID if available (same rule as file grouping, so the
-        # displayed ID always matches the ID used for logbook correlation)
-        if scan.get("neutron_files"):
-            for measurement_num, files in scan["neutron_files"].items():
-                if files:
-                    for file_type, file_path in files.items():
-                        basename = os.path.basename(file_path)
-                        scan_id = NeutronFileGrouper.extract_scan_id(basename)
-                        if scan_id:
-                            text += f" - ID: {scan_id}"
-                            break
-                    break
-
         if scan.get("timestamp"):
             text += f" - {scan['timestamp']}"
 
@@ -1305,10 +1200,27 @@ class OPERAXN(tk.Frame):
 
         return text
 
+    def _format_neutron_scan(self, scan: Dict[str, Any], text: str) -> str:
+        """Append the scan ID from the first non-empty bank to a neutron row."""
+        # Same rule as file grouping, so the displayed ID always matches the
+        # ID used for logbook correlation
+        if scan.get("neutron_files"):
+            for files in scan["neutron_files"].values():
+                if files:
+                    for file_path in files.values():
+                        basename = os.path.basename(file_path)
+                        scan_id = NeutronFileGrouper.extract_scan_id(basename)
+                        if scan_id:
+                            text += f" - ID: {scan_id}"
+                            break
+                    break
+
+        return text
+
     def _format_synchrotron_scan(self, scan: Dict[str, Any], text: str) -> str:
-        """Append scan ID, timestamp, and echem to a synchrotron row."""
-        # Scan ID via the same rule used for file grouping, so the displayed
-        # ID always matches the ID the scan was grouped under
+        """Append the scan ID from the 1D or 2D filename to a synchrotron row."""
+        # Same rule as file grouping, so the displayed ID always matches the
+        # ID the scan was grouped under
         for file_path in [scan.get("oned"), scan.get("twod")]:
             if file_path:
                 scan_id = SynchrotronFileGrouper.extract_scan_id(
@@ -1317,18 +1229,10 @@ class OPERAXN(tk.Frame):
                     text += f" - ID: {scan_id}"
                     break
 
-        if scan.get("timestamp"):
-            text += f" - {scan['timestamp']}"
-
-        if scan.get("echem") is not None:
-            text += f" - {scan['echem']:.3f} V"
-            if scan.get("current") is not None:
-                text += f" / {scan['current']:.3f} mA"
-
         return text
 
     def _format_inhouse_scan(self, scan: Dict[str, Any], text: str) -> str:
-        """Append 1D/2D filenames, timestamp, and echem to a laboratory row."""
+        """Append the 1D/2D filename stems to a laboratory row."""
         filenames = []
 
         if scan.get("oned"):
@@ -1342,14 +1246,6 @@ class OPERAXN(tk.Frame):
         if filenames:
             text += f" - {' - '.join(filenames)}"
 
-        if scan.get("timestamp"):
-            text += f" - {scan['timestamp']}"
-
-        if scan.get("echem") is not None:
-            text += f" - {scan['echem']:.3f} V"
-            if scan.get("current") is not None:
-                text += f" / {scan['current']:.3f} mA"
-
         return text
 
     def _configure_ui_for_data(self) -> None:
@@ -1359,8 +1255,9 @@ class OPERAXN(tk.Frame):
         self.state.intensity_limits.clear()
 
         echem_state = "normal" if self._echem_sources() else "disabled"
-        # XRD-only view: stays disabled for neutron data
-        heatmap_state = "normal" if self.state.oned_arrays else "disabled"
+        # Stacked 1D patterns (X-ray) or per-bank TOF/d maps (neutron)
+        heatmap_state = ("normal" if self.state.oned_arrays or self.state.neutron_arrays
+                         else "disabled")
         self.button_panel.update_states({
             "plot_data": "normal",
             "export_data": "normal",
@@ -1392,7 +1289,6 @@ class OPERAXN(tk.Frame):
             with self.performance.measure("plot_creation"):
                 self._setup_plotting()
 
-                # Check data availability
                 if self.state.data_source == DataSourceType.NEUTRON:
                     has_oned, has_twod, has_neutron = False, False, bool(self.state.neutron_arrays)
                 else:
@@ -1400,21 +1296,18 @@ class OPERAXN(tk.Frame):
                     has_twod = bool(self.state.twod_arrays)
                     has_neutron = False
 
-                has_echem = bool(self.state.echem_arrays.get("x", []).size > 0)
+                has_echem = self.state.echem_arrays.get("x", []).size > 0
 
                 if not any([has_oned, has_twod, has_echem, has_neutron]):
                     self._show_message("Warning", "No data available to plot.", "warning")
                     return
 
-                # Create figure
                 self._create_figure(has_oned, has_twod, has_echem, has_neutron)
 
-                # Update plots
                 self.scan_selector.set_value(1)
                 self.state.current_scan_idx = 0
                 self._update_plots()
 
-                # Enable controls
                 self.button_panel.update_states({
                     "export_plots": "normal",
                     "create_gif": "normal"
@@ -1422,7 +1315,7 @@ class OPERAXN(tk.Frame):
 
         except Exception as e:
             logger.debug("Error details: %s", traceback.format_exc())
-            self._show_message("Error", f"Failed to create plots: {str(e)}", "error")
+            self._show_message("Error", f"Failed to create plots: {e}", "error")
         finally:
             self.state.ui_state = UIState.IDLE
 
@@ -1456,20 +1349,15 @@ class OPERAXN(tk.Frame):
             plot_config=self.config.to_dict()
         )
 
-        # Create canvas
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_container)
-        canvas_widget = self.canvas.get_tk_widget()
-        canvas_widget.pack(fill="both", expand=True)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.canvas.draw()
 
-        # Setup controls
         self.controls.destroy()
         self.controls = self._create_new_controls()
         self.controls.update_data_source(self.state.data_source)
         self.controls.grid(row=5, column=0, sticky="ew", padx=0, pady=0)
-        self.controls.grid()
 
-        # Update control states
         echem_state = "normal" if has_echem else "disabled"
         twod_state = "normal" if has_twod else "disabled"
         self.controls.update_echem_states(echem_state)
@@ -1509,11 +1397,8 @@ class OPERAXN(tk.Frame):
             self.file_list.highlight_scan(self.state.current_scan_idx)
             scan = self.state.scans[self.state.current_scan_idx]
 
-            # Update title
-            title = self._format_plot_title(scan_num, scan)
-            self.fig.suptitle(title)
+            self.fig.suptitle(self._format_plot_title(scan_num, scan))
 
-            # Update plots
             with self._plot_update_context():
                 if self.state.data_source == DataSourceType.NEUTRON:
                     self._update_neutron_plot(scan_num, scan)
@@ -1524,18 +1409,10 @@ class OPERAXN(tk.Frame):
 
     def _format_plot_title(self, scan_num: int, scan: Dict[str, Any]) -> str:
         """Compose the figure suptitle with scan number and echem values."""
-        title = f"Scan {scan_num}"
-
-        if scan.get("echem") is not None:
-            title += f" (V: {scan['echem']:.3f} V"
-            if scan.get("current") is not None:
-                title += f", I: {scan['current']:.3f} mA"
-            title += ")"
-
-        if self.state.data_source == DataSourceType.NEUTRON:
-            title = f"Neutron {title}"
-
-        return title
+        # Same wording as the title the figure layout was created with
+        return FigureLayoutManager._create_title(
+            scan_num, scan.get("echem"), scan.get("current"),
+            self.state.data_source == DataSourceType.NEUTRON)
 
     def _update_oned_plot(self, scan_num: int, scan: Dict[str, Any]) -> None:
         """Redraw the 1D axes, or placeholder text on error/missing data."""
@@ -1547,7 +1424,7 @@ class OPERAXN(tk.Frame):
             if data.get("error"):
                 clear_plot_axes(self.axes["oned"], "oned")
                 self.axes["oned"].text(
-                    0.5, 0.5, "Error reading 1D data — try reopening dataset",
+                    0.5, 0.5, "Error reading 1D data; try reopening dataset",
                     ha="center", va="center", transform=self.axes["oned"].transAxes,
                     color="red", fontsize=10
                 )
@@ -1575,7 +1452,7 @@ class OPERAXN(tk.Frame):
             if data.get("error"):
                 clear_plot_axes(self.axes["twod"], "twod")
                 self.axes["twod"].text(
-                    0.5, 0.5, "Error reading 2D data — try reopening dataset",
+                    0.5, 0.5, "Error reading 2D data; try reopening dataset",
                     ha="center", va="center", transform=self.axes["twod"].transAxes,
                     color="red", fontsize=10
                 )
@@ -1613,7 +1490,7 @@ class OPERAXN(tk.Frame):
         if not self.state.neutron_arrays or self.state.data_source != DataSourceType.NEUTRON:
             return
 
-        neutron_axes_exist = any(key.startswith('neutron_') for key in self.axes.keys())
+        neutron_axes_exist = any(key.startswith('neutron_') for key in self.axes)
 
         if scan_num in self.state.neutron_arrays and neutron_axes_exist:
             neutron_data = self.state.neutron_arrays[scan_num]
@@ -1623,7 +1500,7 @@ class OPERAXN(tk.Frame):
                     if key.startswith('neutron_'):
                         self.axes[key].clear()
                         self.axes[key].text(
-                            0.5, 0.5, "Error reading neutron data — try reopening dataset",
+                            0.5, 0.5, "Error reading neutron data; try reopening dataset",
                             ha="center", va="center", transform=self.axes[key].transAxes,
                             color="red", fontsize=10
                         )
@@ -1740,7 +1617,7 @@ class OPERAXN(tk.Frame):
                            "info")
 
     def _lift_existing_dialog(self, attr: str) -> bool:
-        """Focus a still-open dialog on `attr` instead of duplicating it."""
+        """Lift and focus the dialog stored on `attr`; True when it was still open."""
         existing = getattr(self, attr, None)
         if existing is not None:
             try:
@@ -1779,11 +1656,8 @@ class OPERAXN(tk.Frame):
                 and bool(df["current"].notna().any()))
 
     def _echem_sources(self) -> Dict[str, pd.DataFrame]:
-        """Echem datasets usable for capacity/ICI analysis, keyed by label.
-
-        The operando echem comes first, followed by any standard echem files
-        stored in the loaded .nxs; datasets without current values are
-        excluded (nothing to classify or integrate)."""
+        """Return current-bearing echem datasets for capacity/ICI analysis, keyed by label.
+        Operando echem comes first, then standard echem stored in the loaded .nxs."""
         sources: Dict[str, pd.DataFrame] = {}
         if self._has_analysis_current(self.state.echem_df):
             sources["Operando echem"] = self.state.echem_df
@@ -1802,22 +1676,31 @@ class OPERAXN(tk.Frame):
         return sources
 
     def _open_heatmap(self) -> None:
-        """Open the operando heatmap (stacked XRD patterns + voltage)."""
+        """Open the operando heatmap (stacked patterns + voltage)."""
         if self._lift_existing_dialog('_heatmap_window'):
             return
-        if not self.state.oned_arrays:
+        is_neutron = self.state.data_source == DataSourceType.NEUTRON
+        if not (self.state.neutron_arrays if is_neutron else self.state.oned_arrays):
             self._show_message(
                 "No data",
-                "Load 1D XRD data before opening the heatmap.",
+                "Load 1D XRD or neutron data before opening the heatmap.",
                 "warning")
             return
 
+        neutron_options = {}
+        if is_neutron:
+            # The main window's neutron axis and x range seed the map
+            neutron_options = dict(
+                neutron_arrays=self.state.neutron_arrays,
+                neutron_dspacing=self.config.show_neutron_dspacing,
+                x_range=(self.config.neutron_xmin, self.config.neutron_xmax))
         win = HeatmapWindow(
             self.master,
             scans=self.state.scans,
             oned_arrays=self.state.oned_arrays,
             echem_arrays=self.state.echem_arrays,
-            time_method=self.state.time_method)
+            time_method=self.state.time_method,
+            **neutron_options)
         self._heatmap_window = win
         self.state.dialog_windows.append(win)
         win.protocol("WM_DELETE_WINDOW", lambda: self._close_dialog(win))
@@ -1861,7 +1744,7 @@ class OPERAXN(tk.Frame):
         }
 
         win = tk.Toplevel(self.master)
-        win.title("OperaXN — Capacity Analysis")
+        win.title("OperaXN: Capacity Analysis")
         win.configure(bg=OPERAXNTheme.COLORS['bg_primary'])
         win.minsize(900, 500)
         maximise_window(win)
@@ -1989,7 +1872,7 @@ class OPERAXN(tk.Frame):
             return [selected] if selected in current["available"] else []
 
         # Plot area, bordered like the main-window plot container. The figure
-        # has no fixed size — fractional margins keep the layout correct at
+        # has no fixed size: fractional margins keep the layout correct at
         # any window size, unlike a one-shot tight_layout.
         plot_bg = '#ffffff'
         plot_text = '#20242c'
@@ -2034,20 +1917,7 @@ class OPERAXN(tk.Frame):
         _style_live_axes()
 
         canvas = embed_figure(fig, plot_frame)
-
-        # Watch until the initial layout and DPI adjustment have both settled;
-        # their event order is not deterministic, so one-shot timers can miss.
-        sync_state = {"attempts": 0}
-
-        def _sync_watchdog() -> None:
-            if not win.winfo_exists():
-                return
-            sync_figure_to_widget(canvas)
-            sync_state["attempts"] += 1
-            if sync_state["attempts"] < 12:
-                win.after(200, _sync_watchdog)
-
-        win.after(150, _sync_watchdog)
+        watch_figure_sync(win, (canvas,))
 
         def _replot(*_args) -> None:
             selected = _get_cycles()
@@ -2059,8 +1929,8 @@ class OPERAXN(tk.Frame):
 
         mass_replot_job = {"id": None}
 
+        # Debounce typing while keeping mass changes live
         def _queue_mass_replot(*_args) -> None:
-            """Debounce typing while keeping mass changes live."""
             if mass_replot_job["id"] is not None:
                 try:
                     win.after_cancel(mass_replot_job["id"])
@@ -2204,14 +2074,11 @@ class OPERAXN(tk.Frame):
             else:
                 self._export_multiple_scans(options.dpi, options.plot_types)
         except Exception as e:
-            self._show_message("Error", f"Export failed: {str(e)}", "error")
+            self._show_message("Error", f"Export failed: {e}", "error")
 
     def _export_nxs(self) -> None:
-        """Save the canonical NeXus file for the loaded experiment.
-
-        The file already contains everything chosen at generation time
-        (standard echem, 2D images or references), so this is a plain save.
-        """
+        """Save the canonical NeXus file for the loaded experiment on a worker thread.
+        It already holds everything chosen at generation time, so this is a plain save."""
         if not self.state.scans:
             self._show_message("Error", "No data loaded", "error")
             return
@@ -2291,7 +2158,7 @@ class OPERAXN(tk.Frame):
         if not scan_range:
             return
 
-        scan_list = self._parse_scan_range(scan_range)
+        scan_list = parse_scan_range(scan_range, len(self.state.scans))
         if not scan_list:
             self._show_message("Error", "No valid scans in range", "error")
             return
@@ -2313,17 +2180,13 @@ class OPERAXN(tk.Frame):
             progress.update_progress(idx, f"Exporting scan {scan_num}...")
 
             try:
-                # Get scan data
                 scan_data = get_correlated_data(self.state.scans, self.state.echem_df, scan_num, self.state)
 
                 if not scan_data:
                     failed_scans.append((scan_num, "No data available"))
                     continue
 
-                # Get intensity limits for this specific scan
                 intensity_limits = self.state.intensity_limits.get(scan_num - 1)
-
-                # Prepare filename
                 filename = os.path.join(base_dir, f"scan_{scan_num:03d}.png")
 
                 logger.debug("Exporting scan %d to %s", scan_num, filename)
@@ -2366,9 +2229,7 @@ class OPERAXN(tk.Frame):
 
     def _calculate_cropped_extent(self) -> Tuple[float, float, float, float]:
         """Map crop percentages onto the source's base extent rectangle."""
-        if self.config.data_source == DataSourceType.SYNCHROTRON:
-            base_extent = (0, 1, 0, 1)
-        elif self.config.data_source == DataSourceType.NEUTRON:
+        if self.config.data_source in (DataSourceType.SYNCHROTRON, DataSourceType.NEUTRON):
             base_extent = (0, 1, 0, 1)
         else:
             base_extent = (0, 1 / 2.5, 0, 1)
@@ -2425,7 +2286,6 @@ class OPERAXN(tk.Frame):
             try:
                 progress = ProgressDialog(self.master, "Creating GIF", len(selected_scans))
 
-                # Create frames
                 frame_files = []
                 for idx, scan in enumerate(selected_scans):
                     if not progress.update_progress(idx, f"Processing scan {scan['scan_num']}"):
@@ -2435,7 +2295,6 @@ class OPERAXN(tk.Frame):
                     if frame_file:
                         frame_files.append(frame_file)
 
-                # Create GIF
                 progress.update_progress(len(selected_scans), "Creating animated GIF...")
 
                 writer = imageio.get_writer(output_file, mode='I',
@@ -2459,7 +2318,7 @@ class OPERAXN(tk.Frame):
             except Exception as e:
                 if progress is not None:
                     progress.destroy()
-                self._show_message("Error", f"Failed to create GIF: {str(e)}", "error")
+                self._show_message("Error", f"Failed to create GIF: {e}", "error")
 
     def _create_gif_frame(self, temp_dir: str, index: int, scan: Dict[str, Any], dpi: int) -> Optional[str]:
         """Render one scan to a PNG in temp_dir; None if it has no data."""
@@ -2472,7 +2331,6 @@ class OPERAXN(tk.Frame):
 
         fig = None
         try:
-            # Create figure for frame
             if self.state.data_source == DataSourceType.NEUTRON:
                 has_oned, has_twod, has_neutron = False, False, scan_data.get("neutron") is not None
             else:
@@ -2495,7 +2353,6 @@ class OPERAXN(tk.Frame):
                 plot_config=frame_config
             )
 
-            # Plot data
             if has_oned and "oned" in axes:
                 plot_oned_data(
                     axes["oned"], scan_data["oned"]["x"], scan_data["oned"]["y"],
@@ -2548,7 +2405,6 @@ class OPERAXN(tk.Frame):
                 with self.performance.measure("excel_export"):
                     summary_df = self._create_summary_dataframe()
 
-                    # Get filename
                     default_filename = {
                         DataSourceType.NEUTRON: "Neutron_Diffraction_Data.xlsx",
                         DataSourceType.SYNCHROTRON: "Synchrotron_XRD_Data.xlsx",
@@ -2591,19 +2447,11 @@ class OPERAXN(tk.Frame):
                 error_message = f"Excel export failed: {e}"
                 self.after(0, lambda: self._show_message("Error", error_message, "error"))
 
-        # Run in thread
-        thread = threading.Thread(target=export_task, daemon=True)
-        thread.start()
+        threading.Thread(target=export_task, daemon=True).start()
 
     def _create_summary_dataframe(self) -> pd.DataFrame:
         """Assemble the per-scan summary table, sorted by scan number."""
-        correlated_data_list = []
-
-        for scan in self.state.scans:
-            base_data = self._create_scan_summary(scan)
-            correlated_data_list.append(base_data)
-
-        df = pd.DataFrame(correlated_data_list)
+        df = pd.DataFrame([self._create_scan_summary(scan) for scan in self.state.scans])
 
         if not df.empty:
             df = df.sort_values('scan number').reset_index(drop=True)
@@ -2668,39 +2516,32 @@ class OPERAXN(tk.Frame):
     def _save_to_csv(self, df: pd.DataFrame, filename: str) -> None:
         """Write the CSV, reordering columns first for neutron data."""
         if self.state.data_source == DataSourceType.NEUTRON:
-            # Reorder columns for neutron data
-            column_order = self._get_neutron_column_order(df)
-            df = df[column_order]
+            df = df[self._get_neutron_column_order(df)]
 
         df.to_csv(filename, index=False, encoding=CSV_ENCODING)
 
     def _get_neutron_column_order(self, df: pd.DataFrame) -> List[str]:
-        """Order columns: ids, times, echem, banks, metadata, then rest."""
+        """Order the neutron columns: ids, times, echem, banks, metadata, then the rest."""
         column_order = ["scan number", "scan ID", "data source"]
 
-        # Add timestamp columns
         for col in ["neutron_timestamp", "neutron_start", "neutron_end"]:
             if col in df.columns:
                 column_order.append(col)
 
-        # Add voltage/current columns
         for col in ["voltage (V)", "current (mA)", "voltage timestamp",
                     "exposure time (s)"]:
             if col in df.columns:
                 column_order.append(col)
 
-        # Add bank columns
         for i in range(1, 6):
             for suffix in ["_tof", "_d"]:
                 col = f"bank_{i}{suffix}"
                 if col in df.columns:
                     column_order.append(col)
 
-        # Add metadata column
         if "neutron_metadata" in df.columns:
             column_order.append("neutron_metadata")
 
-        # Add any remaining columns
         for col in df.columns:
             if col not in column_order:
                 column_order.append(col)
@@ -2724,7 +2565,7 @@ class OPERAXN(tk.Frame):
 
     @staticmethod
     def _format_sheet(worksheet, df: pd.DataFrame) -> None:
-        """Bold, frozen header row and readable column widths."""
+        """Bold and freeze the header row and fit column widths (capped at 50)."""
         from openpyxl.styles import Font
         header_font = Font(bold=True)
         for cell in worksheet[1]:
@@ -2739,7 +2580,7 @@ class OPERAXN(tk.Frame):
             ].width = min(column_length + 3, 50)
 
     def _add_operando_echem_sheet(self, writer: pd.ExcelWriter) -> None:
-        """Full operando echem series so the workbook is self-contained."""
+        """Add the full operando echem series so the workbook is self-contained."""
         df = self.state.echem_df
         if df is None or df.empty:
             return
@@ -2755,7 +2596,7 @@ class OPERAXN(tk.Frame):
         self._format_sheet(writer.sheets["Operando Echem"], out)
 
     def _add_experiment_sheet(self, writer: pd.ExcelWriter) -> None:
-        """Experiment-level metadata from the canonical NeXus file."""
+        """Add the experiment-level metadata sheet from the canonical NeXus file."""
         rows = experiment_metadata_rows(get_experiment_metadata())
         if not rows:
             return
@@ -2765,17 +2606,12 @@ class OPERAXN(tk.Frame):
 
     def _add_neutron_statistics_sheet(self, writer: pd.ExcelWriter, df: pd.DataFrame) -> None:
         """Append a per-scan statistics sheet with auto-sized columns."""
-        stats_data = []
-
-        for _, row in df.iterrows():
-            stats = self._calculate_neutron_statistics(row)
-            stats_data.append(stats)
+        stats_data = [self._calculate_neutron_statistics(row) for _, row in df.iterrows()]
 
         if stats_data:
             stats_df = pd.DataFrame(stats_data)
             stats_df.to_excel(writer, index=False, sheet_name="Neutron Statistics")
 
-            # Auto-adjust column widths
             worksheet = writer.sheets["Neutron Statistics"]
             for column in stats_df:
                 column_length = max(
@@ -2811,34 +2647,22 @@ class OPERAXN(tk.Frame):
             except (ValueError, TypeError):
                 duration = "N/A"
 
+        # Uncorrelated scans hold NaN (or "") in the summary's echem columns
+        voltage = row.get("voltage (V)", "")
+        current = row.get("current (mA)", "")
+        has_echem = voltage != "" and pd.notna(voltage)
+
         return {
             "Scan Number": row["scan number"],
             "Measurements": measurements_available,
             "TOF Files": tof_files,
             "D-spacing Files": d_files,
             "Scan Duration": duration,
-            "Voltage (V)": row.get("voltage", ""),
-            "Current (A)": row.get("current", ""),
-            "Has Echem": "Yes" if row.get("voltage", "") != "" else "No"
+            "Voltage (V)": voltage if has_echem else "",
+            "Current (mA)": current if current != "" and pd.notna(current) else "",
+            "Has Echem": "Yes" if has_echem else "No"
         }
 
-    def _parse_scan_range(self, scan_range: str) -> List[int]:
-        """Parse '1-5' or '1,3,5' into sorted in-range scans; [] on error."""
-        scan_list = []
-        try:
-            parts = scan_range.replace(" ", "").split(",")
-
-            for part in parts:
-                if "-" in part and part.count("-") == 1:
-                    start, end = map(int, part.split("-"))
-                    scan_list.extend(range(start, end + 1))
-                else:
-                    scan_list.append(int(part))
-
-            scan_list = sorted(set(scan_list))
-            return [s for s in scan_list if 1 <= s <= len(self.state.scans)]
-        except (ValueError, TypeError, AttributeError):
-            return []
 
     def _clear_all(self) -> None:
         """Confirm, then close dialogs and reset state and UI to startup."""
@@ -2846,11 +2670,9 @@ class OPERAXN(tk.Frame):
             if not messagebox.askyesno("Confirm", "Clear all data?", parent=self.master):
                 return
 
-        # Close dialogs
         for dialog in self.state.dialog_windows[:]:
             self._close_dialog(dialog)
 
-        # Reset state
         self.state.reset()
         self.config = VisualiserConfig()
 
@@ -2888,7 +2710,7 @@ class OPERAXN(tk.Frame):
     # ========================================================================
 
     def _close_dialog(self, dialog: tk.Toplevel) -> None:
-        """Close dialog and remove from tracking."""
+        """Stop tracking a dialog and destroy it if it still exists."""
         try:
             if dialog in self.state.dialog_windows:
                 self.state.dialog_windows.remove(dialog)

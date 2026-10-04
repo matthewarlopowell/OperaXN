@@ -1,5 +1,5 @@
 """
-OperaXN — operando diffraction visualisation with NeXus-canonical storage.
+OperaXN: operando diffraction visualisation with NeXus-canonical storage.
 
 The GUI (this package) is a thin layer over the shared `core` pipeline:
 every raw-data upload is generated into a canonical .nxs file and the
@@ -35,7 +35,6 @@ from .config import (  # noqa: F401  (package API re-exports)
 from .gui import OPERAXN, UIState, VisualiserConfig
 
 from .capacity import (
-    classify_phases,
     assign_cycles,
     compute_capacity,
     plot_capacity_vs_voltage,
@@ -78,7 +77,6 @@ from .dialog import (
     ProgressDialog
 )
 
-# Package metadata
 __all__ = [
     # Main application
     'OPERAXN',
@@ -107,8 +105,7 @@ __all__ = [
     'clear_plot_cache',
     'clear_plot_axes',
 
-    # Echem analysis
-    'classify_phases',
+    # Analysis
     'assign_cycles',
     'compute_capacity',
     'plot_capacity_vs_voltage',
@@ -141,7 +138,7 @@ __all__ = [
     'APP_COPYRIGHT',
     'DEBUG_MODE',
 
-    # System info
+    # Performance settings
     'CACHE_ENABLED',
     'PARALLEL_PROCESSING',
     'MAX_CACHE_SIZE_MB',

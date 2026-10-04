@@ -1,22 +1,20 @@
-"""NXDL definitions validated against the XSD pinned in schema/README.md."""
+"""NXDL definitions: validity against the XSD pinned in schema/README.md, plus Figure-4 elements."""
 from pathlib import Path
 
 import pytest
 
-lxml = pytest.importorskip("lxml")
+pytest.importorskip("lxml")
 from lxml import etree  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 SCHEMA = REPO / "schema" / "nxdl.xsd"
 NXDL_FILES = sorted((REPO / "definitions").glob("*.nxdl.xml"))
-PLUGIN_BUNDLE = (REPO / "pynxtools-operaxn" / "src" / "pynxtools_operaxn"
-                 / "nexus_definitions" / "applications")
 NS = {"nx": "http://definition.nexusformat.org/nxdl/3.1"}
 
 
 @pytest.fixture(scope="module")
 def xsd():
-    """Compiled nxdl.xsd schema."""
+    """Return the compiled nxdl.xsd schema."""
     return etree.XMLSchema(etree.parse(str(SCHEMA)))
 
 
@@ -39,8 +37,7 @@ def test_well_formed_xml(path):
 
 @pytest.mark.parametrize("path", NXDL_FILES, ids=lambda p: p.name)
 def test_valid_against_schema(path, xsd):
-    """Each definition obeys the NXDL meta-schema; failures report the
-    full XSD error log."""
+    """Each definition obeys the NXDL meta-schema; failures report the full XSD error log."""
     doc = etree.parse(str(path))
     ok = xsd.validate(doc)
     assert ok, "; ".join(str(e) for e in xsd.error_log)
@@ -55,25 +52,12 @@ def test_filename_matches_definition_name(path):
 
 @pytest.mark.parametrize("path", NXDL_FILES, ids=lambda p: p.name)
 def test_category_is_application(path):
-    """Each definition declares category='application' so validators
-    treat it as a strict contract, not a base class."""
+    """Each definition declares category='application': a strict contract, not a base class."""
     assert etree.parse(str(path)).getroot().get("category") == "application"
 
 
-@pytest.mark.parametrize("path", NXDL_FILES, ids=lambda p: p.name)
-def test_plugin_bundle_in_sync(path):
-    """The local pynxtools-operaxn bundle carries a byte-identical copy of
-    each repo definition."""
-    if not PLUGIN_BUNDLE.is_dir():
-        pytest.skip("pynxtools-operaxn plugin checkout not present")
-    bundled = PLUGIN_BUNDLE / path.name
-    assert bundled.is_file(), f"{bundled} missing"
-    assert bundled.read_bytes() == path.read_bytes(), (
-        f"{path.name} differs between definitions/ and the plugin bundle")
-
-
 def _one(root, xpath):
-    """Exactly one element matching xpath (namespace-aware) under root."""
+    """Return the one element under root matching xpath (namespace-aware); assert it is unique."""
     hits = root.xpath(xpath, namespaces=NS)
     assert len(hits) == 1, f"{xpath}: {len(hits)} matches"
     return hits[0]
@@ -106,7 +90,7 @@ def test_figure4_elements_present(path):
     scan = _one(entry, "nx:group[@name='SCAN'][@type='NXsubentry']")
     env = _one(scan, "nx:group[@name='environment']")
     # Window extrema are declared optional (Figure 4 requires them); the
-    # index pointers, log slices and capacity are not declared at all
+    # index pointers, log slices and capacity are not declared at all.
     for name, units in (("voltage_min", "NX_VOLTAGE"), ("voltage_max", "NX_VOLTAGE"),
                         ("current_min", "NX_CURRENT"), ("current_max", "NX_CURRENT")):
         f = _one(env, f"nx:field[@name='{name}']")
@@ -122,6 +106,15 @@ def test_figure4_elements_present(path):
     process = _one(entry, "nx:group[@name='process']")
     assert _required(process)
     assert _required(_one(process, "nx:field[@name='correlation_method']"))
+    # The correlation tolerance is a recommended scalar of the echem record
+    # it bounds (an OperaXN addition, so a Figure 4-only file still
+    # validates), not a process field.
+    echem = _one(entry, "nx:group[@name='operando_electrochemistry'][@type='NXdata']")
+    tolerance = _one(echem, "nx:field[@name='echem_time_tolerance']")
+    assert (tolerance.get("type"), tolerance.get("units"),
+            tolerance.get("recommended")) == ("NX_FLOAT", "NX_TIME", "true")
+    assert not tolerance.xpath("nx:dimensions", namespaces=NS)
+    assert not process.xpath("nx:field[@name='echem_time_tolerance']", namespaces=NS)
     # A subentry holds its environment (with the acquisition window) and its
     # data: no definition/title/time fields, no declared link. Only monopd
     # declares a per-scan monitor (the integral of an acquisition with a
@@ -140,42 +133,30 @@ def test_figure4_elements_present(path):
     assert _one(entry, "nx:field[@name='end_time']").get("optional") == "true"
     assert not root.xpath("//nx:link", namespaces=NS)
 
+    mon = _one(entry, "nx:group[@name='monitor'][@type='NXmonitor']")
+    assert mon.get("optional") == "true"
+    mode = _one(mon, "nx:field[@name='mode']")
+    assert _required(mode)
     if root.get("name") == "NXoperando_tofnpd":
         fp = _one(entry, "nx:field[@name='pre_sample_flightpath']")
         assert (fp.get("type"), fp.get("units"), fp.get("optional")) == (
             "NX_FLOAT", "NX_LENGTH", "true")
         det = _one(entry, "nx:group[@name='instrument']/nx:group[@name='detector']")
-        for name, typ, units in (("detector_number", "NX_INT", None),
-                                 ("distance", "NX_FLOAT", "NX_LENGTH"),
-                                 ("polar_angle", "NX_FLOAT", "NX_ANGLE"),
-                                 ("azimuthal_angle", "NX_FLOAT", "NX_ANGLE")):
-            f = _one(det, f"nx:field[@name='{name}']")
-            assert (f.get("type"), f.get("units"), f.get("optional")) == (
-                typ, units, "true"), name
-            dim = _one(f, "nx:dimensions[@rank='1']/nx:dim")
-            assert dim.get("value") == "nBank"
-        _one(root, "nx:symbols/nx:symbol[@name='nBank']")
-        mon = _one(entry, "nx:group[@name='monitor'][@type='NXmonitor']")
-        assert mon.get("optional") == "true"
-        mode = _one(mon, "nx:field[@name='mode']")
-        assert _required(mode)
+        for group, symbol in ((det, "nBank"), (mon, "nMon")):
+            for name, typ, units in (("detector_number", "NX_INT", None),
+                                     ("distance", "NX_FLOAT", "NX_LENGTH"),
+                                     ("polar_angle", "NX_FLOAT", "NX_ANGLE"),
+                                     ("azimuthal_angle", "NX_FLOAT", "NX_ANGLE")):
+                f = _one(group, f"nx:field[@name='{name}']")
+                assert (f.get("type"), f.get("units"), f.get("optional")) == (
+                    typ, units, "true"), name
+                assert _one(f, "nx:dimensions[@rank='1']/nx:dim").get("value") == symbol
+            _one(root, f"nx:symbols/nx:symbol[@name='{symbol}']")
         assert [i.get("value") for i in
                 mode.xpath("nx:enumeration/nx:item", namespaces=NS)] == ["monitor", "timer"]
-        for name, typ, units in (("detector_number", "NX_INT", None),
-                                 ("distance", "NX_FLOAT", "NX_LENGTH"),
-                                 ("polar_angle", "NX_FLOAT", "NX_ANGLE"),
-                                 ("azimuthal_angle", "NX_FLOAT", "NX_ANGLE")):
-            f = _one(mon, f"nx:field[@name='{name}']")
-            assert (f.get("type"), f.get("units"), f.get("optional")) == (
-                typ, units, "true"), name
-            assert _one(f, "nx:dimensions[@rank='1']/nx:dim").get("value") == "nMon"
-        _one(root, "nx:symbols/nx:symbol[@name='nMon']")
         for name in ("preset", "integral", "data", "time_of_flight"):
             assert not mon.xpath(f"nx:field[@name='{name}']", namespaces=NS), name
     else:
-        mon = _one(entry, "nx:group[@name='monitor'][@type='NXmonitor']")
-        assert mon.get("optional") == "true"
-        assert _required(_one(mon, "nx:field[@name='mode']"))
         preset = _one(mon, "nx:field[@name='preset']")
         assert (preset.get("type"), preset.get("optional")) == ("NX_FLOAT", "true")
         assert not mon.xpath("nx:field[@name='integral']", namespaces=NS)

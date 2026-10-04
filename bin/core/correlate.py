@@ -38,7 +38,7 @@ def _nan_to_none(value: Any) -> Any:
 # ============================================================================
 
 class EchemParser:
-    """Parses tab-delimited electrochemistry files into timestamp/voltage/current DataFrames."""
+    """Parser for tab-delimited electrochemistry files (timestamp, voltage, current)."""
 
     COLUMN_PATTERNS = {
         "time": ["time", "date"],
@@ -49,8 +49,8 @@ class EchemParser:
     HEADER_KEYWORDS = ["time", "date", "ecell", "ewe", "voltage", "current", "i/", "v/"]
 
     def parse(self, path: str) -> Optional[pd.DataFrame]:
-        """Parse one echem file into a timestamp/echem_data/current DataFrame;
-        None when nothing parses. Dates are read day-first (UK convention)."""
+        """Parse an echem file into a timestamp/echem_data/current DataFrame, or None.
+        Ambiguous dates are read day-first (UK convention)."""
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
@@ -87,9 +87,8 @@ class EchemParser:
     def _detect_columns(self, header_line: str,
                         sample_line: Optional[str] = None,
                         last_sample_line: Optional[str] = None) -> Dict[str, int]:
-        """Map column names to indices via keyword matching; the first and
-        last data rows validate that a date-named column really carries
-        per-row timestamps."""
+        """Map time/voltage/current to header indices by keyword (-1 when disabled).
+        The first and last data rows confirm a date-named column carries per-row timestamps."""
         header_parts = [part.strip().lower() for part in header_line.strip().split("\t")]
 
         detected: Dict[str, int] = {}
@@ -190,8 +189,8 @@ class EchemParser:
 
     @staticmethod
     def _current_unit_scale(header_line: str, columns: Dict[str, int]) -> float:
-        """1000.0 when a current-named column is unit-labelled in amps, e.g.
-        Arbin's 'Current(A)'; stored current values are milliamps."""
+        """Return 1000.0 when the current column is labelled in amps, else 1.0.
+        Stored current values are milliamps (e.g. Arbin's 'Current(A)' is scaled)."""
         idx = columns.get("current", -1)
         parts = [p.strip().lower() for p in header_line.strip().split("\t")]
         if 0 <= idx < len(parts):
@@ -204,8 +203,8 @@ class EchemParser:
     @staticmethod
     def _parse_data_lines(lines: List[str], columns: Dict[str, int],
                           current_scale: float = 1.0) -> List[Dict[str, Any]]:
-        """Rows as dicts, skipping unparseable lines and placeholder rows;
-        ambiguous dates are read day-first (UK convention, by design)."""
+        """Parse data lines into row dicts, skipping unparseable and placeholder rows.
+        Ambiguous dates are read day-first (UK convention, by design)."""
         # A disabled time/voltage column (-1) would silently index parts[-1]
         if columns["time"] < 0 or columns["voltage"] < 0:
             logger.warning("Echem time/voltage column could not be resolved; skipping file")
@@ -272,7 +271,7 @@ class EchemParser:
 # ============================================================================
 
 class ScanProcessor:
-    """Builds the ordered scan list and correlates scans with echem data."""
+    """Processor building the ordered scan list and correlating it with echem data."""
 
     def __init__(self, time_method: TimeMethod = TimeMethod.ABSOLUTE,
                  data_source: DataSourceType = DataSourceType.INHOUSE,
@@ -292,7 +291,7 @@ class ScanProcessor:
         self.echem_parser = EchemParser()
 
     def process_scans(self, df: pd.DataFrame) -> Tuple[List[Scan], pd.DataFrame]:
-        """Main pipeline: parse echem -> build scans -> adjust timestamps -> correlate."""
+        """Run the pipeline: parse echem, build scans, set exposure midpoints, correlate."""
         combined_echem_df = self._process_echem_data(df)
 
         neutron_metadata_df = None
@@ -382,7 +381,7 @@ class ScanProcessor:
             self.xrd_reference_time = min(mids) if mids else None
         else:
             # Neutron dataframes carry no oned/twod rows, and an empty scan
-            # list implies none either -- there is nothing to reference.
+            # list implies none either: there is nothing to reference.
             self.xrd_reference_time = None
 
         # Echem reference: earliest echem point
@@ -404,7 +403,7 @@ class ScanProcessor:
     @staticmethod
     def _create_neutron_scan_list(df: pd.DataFrame,
                                   neutron_metadata_df: pd.DataFrame) -> List[Scan]:
-        """Match neutron .dat file groups to logbook entries, skip unmatched scans."""
+        """Match neutron .dat file groups to logbook entries, skipping entries without data."""
         scan_list: List[Scan] = []
 
         neutron_files = [
@@ -467,7 +466,7 @@ class ScanProcessor:
 
     def _create_scan_list(self, df: pd.DataFrame,
                           neutron_metadata_df: Optional[pd.DataFrame] = None) -> List[Scan]:
-        """Build scan list from classified DataFrame, sorted by timestamp."""
+        """Build the scan list from the classified DataFrame, sorted by timestamp."""
         scan_list: List[Scan] = []
 
         if self.data_source == DataSourceType.NEUTRON and neutron_metadata_df is not None:
@@ -528,14 +527,13 @@ class ScanProcessor:
         _sort_sentinel = pd.Timestamp("1900-01-01")
         scan_list.sort(key=lambda s: pd.to_datetime(s.timestamp) if s.timestamp else _sort_sentinel)
 
-        # Assign sequential scan numbers
         for i, scan in enumerate(scan_list, start=1):
             scan.scan_num = i
 
         return scan_list
 
     def _adjust_for_exposure_time(self, scan_list: List[Scan]) -> None:
-        """Set timestamp_for_correlation to the exposure midpoint for each scan."""
+        """Set each scan's exposure_time and its exposure-midpoint timestamp_for_correlation."""
         for scan in scan_list:
             exposure_time = self._determine_exposure_time(scan)
             scan.exposure_time = exposure_time
@@ -554,7 +552,8 @@ class ScanProcessor:
                     scan.timestamp_for_correlation = pd.to_datetime(scan.timestamp) if scan.timestamp else None
 
     def _determine_exposure_time(self, scan: Scan) -> Optional[float]:
-        """Return best available exposure time; average 1D/2D if both present."""
+        """Return the exposure time in seconds (neutron: the logbook run length), or None.
+        With both 1D and 2D files it is their mean, None unless both exposures are known."""
         if self.data_source == DataSourceType.NEUTRON and scan.neutron_start and scan.neutron_end:
             start = pd.to_datetime(scan.neutron_start)
             end = pd.to_datetime(scan.neutron_end)
@@ -613,7 +612,7 @@ class ScanProcessor:
 
     @staticmethod
     def _parse_echem_timestamps(echem_df: pd.DataFrame) -> Optional[pd.Series]:
-        """Parse the echem timestamp column, trying the known day-first formats."""
+        """Parse echem timestamps, falling back to the day-first formats; None if all fail."""
         for kwargs in ({}, {"format": "%d/%m/%Y %H:%M:%S.%f"},
                        {"format": "%d/%m/%Y %H:%M:%S"}):
             try:
@@ -686,10 +685,9 @@ class ScanProcessor:
 
     def _annotate_echem_window(self, scan_list: List[Scan],
                                echem_df: pd.DataFrame) -> None:
-        """Fill the per-scan voltage/current extrema over every electrochemistry
-        point inside the acquisition window, both bounds inclusive, in the same
-        clock alignment as the nearest-point correlation (the Figure 4 window
-        summary). Runs before the relative-display rewrite of echem_df."""
+        """Fill per-scan voltage/current extrema over the acquisition window, bounds inclusive.
+        Clock-aligned like the nearest-point match (the Figure 4 window summary); runs before
+        the relative-display rewrite of echem_df."""
         echem_timestamps = self._parse_echem_timestamps(echem_df)
         if echem_timestamps is None:
             return
@@ -736,7 +734,7 @@ class ScanProcessor:
                     scan.current_max = float(np.nanmax(window_i))
 
     def _apply_relative_time(self, scan_list: List[Scan], echem_df: pd.DataFrame) -> None:
-        """Replace absolute timestamps with HH:MM:SS relative strings for display."""
+        """Replace scan and echem timestamps with relative HH:MM:SS display strings."""
         if self.data_source == DataSourceType.NEUTRON:
             reference_time = self.neutron_reference_time
         else:
@@ -768,7 +766,7 @@ class ScanProcessor:
 
 
 def format_relative_time(seconds: float) -> str:
-    """Format elapsed seconds as HH:MM:SS string."""
+    """Format elapsed seconds as an HH:MM:SS string."""
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)

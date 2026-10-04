@@ -1,7 +1,8 @@
-"""Checks for the operaxn.input adapter (GUI contract over the core pipeline)."""
+"""operaxn.input adapter: the GUI contract over the core pipeline."""
+import logging
 import os
 import shutil
-import zipfile
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -36,9 +37,7 @@ from operaxn.input import (
 )
 
 import _builders
-
-needs_fabio = pytest.mark.skipif(not core.FABIO_AVAILABLE,
-                                 reason="fabio not installed")
+from _helpers import needs_fabio
 
 
 def _reset_session():
@@ -50,7 +49,7 @@ def _reset_session():
 
 @pytest.fixture(autouse=True)
 def _own_session():
-    """Each test owns the module-global session; its cache .nxs is dropped after."""
+    """Give each test a fresh module-global session and drop its cache .nxs after."""
     _reset_session()
     yield
     if gui_input._session.get("input_paths") is not None:
@@ -66,7 +65,7 @@ def _discard(path):
 
 
 def _write_edf(path):
-    """8x8 EDF image whose Date pairs it with in-house scan 1."""
+    """Write an 8x8 EDF image whose Date pairs it with in-house scan 1."""
     import fabio
     img = fabio.edfimage.EdfImage(
         data=np.arange(64, dtype=np.float32).reshape(8, 8) + 1.0,
@@ -77,13 +76,13 @@ def _write_edf(path):
 
 @pytest.fixture
 def inhouse_edf_dir(inhouse_dir):
-    """In-house dataset plus an EDF 2D image paired with scan 1 by Date."""
+    """Return the in-house dataset plus an EDF 2D image paired with scan 1 by Date."""
     _write_edf(os.path.join(inhouse_dir, "image_001.edf"))
     return inhouse_dir
 
 
 def _std_echem_file(path, **overrides):
-    """Standard (non-operando) echem file distinct from the operando series."""
+    """Write a standard (non-operando) echem file distinct from the operando series."""
     options = dict(n_rows=10, v0=4.0, dv=0.01, i0=0.5, di=0.0,
                    date="06/02/2024", hour=9)
     options.update(overrides)
@@ -98,7 +97,7 @@ def test_package_exports_core_enums():
 def test_raw_upload_absolute(inhouse_dir):
     """Raw in-house upload yields correlated scan dicts with midpoint matching."""
     progress = []
-    scans, echem_df, method = process_paths(
+    scans, _, method = process_paths(
         [inhouse_dir], progress.append,
         time_method=TimeMethod.ABSOLUTE, data_source=DataSourceType.INHOUSE)
     assert method == "absolute", method
@@ -304,6 +303,21 @@ def test_cache_unsaved_removed_on_exit(inhouse_dir):
     assert not os.path.exists(cache_file)
 
 
+@pytest.mark.display
+def test_closing_main_window_cleans_session_cache(tk_root, inhouse_dir):
+    """The main window's registered close handler deletes the unsaved session cache."""
+    from tkinter import Toplevel
+    process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    cache_file = get_loaded_nxs_path()
+    assert cache_file and os.path.isfile(cache_file)
+    win = Toplevel(tk_root)  # the handler destroys its master; keep the shared root
+    OPERAXN(master=win)
+    win.tk.eval(win.protocol("WM_DELETE_WINDOW"))
+    assert not os.path.exists(cache_file), "exit cleanup must run on window close"
+    assert not win.winfo_exists()
+
+
 def test_cache_exported_file_kept_on_exit(inhouse_dir, tmp_path):
     """An exported session cache .nxs survives cleanup on app exit."""
     process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
@@ -332,7 +346,7 @@ def test_cache_user_nxs_never_deleted(inhouse_dir, tmp_path):
 # ============================================================================
 
 def _write_twod_zip(tmp_path):
-    """A ZIP holding one XRD .dat and one EDF image at the same timestamp."""
+    """Write a ZIP of one XRD .dat and one EDF image at one timestamp and return its path."""
     return _builders.write_twod_zip(str(tmp_path / "cell.zip"), tmp_path)
 
 
@@ -367,8 +381,7 @@ def test_export_copies_zip_images_sidecar(tmp_path):
 
 @needs_fabio
 def test_exported_zip_twod_resolves_after_cache_cleanup(tmp_path):
-    """An exported ZIP experiment shows its 2D via the sibling images dir even
-    after the session cache copy of the images is gone."""
+    """Exported ZIP 2D resolves from the sibling images dir once the cache copy is gone."""
     zpath = _write_twod_zip(tmp_path)
     process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.INHOUSE)
@@ -386,8 +399,7 @@ def test_exported_zip_twod_resolves_after_cache_cleanup(tmp_path):
 
 @needs_fabio
 def test_exported_session_cleanup_drops_cache_sidecar_keeps_nxs(tmp_path):
-    """Exported sessions keep the cache .nxs but not the bulky images sidecar
-    (the export carries its own copy; %TEMP% must not accumulate 2D sets)."""
+    """Exported-session cleanup keeps the cache .nxs but drops the sidecar the export has copied."""
     zpath = _write_twod_zip(tmp_path)
     process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.INHOUSE)
@@ -405,8 +417,7 @@ def test_exported_session_cleanup_drops_cache_sidecar_keeps_nxs(tmp_path):
 
 @needs_fabio
 def test_foreign_images_dir_preserved_and_never_served(tmp_path):
-    """A user's own folder named like the sidecar is never deleted by export
-    and never used for display; the skipped copy is reported as a warning."""
+    """Export spares a user folder named like the sidecar, warns and never serves it as 2D."""
     zpath = _write_twod_zip(tmp_path)
     process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.INHOUSE)
@@ -489,8 +500,7 @@ def test_cache_replaced_by_new_load(inhouse_dir, neutron_dir):
 
 
 def test_standard_echem_stored_and_survives_export(inhouse_dir, tmp_path):
-    """Standard echem is stored in the .nxs, kept out of the GUI's operando data,
-    and carried along by the copy export."""
+    """Standard echem is stored in the .nxs, kept out of operando data and carried by the export."""
     std_echem_path = str(tmp_path / "standard_cycling.txt")
     _std_echem_file(std_echem_path)
 
@@ -514,8 +524,7 @@ def test_standard_echem_stored_and_survives_export(inhouse_dir, tmp_path):
 
 
 def test_standard_echem_append_after_user_nxs(inhouse_dir, tmp_path):
-    """Appending echem to a loaded user .nxs works on a cache copy, leaving the
-    original file untouched."""
+    """Appending echem to a loaded user .nxs edits a cache copy, leaving the original untouched."""
     std_echem_path = str(tmp_path / "standard_cycling.txt")
     _std_echem_file(std_echem_path)
     process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
@@ -560,7 +569,7 @@ def test_upload_dialog_api():
     assert {"paths", "data_source", "time_method", "display_size", "include_2d",
             "title", "sample_name", "sample_description",
             "sample_preparation_date", "cycling_protocol",
-            "standard_echem_files"} \
+            "standard_echem_files", "echem_time_tolerance"} \
         <= set(UploadOptions.__dataclass_fields__.keys())
 
 
@@ -575,6 +584,65 @@ def test_process_paths_threads_protocol_kwargs(inhouse_dir):
     assert meta["cycling_protocol"]["C_rate"] == "C/10", str(meta)
     assert str(meta["sample"]["preparation_date"]).startswith("2024-01-15"), \
         str(meta.get("sample"))
+
+
+def test_process_paths_threads_tolerance(inhouse_dir):
+    """The echem time tolerance reaches metadata and Excel rows; None gives the core default."""
+    process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE, echem_time_tolerance=120)
+    meta = get_experiment_metadata()
+    assert meta.get("echem_time_tolerance") == 120.0, str(meta)
+    rows = experiment_metadata_rows(meta)
+    assert {"field": "echem time tolerance", "value": "120 s"} in rows, rows
+    process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    assert get_experiment_metadata().get("echem_time_tolerance") == \
+        core.ECHEM_TIME_TOLERANCE
+
+
+@pytest.mark.display
+def test_upload_dialog_tolerance_field(tk_root, monkeypatch, inhouse_dir, tmp_path):
+    """The tolerance entry starts at the core default and accepts only finite positive numbers,
+    as a float; a directly opened canonical .nxs greys it out and drops it."""
+    errors = []
+    monkeypatch.setattr("operaxn.dialog.messagebox.showerror",
+                        lambda *args, **kwargs: errors.append(args))
+    nxs = str(tmp_path / "direct.nxs")
+    ok, msgs = core.generate([inhouse_dir], nxs, core.DataSourceType.INHOUSE)
+    assert ok, str(msgs)
+
+    dlg = UploadOptionsDialog(tk_root)
+    try:
+        assert dlg.tolerance_var.get() == f"{core.ECHEM_TIME_TOLERANCE:g}"
+        dlg._paths = [inhouse_dir]
+        dlg._update_option_states()
+        assert str(dlg.tolerance_entry.cget("state")) == "normal"
+        for bad in ("0", "-5", "abc", "", "inf"):
+            dlg.tolerance_var.set(bad)
+            dlg._confirm()
+            assert dlg.result is None, bad
+        assert len(errors) == 5 and all(a[0] == "Echem time tolerance" for a in errors)
+
+        dlg._paths = [nxs]
+        dlg._update_option_states()
+        assert str(dlg.tolerance_entry.cget("state")) == "disabled"
+        dlg.tolerance_var.set("abc")
+        dlg._confirm()
+        assert dlg.result is not None and dlg.result.echem_time_tolerance is None
+        assert len(errors) == 5, "direct .nxs must not validate the greyed field"
+    finally:
+        if dlg.winfo_exists():
+            dlg.destroy()
+
+    dlg = UploadOptionsDialog(tk_root)
+    try:
+        dlg._paths = [inhouse_dir]
+        dlg.tolerance_var.set(" 120.5 ")
+        dlg._confirm()
+        assert dlg.result is not None and dlg.result.echem_time_tolerance == 120.5
+    finally:
+        if dlg.winfo_exists():
+            dlg.destroy()
 
 
 def test_display_size_caps_stored_synchrotron_images(tmp_path):
@@ -599,9 +667,8 @@ def test_display_size_caps_stored_synchrotron_images(tmp_path):
 
 
 def test_experiment_metadata_rows_bank_geometry(polaris_src):
-    """The Excel Experiment sheet lists the profile geometry: the flight
-    path and one row per detector bank; a scalar detector field (the
-    laboratory EDF distance) yields no bank rows."""
+    """Experiment rows list the flight path, each detector bank and each monitor element.
+    A scalar detector field (lab EDF distance) or ragged monitor table yields no element rows."""
     assert experiment_metadata_rows({}) == []
     lab = {"instrument": {"name": "lab", "detector": {"distance": 0.1}}}
     assert [r["field"] for r in experiment_metadata_rows(lab)] == ["instrument"]
@@ -641,8 +708,7 @@ def test_experiment_metadata_rows_bank_geometry(polaris_src):
 
 
 def test_cli_profile_option(tmp_path, capsys):
-    """operaxn --profile prints the INSTRUMENT_PROFILES block derived from a
-    Mantid-processed file and exits 1 for an unreadable one."""
+    """operaxn --profile prints a Mantid file's INSTRUMENT_PROFILES block, exits 1 if unreadable."""
     path = str(tmp_path / "TESTINST1-2.nxs")
     _builders.write_mantid_processed_file(path)
     assert cli_main(["--profile", path]) == 0
@@ -651,3 +717,79 @@ def test_cli_profile_option(tmp_path, capsys):
     assert '"monitor_mode": None' in out and '"monitors": {' in out
     assert cli_main(["--profile", str(tmp_path / "missing.nxs")]) == 1
     assert "error:" in capsys.readouterr().err
+
+def test_neutron_statistics_sheet_reads_echem_columns():
+    """Neutron Statistics rows carry the correlated voltage and current (mA); uncorrelated say No."""
+    def scan(num, volts, amps):
+        return {"scan_num": num, "timestamp": "2026-06-01 10:00:00", "echem": volts,
+                "current": amps, "echem_timestamp": "", "exposure_time": 120.0,
+                "neutron_start": "2026-06-01 10:00:00", "neutron_end": "2026-06-01 10:02:00",
+                "neutron_files": {"1": {"tof": f"/data/run{num}_b1_tof.dat"}}, "neutron_meta": None}
+    fake = SimpleNamespace(state=SimpleNamespace(
+        scans=[scan(1, 3.71, 0.25), scan(2, None, None)],
+        data_source=core.DataSourceType.NEUTRON, time_method="absolute"))
+    summary = pd.DataFrame([OPERAXN._create_scan_summary(fake, s) for s in fake.state.scans])
+    rows = [OPERAXN._calculate_neutron_statistics(fake, r) for _, r in summary.iterrows()]
+    assert rows[0]["Voltage (V)"] == 3.71 and rows[0]["Current (mA)"] == 0.25
+    assert rows[0]["Has Echem"] == "Yes" and rows[0]["Scan Duration"] == "120.0 s"
+    assert rows[1]["Voltage (V)"] == "" and rows[1]["Current (mA)"] == ""
+    assert rows[1]["Has Echem"] == "No"
+    assert "Current (A)" not in rows[0], "values are mA"
+
+def test_config_summary_logs_after_setup(caplog):
+    """The debug configuration summary logs its lines when called after logging setup."""
+    from operaxn.config import log_config_summary
+    with caplog.at_level(logging.DEBUG, logger="operaxn.config"):
+        log_config_summary()
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "OperaXN Configuration" in text and "Max Workers:" in text
+
+
+def test_splash_fill_stops_at_track_end():
+    """The splash progress fill is drawn no further than 100 % of its track."""
+    from operaxn.main import EnhancedSplashScreen
+
+    class Var:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    drawn = []
+
+    class Canvas:
+        def coords(self, item, *xy):
+            if xy:
+                drawn.append(xy)
+            return [50, 10, 60, 20]
+
+        def itemconfig(self, *_args, **_kwargs):
+            pass
+
+    fake = SimpleNamespace(
+        animation_running=True, splash=SimpleNamespace(winfo_exists=lambda: True),
+        progress_var=Var(99), canvas=Canvas(), _schedule_animation=lambda *_args: None,
+        _animate_progress=None,  # rescheduling target; the stub never calls it
+        ui_elements={"bar_width": 300, "bar_center_x": 200,
+                     "progress_rect": 1, "progress_glow": 2})
+    EnhancedSplashScreen._animate_progress(fake)
+    assert fake.progress_var.get() == 100
+    assert drawn[0][2] == 350, "the fill must end at the track's right edge (50 + 300)"
+
+
+@pytest.mark.display
+def test_plot_settings_apply_redraws_once(tk_root):
+    """Applying plot settings redraws through the update callback exactly once."""
+    from operaxn.dialog import PlotSettingsDialog
+    from operaxn.gui import VisualiserConfig
+    calls = []
+    dlg = PlotSettingsDialog(tk_root, VisualiserConfig(), lambda: calls.append(1))
+    try:
+        dlg._apply_settings()
+    finally:
+        dlg.destroy()
+    assert calls == [1]

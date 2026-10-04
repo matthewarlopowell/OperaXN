@@ -1,66 +1,10 @@
 """
-NeXus/HDF5 file writer for the core pipeline — schema 4.0, definition 1.0.0.
+NeXus/HDF5 file writer for the core pipeline: schema 4.0, definition 1.0.0.
 
-Layout conforms to the custom application definitions shipped in
-definitions/ (NXoperando_monopd / NXoperando_tofnpd; validated against
-the NXDL schema by tests/test_nxdl.py). Every group is created with HDF5
-link creation-order tracking and its members are written in the order
-below: the ratified NXmonopd / NXtofnpd sequence first, each OperaXN
-addition directly after the item it extends. Validators ignore member
-order; this is for people and viewers reading the file.
-
-/entry (NXentry)                      one entry for the whole experiment
-    title, start_time, end_time       ISO 8601
-    definition = NXoperando_monopd | NXoperando_tofnpd
-    experiment_identifier             when harvestable
-    process (NXprocess)               generator + correlation provenance
-    pre_sample_flightpath (m)         tofnpd only, from the instrument profile
-    user (NXuser)                     when harvestable (logbook / beamline file)
-    instrument (NXinstrument)         harvested + instrument profile; static
-        name, source (NXsource: type/name/probe), crystal (NXcrystal),
-        detector (NXdetector)
-            detector_number/distance/polar_angle/azimuthal_angle [nBank]
-                                      tofnpd bank geometry from the profile
-        edf_metadata / synchrotron_metadata (full raw harvests, NXcollection)
-    sample (NXsample)                 name + optional cell description,
-                                      preparation_date (ISO 8601)
-    cycling_protocol (NXnote)         technique (+ voltage window, C_rate,
-                                      instrument, software, raw_data_file);
-                                      user-supplied, omitted without technique
-    monitor (NXmonitor)               tofnpd: mode (timer|monitor) + every
-                                      monitor element's detector_number/
-                                      distance/polar_angle/azimuthal_angle
-                                      from the instrument profile; in-house
-                                      monopd: mode timer + the preset every
-                                      acquisition shares
-    operando_electrochemistry (NXdata)      time (s, @start ISO)/voltage/current
-    standard_electrochemistry (NXenvironment)  file_NNN NXdata children
-    scan_000001..scan_N (NXsubentry)  per acquisition, numeric order: only
-                                      what varies per acquisition
-        instrument                    soft link to /entry/instrument
-        environment (NXenvironment)   start_time/end_time (the acquisition
-                                      window), voltage/current (+units),
-                                      window min/max, scan_timestamp,
-                                      midpoint_adjusted_timestamp,
-                                      voltage_timestamp, exposure_time,
-                                      logbook_entry (neutron)
-        monitor (NXmonitor)           in-house acquisitions whose EDF header
-                                      carries a positive Monitor counter:
-                                      integral
-        data (NXdata)                 XRD: polar_angle/data/data_errors
-        image_source (NXnote)         2D image reference (+image_data NXdata
-                                      when embedding was chosen)
-        bank_N / bank_N_d (NXdata)    neutron: one group per bank and axis
-                                      family; data/data_errors then the TOF or
-                                      d-spacing axis
-
-Known, deliberate deviations from NXmonopd/NXtofnpd (documented in the
-definitions): processed intensities are NX_NUMBER, not NX_INT raw counts;
-neutron banks keep their own native axes — nothing is discarded.
-
-All timestamps are timezone-aware ISO 8601 (local wall time + machine
-offset), written via _iso(); string fallbacks preserve unparseable
-values verbatim.
+Writes the NXoperando_monopd / NXoperando_tofnpd layout of definitions/ (one /entry, one
+scan_NNNNNN NXsubentry per acquisition); definitions/README.md documents the member order
+and the deliberate NXmonopd / NXtofnpd deviations. Groups list members in creation order.
+Timestamps are offset-aware ISO 8601 (_iso); string fallbacks keep unparseable ones verbatim.
 """
 
 import logging
@@ -72,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from .config import (DEFAULT_PROFILES, DEFINITION_URL_BASE, DEFINITION_VERSION,
+                     ECHEM_TIME_TOLERANCE,
                      GENERATOR_NAME, GENERATOR_VERSION, INSTRUMENT_PROFILES)
 from .classify import extract_edf_scan_fields, parse_mantid_header
 from .correlate import EchemParser
@@ -112,7 +57,7 @@ SYNCHROTRON_FIELD_PATHS = {
 # ============================================================================
 
 def extract_edf_global_metadata(edf_path: str) -> Dict[str, Any]:
-    """Extract non-excluded header fields from the first EDF file."""
+    """Return the non-excluded, non-blank header fields of an EDF file ({} on failure)."""
     if not FABIO_AVAILABLE:
         return {}
     try:
@@ -132,7 +77,7 @@ def extract_edf_global_metadata(edf_path: str) -> Dict[str, Any]:
 
 
 def extract_nxs_global_metadata(nxs_path: str) -> Dict[str, Any]:
-    """Flatten all small datasets and attributes from a synchrotron .nxs file."""
+    """Flatten the small non-data datasets and attributes of a synchrotron .nxs file."""
     try:
         metadata: Dict[str, Any] = {}
 
@@ -141,11 +86,9 @@ def extract_nxs_global_metadata(nxs_path: str) -> Dict[str, Any]:
                 leaf = name.split('/')[-1]
                 if leaf in NXS_EXCLUDE_FIELDS:
                     return
-                if isinstance(obj, h5py.Dataset):
-                    if obj.size > 1000:
-                        return
-                    if 'data' in name.lower():
-                        return
+                if isinstance(obj, h5py.Dataset) and (
+                        obj.size > 1000 or 'data' in name.lower()):
+                    return
 
                 flat_name = name.replace('/', '_')
 
@@ -178,8 +121,7 @@ def extract_nxs_global_metadata(nxs_path: str) -> Dict[str, Any]:
 
 
 def extract_synchrotron_fields(nxs_path: str) -> Dict[str, Any]:
-    """Targeted pull of NXinstrument/NXsample/NXuser slot values from a source
-    synchrotron .nxs (e.g. Diamond i11-1)."""
+    """Pull SYNCHROTRON_FIELD_PATHS values from a source synchrotron .nxs (e.g. Diamond i11-1)."""
     fields: Dict[str, Any] = {}
     try:
         with h5py.File(nxs_path, 'r') as f:
@@ -198,7 +140,7 @@ def extract_synchrotron_fields(nxs_path: str) -> Dict[str, Any]:
 
 
 def _decode_h5_value(value: Any) -> Any:
-    """Decode HDF5 bytes/numpy scalars to native Python types; None if too large."""
+    """Decode HDF5 bytes/numpy values to native Python types; None above 10 elements."""
     if isinstance(value, bytes):
         return value.decode('utf-8', errors='ignore')
     elif isinstance(value, np.ndarray):
@@ -260,8 +202,8 @@ Geometry = Tuple[List[int], List[Tuple[str, np.ndarray, str]]]
 
 # entry/cycling_protocol (NXnote) fields, in file order:
 # (kwarg key, dataset name, caster, units). `technique` is required within
-# the group — the writer omits the whole group when it is empty. The GUI's
-# experiment sheet iterates the dataset names.
+# the group, so the writer omits the whole group when it is blank. The GUI's
+# experiment sheet (operaxn.input) lists the same dataset names.
 CYCLING_PROTOCOL_FIELDS = (
     ('technique', 'technique', str, None),
     ('voltage_window_lower', 'voltage_window_lower', float, 'V'),
@@ -279,10 +221,8 @@ def _is_blank(value: Any) -> bool:
 
 
 def _ts_sort_key(value: Any) -> Tuple[int, Any]:
-    """Sort key for a timestamp that may be a string or a Timestamp.
-
-    Offsets are dropped so naive and tz-aware values stay comparable;
-    unparseable values sort last so they never displace a real bound."""
+    """Return a sort key for a str or Timestamp value; unparseable values sort last.
+    Offsets are dropped so naive and tz-aware values stay comparable."""
     try:
         ts = pd.to_datetime(value)
     except (ValueError, TypeError):
@@ -293,12 +233,8 @@ def _ts_sort_key(value: Any) -> Tuple[int, Any]:
 
 
 def _scan_window(scan: Scan) -> Tuple[Any, Any]:
-    """(start, end) of one acquisition, exactly as its NXsubentry records them.
-
-    start is the acquisition start -- for neutron the logbook start, never the
-    correlation midpoint; end is the logbook end, or start + exposure for XRD.
-    Either may be None when the source timestamps are missing. Shared by the
-    subentry writer and the entry-level window so the two cannot diverge."""
+    """Return one acquisition's (start, end), either may be None; also feeds the entry window.
+    Neutron: the logbook window, never the correlation midpoint; XRD ends at start + exposure."""
     start = scan.neutron_start or scan.original_timestamp or scan.timestamp
     end = scan.neutron_end
     if end is None and start and scan.exposure_time:
@@ -310,8 +246,7 @@ def _scan_window(scan: Scan) -> Tuple[Any, Any]:
 
 
 def _echem_source_names(echem_df: Any) -> Optional[str]:
-    """Semicolon-joined basenames of the parsed electrochemistry files, or
-    None when the frame carries no source column."""
+    """Return the semicolon-joined basenames of the frame's echem source files, or None."""
     if echem_df is None or getattr(echem_df, 'empty', True):
         return None
     if 'source_file' not in getattr(echem_df, 'columns', ()):
@@ -322,7 +257,7 @@ def _echem_source_names(echem_df: Any) -> Optional[str]:
 
 
 def _iso(value: Any) -> Optional[str]:
-    """Timezone-aware ISO 8601 for a timestamp-like value; None if unparseable.
+    """Return timezone-aware ISO 8601 for a timestamp-like value; None if unparseable.
     Naive input is local wall time and gets the machine's DST-aware offset."""
     if value is None:
         return None
@@ -336,22 +271,21 @@ def _iso(value: Any) -> Optional[str]:
 
 
 def _nx_group(parent: h5py.Group, name: str, nx_class: str) -> h5py.Group:
-    """Create an NX_class-tagged group that records member creation order,
-    so the file lists in definition order rather than alphabetically."""
+    """Create an NX_class-tagged group that lists its members in creation order."""
     group = parent.create_group(name, track_order=True)
     group.attrs['NX_class'] = nx_class
     return group
 
 
 def _bank_sort_key(item: Tuple[Any, Any]) -> Tuple[int, Any]:
-    """Numeric bank keys first, in numeric order; other keys after, as text."""
+    """Return a sort key putting numeric bank keys first, in numeric order, then text keys."""
     key = str(item[0])
     return (0, int(key)) if key.isdigit() else (1, key)
 
 
 def write_echem_series(group: h5py.Group, echem_df: pd.DataFrame) -> None:
-    """Write an EchemParser DataFrame into an NXdata group: float seconds +
-    time/@start origin (NXlog convention); an all-NaN current is omitted."""
+    """Write an EchemParser DataFrame into an NXdata group as time, voltage and current.
+    Time is float seconds from time/@start (NXlog convention); an all-NaN current is omitted."""
     timestamps = pd.to_datetime(echem_df['timestamp'])
     start = timestamps.min()
     time_ds = group.create_dataset(
@@ -376,9 +310,8 @@ def write_echem_series(group: h5py.Group, echem_df: pd.DataFrame) -> None:
 
 def write_standard_echem_group(parent: h5py.Group,
                                datasets: List[Dict[str, Any]]) -> h5py.Group:
-    """(Re)write entry/standard_electrochemistry from parsed echem datasets
-    ('source_file' + 'data' items). Single source of truth for the layout:
-    used by NXSWriter and the GUI's add-echem-after-load path."""
+    """(Re)write entry/standard_electrochemistry from parsed {'source_file', 'data'} items.
+    The one layout shared by NXSWriter and the GUI's add-echem-after-load path."""
     if 'standard_electrochemistry' in parent:
         del parent['standard_electrochemistry']
     container = _nx_group(parent, 'standard_electrochemistry', 'NXenvironment')
@@ -399,9 +332,8 @@ def write_standard_echem_group(parent: h5py.Group,
 
 def get_profile(data_source: DataSourceType,
                 instrument_name: Optional[str] = None) -> Dict[str, Any]:
-    """Instrument profile (config.INSTRUMENT_PROFILES) for a harvested
-    instrument name, falling back to the data-source default; a copy safe
-    to update with harvested values, which always win."""
+    """Return a copy of the data-source default profile overlaid with the named instrument's.
+    An unknown name is kept as instrument_name; callers merge harvested values on top."""
     profile = dict(DEFAULT_PROFILES.get(data_source.value, {}))
     if instrument_name:
         named = INSTRUMENT_PROFILES.get(str(instrument_name).strip().lower())
@@ -413,7 +345,7 @@ def get_profile(data_source: DataSourceType,
 
 
 class NXSWriter:
-    """Writes the canonical schema-4.0 NeXus/HDF5 file."""
+    """Canonical schema-4.0 NeXus/HDF5 file writer."""
 
     def __init__(self, data_source: DataSourceType = DataSourceType.INHOUSE,
                  include_2d_images: bool = False,
@@ -423,7 +355,8 @@ class NXSWriter:
                  sample_name: Optional[str] = None,
                  sample_description: Optional[str] = None,
                  sample_preparation_date: Optional[str] = None,
-                 cycling_protocol: Optional[Dict[str, Any]] = None):
+                 cycling_protocol: Optional[Dict[str, Any]] = None,
+                 echem_time_tolerance: float = ECHEM_TIME_TOLERANCE):
         self.data_source = data_source
         self.include_2d_images = include_2d_images
         self.max_display_size = max_display_size  # 0 = full resolution
@@ -432,9 +365,11 @@ class NXSWriter:
         self.sample_name = sample_name
         self.sample_description = sample_description
         self.sample_preparation_date = sample_preparation_date
-        # Keys per CYCLING_PROTOCOL_FIELDS (technique, voltage_window_lower/
-        # upper, c_rate, instrument, software, raw_data_file)
+        # Keys per CYCLING_PROTOCOL_FIELDS
         self.cycling_protocol = cycling_protocol
+        # Seconds; the bound the scans were matched with, recorded alongside
+        # the record it applies to
+        self.echem_time_tolerance = echem_time_tolerance
         self.echem_parser = EchemParser()
 
     # --- top level ---
@@ -447,7 +382,7 @@ class NXSWriter:
 
         # track_order: members list in the order written here (the NXmonopd /
         # NXtofnpd sequence, additions after the item they extend) instead
-        # of HDF5's default alphabetical index; see the module docstring
+        # of HDF5's default alphabetical index; see definitions/README.md
         with h5py.File(output_path, 'w', track_order=True) as f:
             f.attrs['NX_class'] = 'NXroot'
             f.attrs['file_name'] = os.path.basename(output_path)
@@ -472,8 +407,7 @@ class NXSWriter:
         logger.info(f"NeXus file written to {output_path}")
 
     def _harvest_experiment_metadata(self, scans: List[Scan]) -> Dict[str, Any]:
-        """Collect experiment-level metadata from the first scan's source files
-        and merge with the instrument profile (harvested values win)."""
+        """Harvest metadata from the first scan's files, merged over the instrument profile."""
         harvested: Dict[str, Any] = {}
 
         first = scans[0] if scans else None
@@ -509,11 +443,10 @@ class NXSWriter:
 
         profile = get_profile(self.data_source, harvested.get('instrument_name'))
         # harvested values win over profile defaults
-        merged = {**profile, **{k: v for k, v in harvested.items() if v is not None}}
-        return merged
+        return {**profile, **{k: v for k, v in harvested.items() if v is not None}}
 
     def _write_process(self, entry: h5py.Group, scans: List[Scan]) -> None:
-        """NXprocess with generator and correlation provenance."""
+        """Write the NXprocess with generator and correlation provenance."""
         process = _nx_group(entry, 'process', 'NXprocess')
         process.create_dataset('program', data=GENERATOR_NAME)
         process.create_dataset('version', data=GENERATOR_VERSION)
@@ -524,8 +457,7 @@ class NXSWriter:
 
     def _write_entry_fields(self, entry: h5py.Group, scans: List[Scan],
                             harvest: Dict[str, Any]) -> None:
-        """Entry scalars in NXmonopd / NXtofnpd order: title, time window,
-        definition, then the identifier."""
+        """Write title, time window, definition and identifier in NXmonopd / NXtofnpd order."""
         title = (self.title or harvest.get('run_title') or harvest.get('title')
                  or 'operando diffraction experiment')
         entry.create_dataset('title', data=str(title))
@@ -553,8 +485,7 @@ class NXSWriter:
             entry.create_dataset('experiment_identifier', data=str(identifier))
 
     def _write_flightpath(self, entry: h5py.Group, harvest: Dict[str, Any]) -> None:
-        """NXtofnpd moderator-to-sample flight path; the profile placeholder
-        None is skipped so nothing is fabricated."""
+        """Write the NXtofnpd moderator-to-sample flight path, skipping a None placeholder."""
         flightpath = harvest.get('pre_sample_flightpath_m')
         if self.data_source != DataSourceType.NEUTRON or flightpath is None:
             return
@@ -567,7 +498,7 @@ class NXSWriter:
 
     def _write_instrument(self, entry: h5py.Group, scans: List[Scan],
                           harvest: Dict[str, Any]) -> None:
-        """NXinstrument: source, crystal, detector, and raw-harvest collections."""
+        """Write the NXinstrument: source, crystal, detector and the raw-harvest collections."""
         inst = _nx_group(entry, 'instrument', 'NXinstrument')
         # NeXus linking convention: the linked-to object names its own path
         # so consumers can tell the original from the per-scan soft links
@@ -596,10 +527,8 @@ class NXSWriter:
             ds = crystal.create_dataset('wavelength', data=float(wavelength))
             ds.attrs['units'] = 'angstrom'
 
-        # Detector fields and profile geometry are gathered first and the
-        # group is created only when there is something to write, so a
-        # source with no detector metadata and no profile geometry leaves
-        # no empty group
+        # Detector fields and profile geometry are gathered first so the
+        # group is created only when it has content (no empty NXdetector)
         detector_fields = {
             # EDF detector model (laboratory) or the profile's description
             'description': harvest.get('detector_model') or harvest.get('detector_description'),
@@ -650,7 +579,7 @@ class NXSWriter:
                         logger.debug(f"Could not write harvested field '{k}': {e}")
 
     def _write_sample(self, entry: h5py.Group, harvest: Dict[str, Any]) -> None:
-        """NXsample; the dialog's sample field overrides harvested names."""
+        """Write the NXsample; the dialog's sample name overrides harvested ones."""
         sample = _nx_group(entry, 'sample', 'NXsample')
         # Harvested values (e.g. the EDF Comment header) are stored verbatim,
         # even when the instrument leaves a trailing template separator
@@ -676,12 +605,8 @@ class NXSWriter:
     @staticmethod
     def _geometry_arrays(table: Optional[Dict[Any, Dict[str, Any]]],
                          what: str = 'detector') -> Optional[Geometry]:
-        """NXtofnpd geometry arrays from a profile table keyed by element
-        number, for the per-bank detector [nBank] and the monitor elements
-        [nMon]: (element numbers, [(name, data, units), ...]) in NXtofnpd
-        order (distance, polar_angle, azimuthal_angle), or None when there
-        is nothing to write. All-or-skip per key: an array is included only
-        when every element supplies that key."""
+        """Return NXtofnpd Geometry from a profile table keyed by element number, or None.
+        For banks [nBank] or monitors [nMon]; an array needs its key on every element."""
         if not table:
             return None
         try:
@@ -710,8 +635,7 @@ class NXSWriter:
 
     @staticmethod
     def _write_geometry(group: h5py.Group, geometry: Geometry) -> None:
-        """Write prepared geometry arrays into group: detector_number leads
-        (NXtofnpd order), then each array with its units."""
+        """Write detector_number, then each geometry array with its units (NXtofnpd order)."""
         numbers, arrays = geometry
         group.create_dataset('detector_number',
                              data=np.asarray(numbers, dtype=np.int64))
@@ -721,15 +645,9 @@ class NXSWriter:
 
     def _write_cycling_protocol(self, entry: h5py.Group,
                                 echem_df: pd.DataFrame = None) -> None:
-        """entry/cycling_protocol NXnote from the user-supplied dict; the
-        whole group is omitted (with a warning) when technique is empty, as a
-        present group without technique is invalid under the definitions.
-
-        raw_data_file defaults to the electrochemistry files actually
-        ingested, so the provenance link is recorded without being typed."""
+        """Write the cycling_protocol NXnote; raw_data_file defaults to the ingested echem files.
+        Nothing is written without a technique (a warning if other fields were given)."""
         protocol = dict(self.cycling_protocol or {})
-        if not protocol:
-            return
         present = {k: v for k, v in protocol.items() if not _is_blank(v)}
         if not present:
             return
@@ -759,11 +677,8 @@ class NXSWriter:
 
     def _write_monitor(self, entry: h5py.Group, scans: List[Scan],
                        harvest: Dict[str, Any]) -> None:
-        """Entry-level beam monitor record. tofnpd: the counting mode and the
-        geometry of every monitor element from the profile (none for an
-        unprofiled instrument). In-house monopd: acquisitions count to a time
-        preset, so mode is timer plus the preset when every acquisition
-        shares one exposure. Synchrotron sources record none."""
+        """Write the entry NXmonitor: tofnpd mode and monitor geometry from the profile.
+        In-house: mode timer, plus the preset when all exposures match; synchrotron: none."""
         if self.data_source == DataSourceType.NEUTRON:
             mode = harvest.get('monitor_mode')
             if _is_blank(mode):
@@ -790,7 +705,7 @@ class NXSWriter:
 
     @staticmethod
     def _write_user(entry: h5py.Group, harvest: Dict[str, Any]) -> None:
-        """NXuser, only when a name was harvestable."""
+        """Write the NXuser, only when a name was harvested."""
         user_name = harvest.get('users') or harvest.get('user')
         if user_name:
             user = _nx_group(entry, 'user', 'NXuser')
@@ -799,10 +714,7 @@ class NXSWriter:
     # --- per-scan subentries ---
 
     def _write_scan(self, entry: h5py.Group, scan: Scan) -> None:
-        """One scan_N NXsubentry: a soft link to the shared instrument, then
-        what varies per acquisition: its environment (time window + cell
-        state), the EDF beam-monitor record when the header carries one,
-        and its diffraction data."""
+        """Write one scan NXsubentry: instrument link, environment, EDF monitor, then data."""
         sub = _nx_group(entry, f'scan_{scan.scan_num:06d}', 'NXsubentry')
         sub.attrs['scan_number'] = scan.scan_num
 
@@ -820,8 +732,7 @@ class NXSWriter:
 
     @staticmethod
     def _write_environment(sub: h5py.Group, scan: Scan) -> None:
-        """Acquisition window plus the electrochemical state of the cell
-        during it (the operando extension)."""
+        """Write the acquisition window and the cell's electrochemical state during it."""
         env = _nx_group(sub, 'environment', 'NXenvironment')
 
         def scalar(name: str, value: Optional[float], units: str) -> None:
@@ -861,10 +772,8 @@ class NXSWriter:
             env.create_dataset('logbook_entry', data=str(scan.logbook['full_line']))
 
     def _write_scan_monitor(self, sub: h5py.Group, scan: Scan) -> None:
-        """Beam-monitor counts of one in-house acquisition, from the Monitor
-        counter of its EDF header. No group when the header has none or it
-        read zero (an instrument without a beam monitor); the counting mode
-        and preset are held once at entry level."""
+        """Write one in-house acquisition's monitor integral from its EDF Monitor counter.
+        No group for a missing or non-positive count; mode and preset live at entry level."""
         if not (scan.twod and str(scan.twod).lower().endswith('.edf')):
             return
         integral = extract_edf_scan_fields(str(scan.twod)).get('monitor', {}).get('Monitor')
@@ -875,11 +784,10 @@ class NXSWriter:
         integral_ds.attrs['units'] = 'counts'
 
     def _write_xrd_data(self, sub: h5py.Group, scan: Scan) -> None:
-        """NXdata with the 1D pattern (plus data_errors); 2D image at subentry level."""
+        """Write the 1D pattern NXdata (plus data_errors), then the 2D image records."""
         if scan.oned:
             # Read before creating the group: a read failure must not leave
             # an empty NXdata shell behind
-            arr = None
             try:
                 arr = np.asarray(DataReaderFactory.read_file(scan.oned))
                 if arr.ndim != 2 or arr.shape[1] < 2:
@@ -902,8 +810,7 @@ class NXSWriter:
             self._write_2d_data(sub, scan)
 
     def _write_2d_data(self, sub: h5py.Group, scan: Scan) -> None:
-        """image_source NXnote referencing the 2D detector image, plus an
-        image_data NXdata copy when embedding was chosen."""
+        """Write the 2D image's image_source NXnote, plus the image_data copy when embedding."""
         twod_path = str(scan.twod)
         basename = os.path.basename(twod_path)
         ext = os.path.splitext(basename)[1].lower()
@@ -948,8 +855,7 @@ class NXSWriter:
                                 data=np.asarray(original_shape, dtype=np.int64))
 
     def _write_neutron_banks(self, sub: h5py.Group, scan: Scan) -> None:
-        """One NXdata per bank and axis family: bank_N (native TOF) plus
-        bank_N_d (d-spacing) — keep-all-data, one axis family per group."""
+        """Write one NXdata per bank and axis: bank_N (native TOF) and bank_N_d (d-spacing)."""
         # Banks in numeric order, TOF before d-spacing for each; fields in
         # NXtofnpd's NXdata order (data before the axis), data_errors after data
         for meas_num, meas_files in sorted(scan.neutron_files.items(),
@@ -1000,22 +906,22 @@ class NXSWriter:
 
     # --- electrochemistry layers ---
 
-    @staticmethod
-    def _write_operando_echem(entry: h5py.Group, echem_df: pd.DataFrame) -> None:
-        """Full cycling protocol: time (s, @start ISO) / voltage / current."""
+    def _write_operando_echem(self, entry: h5py.Group, echem_df: pd.DataFrame) -> None:
+        """Write the cycling record (time/voltage/current) and the correlation tolerance used."""
         if echem_df is None or echem_df.empty:
             return
 
         echem_group = _nx_group(entry, 'operando_electrochemistry', 'NXdata')
         write_echem_series(echem_group, echem_df)
+        tolerance = echem_group.create_dataset(
+            'echem_time_tolerance', data=float(self.echem_time_tolerance))
+        tolerance.attrs['units'] = 's'
         entry.attrs['default'] = 'operando_electrochemistry'
 
     def _write_standard_echem(self, entry: h5py.Group,
                               standard_echem_files: Optional[List[Union[str, Tuple[str, str]]]]
                               ) -> None:
-        """standard_electrochemistry NXenvironment: one file_NNN NXdata per
-        parseable additional echem file; items are paths or
-        (parse_path, display_path) pairs."""
+        """Write standard_electrochemistry from the parseable extra echem files."""
         if not standard_echem_files:
             return
 

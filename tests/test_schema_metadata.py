@@ -1,6 +1,7 @@
-"""Schema v4 provenance: reader round-trips, overrides, v3 back-compat, validation."""
+"""Schema v4 metadata: reader round-trips, overrides, profiles, v3 back-compat and validation."""
 import ast
 import os
+import re
 
 import h5py
 import numpy as np
@@ -13,8 +14,7 @@ from _helpers import s, wall, tz_aware, assert_pynxtools_valid
 
 
 def test_monopd_reader_roundtrip(inhouse_nxs):
-    """A generated file loads back with the same shapes and the v4
-    fields (window, extrema, echem_df, metadata) populated."""
+    """A generated file loads back with its scans, window, extrema, echem_df and metadata."""
     m = core.load(inhouse_nxs)
     m1 = m.scans[0]
     assert len(m.scans) == 2
@@ -32,6 +32,7 @@ def test_monopd_reader_roundtrip(inhouse_nxs):
     assert m.global_metadata.get("generator_version") == core.config.GENERATOR_VERSION
     assert m.global_metadata.get("total_scans") == 2
     assert m.global_metadata.get("correlation_method") == "absolute"
+    assert m.global_metadata.get("echem_time_tolerance") == core.ECHEM_TIME_TOLERANCE
     assert m.data_source == "inhouse"
 
 
@@ -48,6 +49,7 @@ def test_tofnpd_reader_roundtrip(neutron_nxs):
     assert n1.neutron_end == "2024-02-05 10:30:00"
     assert n1.echem == 3.85
     assert n1.voltage_min == 3.70 and n1.voltage_max == 4.00
+    assert nm.global_metadata.get("echem_time_tolerance") == core.ECHEM_TIME_TOLERANCE
 
 
 def test_v3_backcompat(legacy_v3_nxs):
@@ -67,11 +69,13 @@ def test_v3_backcompat(legacy_v3_nxs):
     assert lm.echem_df is not None and len(lm.echem_df) == 10
     assert str(lm.echem_df["timestamp"].iloc[1]) == "2024-02-05 10:01:00"
     assert lm.global_metadata.get("generator_version") == "2.0.0"
+    assert "echem_time_tolerance" not in lm.global_metadata, \
+        "files written before the tolerance was recorded carry no key"
     assert lm.data_source == "inhouse"
 
 
 def test_overrides(override_nxs):
-    """Title, sample name, and sample description overrides land in the file."""
+    """Title, sample name and sample description overrides land in the file."""
     with h5py.File(override_nxs) as f:
         assert s(f["entry/title"]) == "My Operando Study"
         assert s(f["entry/sample/name"]) == "NMC811 pouch"
@@ -79,8 +83,7 @@ def test_overrides(override_nxs):
 
 
 def test_cycling_protocol_written(protocol_nxs):
-    """The cycling protocol lands as an NXnote with all seven datasets and
-    voltage units."""
+    """The cycling protocol lands as an NXnote with all seven datasets and voltage units."""
     with h5py.File(protocol_nxs) as f:
         cp = f["entry/cycling_protocol"]
         assert cp.attrs.get("NX_class") == "NXnote"
@@ -110,9 +113,7 @@ def test_raw_data_file_uses_original_xlsx_name(tmp_path):
     """xlsx echem provenance records the user's filename, not the temp copy."""
     src = tmp_path / "xlsx_src"
     src.mkdir()
-    for i, ts in enumerate(_builders.SCAN_TIMES, start=1):
-        _builders.write_xrd_dat(str(src / f"scan_{i:03d}.dat"), ts,
-                                y=_builders.inhouse_scan_y(i))
+    _builders.write_inhouse_scans(str(src))
     _builders.write_arbin_xlsx(str(src / "cellA.xlsx"))
     out = str(tmp_path / "xlsx_raw.nxs")
     ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE,
@@ -178,9 +179,7 @@ def test_cycling_protocol_dropped_without_technique(tmp_path, inhouse_src):
 
 
 def test_tofnpd_geometry_placeholders_skipped(tmp_path, polaris_src, monkeypatch):
-    """None geometry placeholders in a profile write nothing, not even an
-    empty detector or monitor group (the shipped POLARIS values are patched
-    back to placeholders for the check)."""
+    """None geometry placeholders write no flight path and no empty detector or monitor group."""
     profile = core.config.INSTRUMENT_PROFILES["polaris"]
     monkeypatch.setitem(profile, "pre_sample_flightpath_m", None)
     monkeypatch.setitem(profile, "detector_banks", {
@@ -202,8 +201,7 @@ def test_tofnpd_geometry_placeholders_skipped(tmp_path, polaris_src, monkeypatch
 
 
 def test_polaris_profile_geometry_written(tmp_path, polaris_src):
-    """The shipped POLARIS profile writes the flight path and the per-bank
-    distance/2theta arrays; the ring banks carry no azimuth."""
+    """Shipped POLARIS geometry writes flight path, bank and monitor arrays; no ring azimuth."""
     out = str(tmp_path / "polaris_geometry.nxs")
     ok, msgs = core.generate([polaris_src], out, core.DataSourceType.NEUTRON)
     assert ok, str(msgs)
@@ -247,8 +245,7 @@ def test_polaris_profile_geometry_written(tmp_path, polaris_src):
 
 
 def test_tofnpd_geometry_from_profile(tmp_path, polaris_src, monkeypatch):
-    """Profile geometry values become entry/pre_sample_flightpath and per-bank
-    detector arrays; a bank missing one key drops only that array."""
+    """Profile geometry gives flight path, bank and monitor arrays; a None drops that array."""
     profile = core.config.INSTRUMENT_PROFILES["polaris"]
     monkeypatch.setitem(profile, "pre_sample_flightpath_m", 14.0)
     monkeypatch.setitem(profile, "monitors", {
@@ -336,8 +333,7 @@ def test_pynxtools_validation(request, nxs_fixture):
 
 
 def test_profile_from_mantid_nexus(tmp_path):
-    """L1 from the IDF, per-bank means and ranges from the focussed
-    positions; a ring gets no azimuth, a localised panel does."""
+    """L1 comes from the IDF, bank means and ranges from focussed positions; no ring azimuth."""
     path = str(tmp_path / "TESTINST1-2.nxs")
     _builders.write_mantid_processed_file(path)
     p = core.profile_from_mantid_nexus(path)
@@ -375,8 +371,7 @@ def test_profile_from_mantid_nexus(tmp_path):
 
 
 def test_format_profile_block_is_paste_ready(tmp_path):
-    """The printed block is a valid INSTRUMENT_PROFILES entry with the
-    informational values as comments."""
+    """The printed block is a valid INSTRUMENT_PROFILES entry with info values as comments."""
     path = str(tmp_path / "TESTINST1-2.nxs")
     _builders.write_mantid_processed_file(path)
     block = core.format_profile_block(core.profile_from_mantid_nexus(path))
@@ -403,8 +398,7 @@ def test_profile_from_non_mantid_file(tmp_path):
 
 
 def test_wish_profile_minimal(tmp_path):
-    """WISH ships source and name only: the file names ISIS as the source and
-    carries no detector, flight path or monitor group."""
+    """WISH ships source and name only, so no detector, flight path or monitor group is written."""
     profile = core.get_profile(core.DataSourceType.NEUTRON, "WISH")
     assert profile["source_name"] == "ISIS" and profile["instrument_name"] == "WISH"
     assert not any(k in profile for k in ("pre_sample_flightpath_m", "detector_banks",
@@ -426,8 +420,7 @@ def test_wish_profile_minimal(tmp_path):
 
 
 def test_synchrotron_collection_keeps_count_time(tmp_path):
-    """The synchrotron_metadata collection keeps the detector count_time (a
-    setting) while the per-scan start/end times and scan identifier stay out."""
+    """synchrotron_metadata keeps the count_time setting but not the per-scan start/end times."""
     src = str(tmp_path / "synchrotron")
     os.makedirs(src)
     _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00",
@@ -444,8 +437,7 @@ def test_synchrotron_collection_keeps_count_time(tmp_path):
 
 
 def test_reader_accepts_pre_rename_errors_name(tmp_path, inhouse_src):
-    """Files written before the data_errors name carry NXdata's deprecated
-    `errors`; the reader still returns the uncertainties as the trace's e."""
+    """The reader maps the pre-rename NXdata `errors` field to each trace's e, mono and TOF."""
     nxs = str(tmp_path / "old_name.nxs")
     ok, msgs = core.generate([inhouse_src], nxs, core.DataSourceType.INHOUSE)
     assert ok, msgs
@@ -467,11 +459,7 @@ def test_reader_accepts_pre_rename_errors_name(tmp_path, inhouse_src):
 
 
 def test_is_canonical_requires_operaxn_provenance(tmp_path, inhouse_nxs):
-    """Generic NeXus members do not make a file ours: a raw facility file
-    with /entry/definition and /entry/process is left to generation, while
-    OperaXN provenance in any of its forms (an NXoperando definition,
-    process/program operaxn, the pre-17-Sep program_name, or scan_
-    subentries) is recognised."""
+    """A foreign file with definition and process is not ours; each OperaXN provenance form is."""
     def nxs_with(name, build):
         path = str(tmp_path / f"{name}.nxs")
         with h5py.File(path, "w") as f:
@@ -505,3 +493,16 @@ def test_is_canonical_requires_operaxn_provenance(tmp_path, inhouse_nxs):
                         ("program_name", pre_rename), ("scans", scans_only)):
         assert core.is_canonical_nxs(nxs_with(name, build)), name
     assert core.is_canonical_nxs(inhouse_nxs)
+
+def test_release_version_matches_package_and_citation():
+    """pyproject.toml and CITATION.cff carry the GENERATOR_VERSION every file is stamped with."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
+        project = fh.read().split("[project]", 1)[1].split("\n[", 1)[0]
+    with open(os.path.join(root, "CITATION.cff"), encoding="utf-8") as fh:
+        citation = fh.read()
+    package = re.search(r'^version\s*=\s*"([^"]+)"', project, re.M)
+    cited = re.search(r"^version:\s*(\S+)", citation, re.M)
+    assert package and cited, "version line not found"
+    assert package.group(1) == core.GENERATOR_VERSION, "pyproject.toml version differs"
+    assert cited.group(1).strip("'\"") == core.GENERATOR_VERSION, "CITATION.cff version differs"

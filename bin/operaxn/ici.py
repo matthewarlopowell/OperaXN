@@ -1,17 +1,12 @@
 """
-ICI (intermittent current interruption) analysis window.
+ICI (intermittent current interruption) analysis window and the analysis windows' shared helpers.
 
 Pulse detection and regression follow the pyICI conventions
 (https://github.com/joe-arroyo/pyICI): a pulse is an active period
 (current != 0) followed by a rest (current == 0) no longer than max_rest;
 for each pulse a linear fit of ΔV against √Δt over a configurable time
 window yields R = -intercept/I and k = -slope/I, with errors propagated
-from the fit covariance.
-
-The window pairs the raw voltage trace with per-pulse fit diagnostics
-and summary plots of the fitted R and k values.
-
-Ported from the OperaXN-ICI fork (Joe Arroyo).
+from the fit covariance. Ported from the OperaXN-ICI fork (Joe Arroyo).
 """
 
 from __future__ import annotations
@@ -29,9 +24,11 @@ from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 
 from .capacity import assign_cycles, compute_capacity
-from .config import FIGURE_DPI, OPERAXNTheme
+from .config import (
+    CSV_ENCODING, FIGURE_DPI, OPERAXNTheme, SECONDS_PER_HOUR, TIME_HOURS_LABEL,
+)
 
-# Theme shorthands (module-local; every widget below uses them)
+# Theme shorthands, also imported by heatmap.py
 _C = OPERAXNTheme.COLORS
 BG = _C['bg_primary']
 BG2 = _C['bg_secondary']
@@ -56,7 +53,6 @@ HIGHLIGHT_COLOR = '#4b5563'
 _FONT = OPERAXNTheme.FONTS['small']
 _FONT_BTN = OPERAXNTheme.FONTS['button']
 _PAD_S = OPERAXNTheme.PADDING['small']
-_PAD_M = OPERAXNTheme.PADDING['medium']
 
 
 # ============================================================================
@@ -64,7 +60,7 @@ _PAD_M = OPERAXNTheme.PADDING['medium']
 # ============================================================================
 
 def maximise_window(win: tk.Toplevel) -> None:
-    """Open a toplevel maximised, with fallbacks per window manager."""
+    """Maximise a toplevel, with fallbacks per window manager."""
     try:
         win.state('zoomed')
     except tk.TclError:
@@ -80,19 +76,10 @@ def maximise_window(win: tk.Toplevel) -> None:
 # Data Helpers
 # ============================================================================
 
-def _prepare_df(echem_df: pd.DataFrame) -> pd.DataFrame:
-    """Return echem_df with t_s/phase/cycle columns for ICI analysis."""
-    return assign_cycles(echem_df)
-
-
 def _detect_pulses(phase_df: pd.DataFrame, max_rest: float = 1800.0) -> list[dict]:
-    """
-    Detect valid pulses in a phase's current trace.
-
-    A pulse = active period (current != 0) followed by rest (current == 0).
-    Valid only if 0 < rest_duration <= max_rest. This naturally excludes the
-    CV step (rest too long) and inter-cycle rests.
-    """
+    """Detect pulses: an active run (current != 0) followed by a rest (current == 0).
+    Valid only if 0 < rest duration <= max_rest (s), which excludes the CV step and
+    inter-cycle rests."""
     if phase_df.empty:
         return []
 
@@ -145,17 +132,9 @@ def _detect_pulses(phase_df: pd.DataFrame, max_rest: float = 1800.0) -> list[dic
 
 def _compute_fit(seg: pd.DataFrame, pulse: dict, r1_start: float, r1_length: float,
                  cap_arr: np.ndarray | None = None) -> dict | None:
-    """ΔV vs √Δt linear fit for one pulse.
-
-    r1_start/r1_length are a time window (seconds) into the rest period:
-    fit points with r1_start <= Δt < r1_start + r1_length. Returns None if
-    rest data is insufficient.
-
-    cap_arr, if given, is the cumulative capacity (mAh) for `seg` (same
-    length, same row order — see compute_capacity), used to attach a capacity
-    value to this pulse's V0 point by position rather than by voltage
-    (voltage can repeat across pulses in flat regions, capacity is monotonic).
-    """
+    """Fit ΔV against √Δt over one pulse's rest window; None when it cannot be fitted.
+    The window is r1_start <= Δt < r1_start + r1_length (s). cap_arr is seg's cumulative
+    capacity (mAh, row-aligned); V0's capacity is taken by position, as voltage can repeat."""
     active = seg[pulse['pulse_mask']]
     rest = seg[pulse['relax_mask']]
     if active.empty or rest.empty:
@@ -214,7 +193,7 @@ def _compute_fit(seg: pd.DataFrame, pulse: dict, r1_start: float, r1_length: flo
 
 
 def _compute_all_pulses(seg: pd.DataFrame, pulses: list[dict], get_r1) -> list[dict]:
-    """Fit every pulse in seg; get_r1(pulse_idx) -> (r1_start_s, r1_length_s)."""
+    """Fit every pulse in seg; get_r1(1-based pulse_idx) -> (r1_start_s, r1_length_s)."""
     cap_arr = compute_capacity(seg) if not seg.empty else np.array([])
     results = []
     for i, p in enumerate(pulses):
@@ -258,7 +237,7 @@ class _Btn(tk.Button):
         self.bind('<Leave>', lambda _: self._set_hover_state(False))
 
     def _set_hover_state(self, hovering: bool) -> None:
-        """Set button hover state."""
+        """Apply or clear the hover colour unless the button is disabled."""
         if self['state'] != 'disabled':
             self.config(bg=self._hover if hovering else self._bg)
 
@@ -272,7 +251,7 @@ class _Btn(tk.Button):
 
 
 def _spinbox(master, var, **kw):
-    """Flat spinbox using the theme's input colours and border."""
+    """Build a flat spinbox in the theme's input colours and border."""
     return tk.Spinbox(
         master, textvariable=var,
         bg=INPUT, fg=TEXT, buttonbackground=BG2,
@@ -283,7 +262,7 @@ def _spinbox(master, var, **kw):
 
 
 def _label(master, text, dim=False, **kw):
-    """Themed label; dim=True uses the dimmed text colour."""
+    """Build a themed label; dim=True uses the dimmed text colour."""
     return tk.Label(
         master, text=text,
         bg=kw.pop('bg', BG2),
@@ -293,14 +272,14 @@ def _label(master, text, dim=False, **kw):
 
 
 def _separator(master, horizontal=True):
-    """One-pixel border-coloured separator frame."""
+    """Build a one-pixel border-coloured separator frame."""
     if horizontal:
         return tk.Frame(master, bg=BORDER, height=1)
     return tk.Frame(master, bg=BORDER, width=1)
 
 
 def _canvas_frame(master):
-    """Styled border frame that matches the main window's plot container."""
+    """Build a bordered plot frame matching the main window's plot container."""
     return tk.Frame(
         master,
         bg=PLOT_BG,
@@ -312,12 +291,31 @@ def _canvas_frame(master):
     )
 
 
+def _themed_menubutton(master, textvariable, **kw):
+    """Build a flat themed menu button and its menu, not yet attached; return (button, menu)."""
+    button = tk.Menubutton(master, textvariable=textvariable)
+    button.config(
+        bg=BG3, fg=TEXT,
+        activebackground=_C['accent_hover'],
+        activeforeground=_C['button_text'],
+        font=_FONT, relief=tk.FLAT, cursor='hand2',
+        highlightthickness=1, highlightbackground=BORDER,
+        indicatoron=False, anchor='w', **kw,
+    )
+    menu = tk.Menu(button, tearoff=False)
+    menu.config(
+        bg=BG2, fg=TEXT,
+        activebackground=ACCENT,
+        activeforeground=_C['button_text'],
+        font=_FONT,
+    )
+    return button, menu
+
+
 def echem_source_button(master, var, values, command=None,
                         on_add=None) -> tk.Menubutton:
-    """Compact themed menu button for choosing an echem dataset.
-
-    Shared by the ICI and Capacity analysis windows.
-    """
+    """Build a compact themed menu button for choosing an echem dataset.
+    Shared by the ICI and Capacity windows; button.set_values(names) refreshes the menu."""
     values = list(values)
 
     def display_text(value) -> str:
@@ -326,22 +324,7 @@ def echem_source_button(master, var, values, command=None,
         return f'Echem: {short}  ▾'
 
     display_var = tk.StringVar(value=display_text(var.get()))
-    button = tk.Menubutton(master, textvariable=display_var)
-    button.config(
-        bg=BG3, fg=TEXT,
-        activebackground=_C['accent_hover'],
-        activeforeground=_C['button_text'],
-        font=_FONT, relief=tk.FLAT, cursor='hand2',
-        highlightthickness=1, highlightbackground=BORDER,
-        indicatoron=False, width=24, anchor='w',
-    )
-    source_menu = tk.Menu(button, tearoff=False)
-    source_menu.config(
-        bg=BG2, fg=TEXT,
-        activebackground=ACCENT,
-        activeforeground=_C['button_text'],
-        font=_FONT,
-    )
+    button, source_menu = _themed_menubutton(master, display_var, width=24)
 
     def select(value) -> None:
         var.set(value)
@@ -377,8 +360,7 @@ def echem_source_button(master, var, values, command=None,
 # ============================================================================
 
 class _SelectorStrip(tk.Frame):
-    """Navigation strip: echem source, cycle/pulse spinboxes, phase toggle,
-    R² scope."""
+    """Navigation strip: echem source, cycle/pulse spinboxes, phase and R² scope toggles."""
 
     def __init__(self, master, on_change, source_names=None,
                  on_source_change=None, on_add_source=None):
@@ -514,7 +496,7 @@ class _SelectorStrip(tk.Frame):
             self.pulse_var.set(clamped)
 
     def set_cycle_range(self, max_cycle: int) -> None:
-        """Bound the cycle spinbox to the cycles in the loaded data."""
+        """Bound the cycle spinbox to the loaded data's cycles and reset it to cycle 1."""
         self._cycle_spin.config(to=max_cycle)
         self.cycle_var.set(1)
 
@@ -546,10 +528,8 @@ class _SelectorStrip(tk.Frame):
 # ============================================================================
 
 class _RegressionBar(tk.Frame):
-    """Regression window and pulse-detection controls.
-
-    Edits apply to the selected pulse automatically (like the main window's
-    intensity controls); Apply All pushes the current values to every pulse."""
+    """Bottom bar: regression window, pulse-detection max rest and CSV export.
+    Edits apply live, the window to the selected pulse; Apply All sets it on every pulse."""
 
     def __init__(self, master, on_change, on_apply_all, on_export):
         super().__init__(master, bg=BG2)
@@ -663,16 +643,14 @@ def _style_ax(ax, xlabel='', ylabel='', title=''):
 
 
 def _stub(ax, msg='No data'):
-    """Centred placeholder message on an empty axes."""
+    """Draw a centred placeholder message on an empty axes."""
     ax.text(0.5, 0.5, msg, color=PLOT_DIM, fontsize=9,
             ha='center', va='center', transform=ax.transAxes, style='italic')
 
 
 def embed_figure(fig, parent) -> FigureCanvasTkAgg:
     """Embed a matplotlib Figure in a Tk parent with a themed toolbar.
-
-    Shared by the ICI and Capacity analysis windows.
-    """
+    Shared by the ICI, Capacity and Heatmap windows; re-syncs the figure after each resize."""
     canvas = FigureCanvasTkAgg(fig, master=parent)
     toolbar_frame = tk.Frame(parent, bg=BG2)
     toolbar_frame.pack(fill='x', side='bottom')
@@ -692,7 +670,7 @@ def embed_figure(fig, parent) -> FigureCanvasTkAgg:
     canvas.draw()
 
     # Every resize on a scaled display can re-run matplotlib's device-pixel-
-    # ratio race (see sync_figure_to_widget) — not just the opening layout
+    # ratio race (see sync_figure_to_widget), not just the opening layout
     # the windows' startup watchdogs cover. Reconcile after each resize
     # settles; the sync is a no-op when figure and widget already agree.
     def _sync_after_resize(_event=None):
@@ -715,15 +693,12 @@ def embed_figure(fig, parent) -> FigureCanvasTkAgg:
 
 def sync_figure_to_widget(canvas: FigureCanvasTkAgg, force: bool = False) -> None:
     """Resize a canvas's figure to its widget's current size.
-
-    On scaled displays matplotlib's one-off DPI adjustment can land after
-    the widget's last <Configure> event; the figure is then larger than the
-    widget and renders cropped, with no further event to reconcile them.
-    Replays the resize handler with the widget's actual size (which also
-    recreates the Tk photo buffer). No-op when the two already agree —
-    pass force=True after a window resize, where the sizes can compare
-    equal while the photo buffer is still stale.
-    """
+    No-op when the sizes agree; pass force=True after a window resize, where they can
+    compare equal while the Tk photo buffer is still stale."""
+    # On scaled displays matplotlib's one-off DPI adjustment can land after the
+    # widget's last <Configure> event, leaving the figure larger than the widget
+    # (rendered cropped) with no further event to reconcile them. Replaying the
+    # resize handler at the widget's actual size also recreates the photo buffer.
     widget = canvas.get_tk_widget()
     parent = getattr(canvas, '_operaxn_parent', widget.master)
     toolbar = getattr(canvas, '_operaxn_toolbar', None)
@@ -731,8 +706,8 @@ def sync_figure_to_widget(canvas: FigureCanvasTkAgg, force: bool = False) -> Non
     height = parent.winfo_height()
     if toolbar is not None:
         height -= toolbar.winfo_height()
-    # the canvas widget sits inside two 1px borders (frame highlight +
-    # canvas border): its actual size is parent - 4 in each dimension
+    # the canvas widget (no border of its own) sits inside the frame's 2px
+    # highlight on each side: its actual size is parent - 4 in each dimension
     width = max(1, width - 4)
     height = max(1, height - 4)
     if width <= 1 or height <= 1:
@@ -746,23 +721,38 @@ def sync_figure_to_widget(canvas: FigureCanvasTkAgg, force: bool = False) -> Non
         canvas.draw_idle()
 
 
+def watch_figure_sync(win, canvases):
+    """Re-fit each canvas to its widget 150 ms after opening, then every 200 ms, 12 times in all.
+    Layout and the DPI adjustment settle in no fixed order, so a one-shot timer can miss."""
+    attempts = 0
+
+    def watchdog():
+        nonlocal attempts
+        if not win.winfo_exists():
+            return
+        for canvas in canvases:
+            sync_figure_to_widget(canvas)
+        attempts += 1
+        if attempts < 12:
+            win.after(200, watchdog)
+
+    win.after(150, watchdog)
+
+
 # ============================================================================
 # ICI Window
 # ============================================================================
 
 class ICIWindow(tk.Toplevel):
     """ICI analysis window; opens maximised.
-
-        ICIWindow(parent, echem_df)                    # single dataset
-        ICIWindow(parent, echem_sources={name: df})    # selectable datasets
-    """
+    Takes one echem_df, or echem_sources {name: df} to choose between datasets."""
 
     def __init__(self, parent: tk.Widget,
                  echem_df: Optional[pd.DataFrame] = None,
                  echem_sources: Optional[dict] = None,
                  on_add_source=None) -> None:
         super().__init__(parent)
-        self.title('OperaXN — ICI Analysis')
+        self.title('OperaXN: ICI Analysis')
         self.configure(bg=BG)
         self.minsize(1000, 600)
         maximise_window(self)
@@ -783,7 +773,6 @@ class ICIWindow(tk.Toplevel):
         self._reg_change_job = None
         self._last_max_rest = 300.0
         self._on_add_source = on_add_source
-        self._last_cycle_phase: tuple = (None, None)
 
         # Regression-window overrides, resolved pulse > phase > defaults.
         # Bar edits write the pulse level; Apply All writes the phase level.
@@ -796,10 +785,7 @@ class ICIWindow(tk.Toplevel):
         if self._sources:
             self._load(next(iter(self._sources.values())))
 
-        # Watch until the initial layout and DPI adjustment have both settled;
-        # their event order is not deterministic, so one-shot timers can miss.
-        self._sync_attempts = 0
-        self.after(150, self._sync_watchdog)
+        watch_figure_sync(self, (self._canvas_top, self._canvas_bot, self._canvas_right))
 
     # ------------------------------------------------------------------
     # Layout
@@ -807,7 +793,7 @@ class ICIWindow(tk.Toplevel):
 
     def _build_ui(self):
         """Build the window layout: figures, selector strip, regression bar."""
-        # Regression bar — packed from bottom first
+        # Regression bar, packed from the bottom first
         _separator(self).pack(fill='x', side='bottom')
         self.reg_bar = _RegressionBar(self, on_change=self._on_regression_change,
                                       on_apply_all=self._on_apply_all,
@@ -890,7 +876,7 @@ class ICIWindow(tk.Toplevel):
                                   self.rk_axis_bar.winfo_reqwidth() + 4 * _PAD_S))
 
     def _focus_primary_panel(self) -> None:
-        """Start with the overview/pulse panel as the active plot region."""
+        """Focus the overview/pulse panel as the starting plot region."""
         frame = getattr(self, '_primary_canvas_frame', None)
         if frame is not None and frame.winfo_exists():
             frame.focus_set()
@@ -903,8 +889,8 @@ class ICIWindow(tk.Toplevel):
                       top=0.88, bottom=0.18)
         self.ax_overview = self._fig_top.add_subplot(gs[0, 0])
         self.ax_pulse = self._fig_top.add_subplot(gs[0, 1])
-        _style_ax(self.ax_overview, 't (h)', 'Voltage (V)', 'Overview')
-        _style_ax(self.ax_pulse, 't (h)', 'Voltage (V)', 'Pulse zoom')
+        _style_ax(self.ax_overview, TIME_HOURS_LABEL, 'Voltage (V)', 'Overview')
+        _style_ax(self.ax_pulse, TIME_HOURS_LABEL, 'Voltage (V)', 'Pulse zoom')
 
     def _build_bot_axes(self):
         """Create the ICI-fit and R² axes."""
@@ -944,14 +930,14 @@ class ICIWindow(tk.Toplevel):
         """Load echem data, reset caches, and redraw everything."""
         self._updating = True
         try:
-            self._df = _prepare_df(echem_df)
+            self._df = assign_cycles(echem_df)
             self._pulses = {}
             self._ici_cache = {}
             self.selector.set_cycle_range(max(1, self._max_cycle()))
             self.selector.pulse_var.set(1)
         finally:
             self._updating = False
-        self._update_all()
+        self._update_live_plots()
 
     def _on_source_change(self, name):
         """Queue a source switch after the dropdown has closed."""
@@ -973,7 +959,6 @@ class ICIWindow(tk.Toplevel):
             # Overrides are indexed by pulse/cycle of the previous dataset.
             self._r1_pulse_overrides.clear()
             self._r1_phase_overrides.clear()
-            self._last_cycle_phase = (None, None)
             self._load(df)
         finally:
             self.configure(cursor='')
@@ -984,14 +969,14 @@ class ICIWindow(tk.Toplevel):
         self.selector.set_sources(self._sources)
 
     def _max_cycle(self) -> int:
-        """Highest detected cycle number in the loaded data (0 if none)."""
+        """Return the highest detected cycle number in the loaded data (0 if none)."""
         if self._df is None:
             return 0
         cycles = self._df[self._df['cycle'] > 0]['cycle']
         return int(cycles.max()) if not cycles.empty else 0
 
     def _get_pulses(self, cycle: int, phase: str) -> list[dict]:
-        """Detected pulses for (cycle, phase), cached until the bar changes."""
+        """Return the detected pulses for (cycle, phase), cached until a bar edit or reload."""
         key = (cycle, phase)
         if key not in self._pulses:
             if self._df is None:
@@ -1010,16 +995,16 @@ class ICIWindow(tk.Toplevel):
     # ------------------------------------------------------------------
 
     def _plot_overview(self, cycle, pulse_idx, phase):
-        """Voltage vs time for the selected cycle with pulse highlight."""
+        """Plot voltage against time for the selected cycle, highlighting the pulse."""
         ax = self.ax_overview
         ax.cla()
-        _style_ax(ax, 't (h)', 'Voltage (V)', 'Overview')
+        _style_ax(ax, TIME_HOURS_LABEL, 'Voltage (V)', 'Overview')
         if self._df is None:
             _stub(ax, 'No data loaded')
             return
 
         df = self._df
-        t_h = df['t_s'].values / 3600.0
+        t_h = df['t_s'].values / SECONDS_PER_HOUR
         voltage = df['echem_data'].values
 
         if self.selector.show_all_var.get():
@@ -1037,8 +1022,8 @@ class ICIWindow(tk.Toplevel):
         pulses = self._get_pulses(cycle, phase)
         if 1 <= pulse_idx <= len(pulses):
             pulse = pulses[pulse_idx - 1]
-            t0 = pulse['pulse_start_t'] / 3600.0
-            t1 = pulse['relax_end_t'] / 3600.0
+            t0 = pulse['pulse_start_t'] / SECONDS_PER_HOUR
+            t1 = pulse['relax_end_t'] / SECONDS_PER_HOUR
             ax.axvspan(t0, t1, alpha=0.25, color=HIGHLIGHT_COLOR, zorder=3)
             ax.axvline(t0, color=HIGHLIGHT_COLOR, lw=1.0, ls='--', zorder=4)
 
@@ -1046,14 +1031,14 @@ class ICIWindow(tk.Toplevel):
                   labelcolor=PLOT_TEXT, facecolor=PLOT_BG, edgecolor=PLOT_BORDER)
 
     def _plot_pulse_zoom(self, cycle, pulse_idx, phase):
-        """Voltage and current for the selected pulse and its relaxation."""
+        """Plot voltage and current over the selected pulse and its relaxation."""
         if self._ax_pulse_twin is not None:
             self._fig_top.delaxes(self._ax_pulse_twin)
             self._ax_pulse_twin = None
 
         ax = self.ax_pulse
         ax.cla()
-        _style_ax(ax, 't (h)', 'Voltage (V)', 'Pulse zoom')
+        _style_ax(ax, TIME_HOURS_LABEL, 'Voltage (V)', 'Pulse zoom')
 
         if self._df is None:
             _stub(ax, 'No data loaded')
@@ -1068,27 +1053,27 @@ class ICIWindow(tk.Toplevel):
         pulse = pulses[pulse_idx - 1]
         mask = (self._df['cycle'] == cycle) & (self._df['phase'] == phase)
         seg = self._df[mask]
+        pulse_seg = seg[pulse['pulse_mask']]
+        relax_seg = seg[pulse['relax_mask']]
 
-        combined = pd.concat([seg[pulse['pulse_mask']], seg[pulse['relax_mask']]])
+        combined = pd.concat([pulse_seg, relax_seg])
         if combined.empty:
             _stub(ax, 'Empty pulse segment')
             return
 
-        t_h = combined['t_s'].values / 3600.0
+        t_h = combined['t_s'].values / SECONDS_PER_HOUR
         voltage = combined['echem_data'].values
         current = combined['current'].fillna(0).values
         colour = CHARGE_COLOR if phase == 'charge' else DISCHARGE_COLOR
 
         # V0 = voltage at end of active period (pyICI convention)
-        pulse_seg = seg[pulse['pulse_mask']]
-        relax_seg = seg[pulse['relax_mask']]
-        t0_h = pulse['pulse_end_t'] / 3600.0
+        t0_h = pulse['pulse_end_t'] / SECONDS_PER_HOUR
 
         ax.plot(t_h, voltage, color=colour, lw=1.8, label='Voltage', zorder=3)
 
         # Shade rest period + V0 marker (matches pyICI)
         if not relax_seg.empty:
-            ax.axvspan(t0_h, pulse['relax_end_t'] / 3600.0,
+            ax.axvspan(t0_h, pulse['relax_end_t'] / SECONDS_PER_HOUR,
                        color=colour, alpha=0.12, zorder=1)
         if not pulse_seg.empty:
             V0 = pulse_seg['echem_data'].iloc[-1]
@@ -1128,8 +1113,8 @@ class ICIWindow(tk.Toplevel):
     # ------------------------------------------------------------------
 
     def _get_r1(self, cycle: int = None, phase: str = None, pulse_idx: int = None):
-        """Resolve the regression window (start_s, length_s) for a pulse,
-        falling back pulse override -> phase override -> the bar defaults."""
+        """Return a pulse's regression window (start_s, length_s).
+        Resolves the pulse override, then the phase override, then the default (0.5, 1.0)."""
         if cycle is not None and phase is not None and pulse_idx is not None:
             override = self._r1_pulse_overrides.get((cycle, phase, pulse_idx))
             if override is not None:
@@ -1137,7 +1122,7 @@ class ICIWindow(tk.Toplevel):
         return self._r1_phase_overrides.get(phase, (0.5, 1.0))
 
     def _compute_ici(self, cycle: int, phase: str) -> list[dict]:
-        """Fit results for (cycle, phase), cached until Apply/reload."""
+        """Return the fit results for (cycle, phase), cached until a bar edit or reload."""
         key = (cycle, phase)
         if key not in self._ici_cache:
             pulses = self._get_pulses(cycle, phase)
@@ -1185,7 +1170,7 @@ class ICIWindow(tk.Toplevel):
             color=PLOT_TEXT, fontsize=9, pad=4)
 
     def _plot_r2_panel(self, cycle: int, pulse_idx: int, phase: str, scope: str):
-        """R² of every fit in the selected scope, star on the current pulse."""
+        """Plot R² of every fit in the selected scope, starring the current pulse."""
         ax = self.ax_r2
         ax.cla()
         _style_ax(ax, 'Pulse #', 'R²', 'R² vs Pulse')
@@ -1237,7 +1222,7 @@ class ICIWindow(tk.Toplevel):
     }
 
     def _get_mass_mg(self) -> float:
-        """Sample mass from the R/k axis bar, 0.0 when unset or invalid."""
+        """Return the sample mass (mg) from the R/k axis bar, 0.0 when unset or invalid."""
         try:
             return float(self.rk_axis_bar.mass_var.get())
         except (ValueError, tk.TclError):
@@ -1330,7 +1315,6 @@ class ICIWindow(tk.Toplevel):
             phase = self.selector.phase_var.get()
             pulses = self._get_pulses(cycle, phase)
             self.selector.set_pulse_range(len(pulses))
-            self._last_cycle_phase = (cycle, phase)
             self._update_live_plots()
         finally:
             self._updating = False
@@ -1366,7 +1350,8 @@ class ICIWindow(tk.Toplevel):
                         'R2': r['r2'],
                     })
             out = pd.DataFrame(rows, columns=columns)
-            out.to_csv(os.path.join(directory, f'ici_{phase}.csv'), index=False)
+            out.to_csv(os.path.join(directory, f'ici_{phase}.csv'), index=False,
+                       encoding=CSV_ENCODING)
 
         messagebox.showinfo(
             'Export complete',
@@ -1384,7 +1369,7 @@ class ICIWindow(tk.Toplevel):
         self._update_right_plots(cycle, phase, scope)
 
     def _reg_values(self):
-        """Bar values as (start_s, length_s), or None while an edit is invalid."""
+        """Return the bar's (start_s, length_s), or None while an edit is invalid."""
         try:
             return (float(self.reg_bar.start_var.get()),
                     float(self.reg_bar.length_var.get()))
@@ -1398,7 +1383,7 @@ class ICIWindow(tk.Toplevel):
         self._reg_change_job = self.after(250, self._apply_regression_change)
 
     def _apply_regression_change(self):
-        """Apply the bar's values to the selected pulse and refit."""
+        """Apply the bar's window to the selected pulse, re-detect pulses and refit."""
         self._reg_change_job = None
         if self._df is None:
             return
@@ -1417,7 +1402,7 @@ class ICIWindow(tk.Toplevel):
         self._update_live_plots()
 
     def _on_apply_all(self):
-        """Apply the bar's values to every pulse, cycle, and phase."""
+        """Apply the bar's window to every pulse, cycle and phase."""
         if self._df is None:
             return
         value = self._reg_values()
@@ -1445,23 +1430,3 @@ class ICIWindow(tk.Toplevel):
         self._plot_r2_panel(cycle, pulse, phase, scope)
         self._canvas_bot.draw_idle()
         self._update_right_plots(cycle, phase, scope)
-
-    def _update_all(self):
-        """Full refresh after a data load."""
-        self._update_live_plots()
-
-    def _sync_figures(self):
-        """Re-fit all three figures to their widgets (see sync_figure_to_widget)."""
-        if not self.winfo_exists():
-            return
-        for canvas in (self._canvas_top, self._canvas_bot, self._canvas_right):
-            sync_figure_to_widget(canvas)
-
-    def _sync_watchdog(self):
-        """Re-fit the figures repeatedly while the window is settling."""
-        if not self.winfo_exists():
-            return
-        self._sync_figures()
-        self._sync_attempts += 1
-        if self._sync_attempts < 12:
-            self.after(200, self._sync_watchdog)

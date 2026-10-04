@@ -1,15 +1,11 @@
 """
 Input adapter: bridges the OperaXN GUI to the core NXS-canonical pipeline.
 
-Every upload goes through the canonical .nxs file:
-- raw data  -> core.generate() into a cache .nxs -> core.load()
-- .nxs file -> core.load() directly
-
-This module exposes the GUI's data API (process_paths, make_*_arrays,
-get_correlated_data); every call serves data from the loaded
-ExperimentModel — raw files are never re-read per scan.
-Relative time is applied here as a display-only view transform; the .nxs
-always stores absolute timestamps.
+Raw data goes through core.generate() into a cache .nxs and a canonical .nxs
+opens directly; either way core.load() builds the ExperimentModel that the GUI
+data API (process_paths, make_*_arrays, get_correlated_data) serves, so raw
+files are never re-read per scan. Relative time is a display-only view; the
+.nxs always stores absolute timestamps.
 """
 
 import logging
@@ -21,7 +17,7 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from core import SYNCHROTRON_MAX_DISPLAY_SIZE
+from core import ECHEM_TIME_TOLERANCE, SYNCHROTRON_MAX_DISPLAY_SIZE
 from core import (  # noqa: F401  (GUI scan labels)
     NeutronFileGrouper,
     SynchrotronFileGrouper,
@@ -39,7 +35,8 @@ from core import (  # noqa: F401  (re-exported for package API)
 )
 from core import is_canonical_nxs, load
 from core import write_standard_echem_group
-from core import (  # noqa: F401  (clear_global_cache used by main.py)
+from core.nxs_writer import CYCLING_PROTOCOL_FIELDS
+from core import (  # noqa: F401  (clear_global_cache used by gui.py)
     DataReaderFactory,
     HDFReader,
     clear_global_cache,
@@ -58,14 +55,8 @@ _session: Dict[str, Any] = {
 
 
 def cleanup_session_cache() -> None:
-    """Delete the session's auto-generated cache .nxs if it was never
-    exported, plus its 2D images sidecar (removed even for exported
-    sessions: the export carries its own copy).
-
-    Never touches user files: only paths inside the cache directory that came
-    from a raw-data load are eligible. Called on app exit and whenever a new
-    load replaces the session.
-    """
+    """Delete the session's cache .nxs unless exported, and its 2D images sidecar regardless.
+    Only raw-data loads inside the cache directory qualify, so user files are never touched."""
     path = _session.get("nxs_path")
     if not path:
         return
@@ -95,11 +86,9 @@ def cleanup_session_cache() -> None:
 # ============================================================================
 
 def _scan_to_dict(sd: ScanData) -> Dict[str, Any]:
-    """Convert a loaded ScanData into the dict shape the GUI consumes.
-
-    `oned`/`twod`/`neutron_files` hold source *names* for display; the arrays
-    themselves live on the attached ScanData under the private `_data` key.
-    """
+    """Convert a loaded ScanData into the scan dict the GUI consumes.
+    oned/twod/neutron_files hold source names for display; the arrays stay on the
+    ScanData under the private "_data" key."""
     neutron_files = None
     if sd.neutron:
         neutron_files = {}
@@ -146,14 +135,9 @@ def _scan_to_dict(sd: ScanData) -> Dict[str, Any]:
 def _apply_relative_view(scan_dicts: List[Dict[str, Any]],
                          echem_df: Optional[pd.DataFrame],
                          data_source: DataSourceType) -> None:
-    """Display-only transform: rewrite timestamps as HH:MM:SS offsets.
-
-    Scan t=0 is the earliest correlation midpoint (XRD scans only for
-    XRD sources, all scans for neutron); echem t=0 is its earliest point.
-    Same rewrite as core ScanProcessor._apply_relative_time, which the
-    canonical pipeline leaves disabled (apply_relative_display=False) so
-    generated files keep absolute time; the view is applied here instead.
-    """
+    """Rewrite scan and echem timestamps in place as HH:MM:SS offsets (display only).
+    Scan t=0 is the earliest correlation midpoint (XRD scans only, all scans for neutron) and
+    echem t=0 its earliest point; mirrors ScanProcessor._apply_relative_time (off in generate())."""
     if data_source == DataSourceType.NEUTRON:
         candidates = scan_dicts
     else:
@@ -201,16 +185,12 @@ def process_paths(selected_paths: List[str],
                   sample_name: Optional[str] = None,
                   sample_description: Optional[str] = None,
                   sample_preparation_date: Optional[str] = None,
-                  cycling_protocol: Optional[Dict[str, Any]] = None
+                  cycling_protocol: Optional[Dict[str, Any]] = None,
+                  echem_time_tolerance: Optional[float] = None
                   ) -> tuple:
-    """Load an experiment: generate the canonical .nxs (or take one directly),
-    load it, and return (scan_dicts, echem_df, time_method_str).
-
-    `time_method` defaults to absolute correlation when None.
-    `standard_echem_files`, `include_2d_images`, `twod_max_display_size`,
-    `title`, `sample_name`, `sample_description`, `sample_preparation_date`,
-    and `cycling_protocol` are generation options: they determine what is
-    stored in the .nxs and are ignored when a .nxs is opened directly."""
+    """Generate (or open) the canonical .nxs, load it and return (scan_dicts, echem_df, method).
+    time_method defaults to absolute and echem_time_tolerance (s) to the core default; options
+    after data_source only shape the generated file and are ignored for a directly opened .nxs."""
     paths = [str(p) for p in selected_paths]
     empty = ([], pd.DataFrame(columns=["timestamp", "echem_data", "current"]),
              TimeMethod.ABSOLUTE.value)
@@ -220,6 +200,8 @@ def process_paths(selected_paths: List[str],
 
     if time_method is None:
         time_method = TimeMethod.ABSOLUTE
+    if echem_time_tolerance is None:
+        echem_time_tolerance = ECHEM_TIME_TOLERANCE
 
     # A new load replaces the session: drop the previous unsaved cache file
     cleanup_session_cache()
@@ -246,6 +228,7 @@ def process_paths(selected_paths: List[str],
             sample_description=sample_description,
             sample_preparation_date=sample_preparation_date,
             cycling_protocol=cycling_protocol,
+            echem_time_tolerance=echem_time_tolerance,
             progress_callback=progress_callback,
         )
         if not success:
@@ -289,20 +272,19 @@ def process_paths(selected_paths: List[str],
 # ============================================================================
 
 def get_loaded_nxs_path() -> Optional[str]:
-    """Path of the canonical .nxs backing the currently loaded experiment."""
+    """Return the path of the canonical .nxs backing the loaded experiment."""
     return _session["nxs_path"]
 
 
 def get_experiment_metadata() -> Dict[str, Any]:
-    """Experiment-level metadata of the loaded .nxs (for exports/display)."""
+    """Return a copy of the loaded experiment's metadata (for exports and display)."""
     return dict(_session.get("global_metadata") or {})
 
 
 def experiment_metadata_rows(meta: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Experiment-level metadata as {field, value} rows for the Excel
-    Experiment sheet: entry fields, instrument/sample/user, the tofnpd
-    instrument geometry (flight path and per-bank distance/2theta from the
-    instrument profile), the beam monitor and the cycling protocol."""
+    """Flatten experiment metadata into {field, value} rows for the Excel Experiment sheet.
+    Covers entry fields, echem tolerance, instrument/sample/user, tofnpd geometry (flight path,
+    per-bank L2 and 2-theta), the beam monitor and the cycling protocol."""
     rows: List[Dict[str, str]] = []
     if not meta:
         return rows
@@ -312,6 +294,9 @@ def experiment_metadata_rows(meta: Dict[str, Any]) -> List[Dict[str, str]]:
                 "generator_version", "total_scans"):
         if meta.get(key) is not None:
             rows.append({"field": key, "value": str(meta[key])})
+    if meta.get("echem_time_tolerance") is not None:
+        rows.append({"field": "echem time tolerance",
+                     "value": f"{float(meta['echem_time_tolerance']):g} s"})
 
     for group in ("instrument", "sample", "user"):
         info = meta.get(group)
@@ -348,12 +333,11 @@ def experiment_metadata_rows(meta: Dict[str, Any]) -> List[Dict[str, str]]:
                          "value": f"{float(monitor['preset']):g} s"})
         rows.extend(_geometry_rows(monitor, "monitor", "{d:.3f} m, 2theta {p:.2f} deg"))
 
-    # Known dataset names only (the flattened group also carries NX_class)
+    # Known dataset names only, in file order (the flattened group also
+    # carries NX_class)
     protocol = meta.get("cycling_protocol")
     if isinstance(protocol, dict):
-        for key in ("technique", "voltage_window_lower",
-                    "voltage_window_upper", "C_rate", "instrument",
-                    "software", "raw_data_file"):
+        for _, key, _, _ in CYCLING_PROTOCOL_FIELDS:
             if protocol.get(key) is not None:
                 rows.append({"field": f"cycling protocol {key}",
                              "value": str(protocol[key])})
@@ -361,12 +345,9 @@ def experiment_metadata_rows(meta: Dict[str, Any]) -> List[Dict[str, str]]:
 
 
 def _geometry_rows(table: Any, label: str, value_format: str) -> List[Dict[str, str]]:
-    """One row per element of a tofnpd geometry table (the per-bank detector
-    arrays or the monitor elements): detector_number with distance and
-    polar_angle arrays of one length. [] when the arrays are absent or
-    incomplete (e.g. the scalar laboratory detector distance). Rows are
-    labelled "<label> <number>" and valued by value_format with d (distance,
-    m) and p (polar angle, degrees)."""
+    """Return one row per element of a tofnpd geometry table (detector banks or monitor elements).
+    Needs equal-length detector_number, distance and polar_angle, else []; rows are labelled
+    "<label> <number>" and valued by value_format with d (distance, m) and p (polar angle, deg)."""
     if not isinstance(table, dict):
         return []
     columns = [table.get(k) for k in ("detector_number", "distance", "polar_angle")]
@@ -385,29 +366,24 @@ def _geometry_rows(table: Any, label: str, value_format: str) -> List[Dict[str, 
 
 
 def get_standard_echem() -> List[Dict[str, Any]]:
-    """Standard (non-operando) echem datasets stored in the loaded .nxs.
-
-    Each entry has 'name', 'source_file', and 'data' (a DataFrame with
-    timestamp/echem_data and, when present in the file, current columns)."""
+    """Return the loaded experiment's standard (non-operando) echem datasets.
+    Entries hold 'source_file' and 'data' (timestamp, echem_data and, when stored, current
+    columns), plus the stored 'name' for datasets read from the file."""
     return list(_session.get("standard_echem") or [])
 
 
 def _write_standard_echem_group(nxs_path: str,
                                 datasets: List[Dict[str, Any]]) -> None:
-    """Replace the standard-echem group in a canonical NeXus file (layout
-    lives in core.nxs_writer.write_standard_echem_group — no drift)."""
+    """Replace the standard-echem group of a canonical .nxs via core write_standard_echem_group."""
     with h5py.File(nxs_path, "a") as nxs:
         parent = nxs["entry"] if "entry" in nxs else nxs
         write_standard_echem_group(parent, datasets)
 
 
 def add_standard_echem_files(paths: List[str]) -> List[Dict[str, Any]]:
-    """Append echem files to the loaded experiment without replacing its data.
-
-    The backing cache is updated for subsequent NeXus export. A directly
-    opened user NeXus file is copied into the cache before it is modified.
-    Returns the successfully parsed additions.
-    """
+    """Append echem files to the loaded experiment and return the parsed additions.
+    The backing cache .nxs is updated for export (a directly opened user .nxs is first copied
+    into the cache); re-adding a file name, case-insensitively, replaces its earlier entry."""
     if not _session.get("nxs_path"):
         raise RuntimeError("Load experiment data before adding electrochemistry")
 
@@ -435,7 +411,7 @@ def add_standard_echem_files(paths: List[str]) -> List[Dict[str, Any]]:
     if not additions:
         return []
 
-    combined = list(_session.get("standard_echem") or [])
+    combined = get_standard_echem()
     positions = {
         str(item.get("source_file", "")).casefold(): index
         for index, item in enumerate(combined)
@@ -477,10 +453,8 @@ def add_standard_echem_files(paths: List[str]) -> List[Dict[str, Any]]:
 
 def export_nxs(destination: str,
                progress_callback: Optional[Callable] = None) -> tuple:
-    """Save the loaded experiment's canonical .nxs to `destination`.
-
-    Copies the file, plus the <stem>_images sidecar when a ZIP load persisted
-    2D sources next to the cache file. Returns (success, messages)."""
+    """Save the loaded experiment's canonical .nxs to destination; return (success, messages).
+    The <stem>_images sidecar (ZIP loads persist 2D sources there) is copied alongside."""
     source = _session["nxs_path"]
     if not source or not os.path.isfile(source):
         return False, ["No experiment loaded"]
@@ -520,15 +494,14 @@ def export_nxs(destination: str,
 # ============================================================================
 
 def _scan_data(scan: Dict[str, Any]) -> Optional[ScanData]:
-    """The ScanData carried on a GUI scan dict (None for synthetic entries)."""
+    """Return the ScanData carried on a GUI scan dict (None for synthetic entries)."""
     return scan.get("_data")
 
 
 def _resolve_twod_source(path: Any) -> Optional[str]:
-    """Resolve a recorded 2D source path to a readable file, preferring the
-    OperaXN-marked <stem>_images sidecar next to the opened .nxs (it travels
-    with the file, while the recorded absolute path may be a stale cache
-    location)."""
+    """Resolve a recorded 2D source path to a readable file, or None.
+    The OperaXN-marked <stem>_images sidecar beside the opened .nxs (it travels with the file)
+    wins over a missing or cache-located recorded path."""
     if not path:
         return None
     path = str(path)
@@ -556,8 +529,7 @@ def _resolve_twod_source(path: Any) -> Optional[str]:
 
 
 def _load_twod_image(sd: ScanData, state: Any = None) -> Optional[np.ndarray]:
-    """Return the 2D image: embedded array, or lazy-load the referenced source
-    file (2D is stored by reference unless embedding was requested)."""
+    """Return the embedded 2D image, else read it from its referenced source file."""
     if sd.twod is not None:
         return sd.twod
 
@@ -566,14 +538,14 @@ def _load_twod_image(sd: ScanData, state: Any = None) -> Optional[np.ndarray]:
         return None
 
     try:
-        ext = os.path.splitext(str(path))[1].lower()
+        ext = os.path.splitext(path)[1].lower()
         if ext == ".hdf":
             max_size = SYNCHROTRON_MAX_DISPLAY_SIZE
             if state is not None and hasattr(state, "synchrotron_max_size"):
                 max_size = state.synchrotron_max_size
             reader = HDFReader(max_display_size=max_size)
-            return reader.read(str(path))
-        return DataReaderFactory.read_file(str(path))
+            return reader.read(path)
+        return DataReaderFactory.read_file(path)
     except Exception as e:
         logger.error(f"Error loading 2D source {path}: {e}")
         return None
@@ -602,7 +574,8 @@ def make_oned_arrays(scans: List[Dict[str, Any]], state: Any = None
 
 def make_twod_arrays(scans: List[Dict[str, Any]], state: Any = None
                      ) -> Dict[int, Dict[str, Any]]:
-    """Build {scan_num: {image, timestamp, echem, current}} from 2D scans."""
+    """Build {scan_num: {image, timestamp, echem, current}} from 2D scans.
+    A scan whose image cannot be read maps to {"error": True}."""
     plot_data = {}
 
     for scan in scans:
@@ -625,6 +598,19 @@ def make_twod_arrays(scans: List[Dict[str, Any]], state: Any = None
     return plot_data
 
 
+def _neutron_xy(sd: ScanData) -> Dict[Any, Dict[str, Dict[str, Any]]]:
+    """Return {measurement: {type: {x, y}}} for a scan's neutron banks with tof or d data."""
+    neutron_data = {}
+    for measurement_num, bank in sd.neutron.items():
+        measurement_data = {}
+        for key in ("tof", "d"):
+            if key in bank:
+                measurement_data[key] = {"x": bank[key]["x"], "y": bank[key]["y"]}
+        if measurement_data:
+            neutron_data[measurement_num] = measurement_data
+    return neutron_data
+
+
 def make_neutron_arrays(scans: List[Dict[str, Any]], state: Any = None
                         ) -> Dict[int, Dict[str, Dict[str, Any]]]:
     """Build {scan_num: {measurement: {type: {x, y}}}} from neutron scans."""
@@ -635,15 +621,7 @@ def make_neutron_arrays(scans: List[Dict[str, Any]], state: Any = None
         if sd is None or not sd.neutron:
             continue
 
-        scan_data = {}
-        for measurement_num, bank in sd.neutron.items():
-            measurement_data = {}
-            for key in ("tof", "d"):
-                if key in bank:
-                    measurement_data[key] = {"x": bank[key]["x"], "y": bank[key]["y"]}
-            if measurement_data:
-                scan_data[measurement_num] = measurement_data
-
+        scan_data = _neutron_xy(sd)
         if scan_data:
             plot_data[scan["scan_num"]] = scan_data
 
@@ -653,7 +631,7 @@ def make_neutron_arrays(scans: List[Dict[str, Any]], state: Any = None
 def make_echem_arrays(echem_df: Optional[pd.DataFrame],
                       time_method: str = "absolute"
                       ) -> Dict[str, Union[np.ndarray, List]]:
-    """Convert echem DataFrame to {x, y, current, timestamps} arrays."""
+    """Convert an echem DataFrame to {x, y, current, timestamps} arrays, x in elapsed seconds."""
     if echem_df is None or echem_df.empty:
         return {
             "x": np.array([]),
@@ -703,23 +681,14 @@ def get_correlated_data(scans: List[Dict[str, Any]],
         "scan_num": scan_num,
         "timestamp": scan["timestamp"],
         "echem_value": scan.get("echem"),
-        "current_value": scan.get("current")
+        "current_value": scan.get("current"),
+        "oned": ({"x": sd.oned["x"], "y": sd.oned["y"]}
+                 if sd.oned is not None else None),
+        "twod": _load_twod_image(sd, state) if scan.get("twod") else None,
     }
 
-    result["oned"] = ({"x": sd.oned["x"], "y": sd.oned["y"]}
-                      if sd.oned is not None else None)
-
-    result["twod"] = _load_twod_image(sd, state) if scan.get("twod") else None
-
     if sd.neutron:
-        neutron_data = {}
-        for measurement_num, bank in sd.neutron.items():
-            measurement_data = {}
-            for key in ("tof", "d"):
-                if key in bank:
-                    measurement_data[key] = {"x": bank[key]["x"], "y": bank[key]["y"]}
-            if measurement_data:
-                neutron_data[measurement_num] = measurement_data
+        neutron_data = _neutron_xy(sd)
         if neutron_data:
             result["neutron"] = neutron_data
 

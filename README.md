@@ -38,8 +38,12 @@ not just the raw files, is what gets analysed, shared and archived.
   distance/scattering angle)
 - Simultaneous visualisation of X-ray (1D and 2D) and neutron (per-bank
   TOF/d-spacing) diffraction data with electrochemical cycling
-- Operando heatmap (stacked patterns vs scan/time with the voltage track),
-  capacity analysis and ICI (intermittent current interruption) analysis
+- Operando heatmap (stacked patterns vs scan/time with the voltage track;
+  one map per bank on TOF or d spacing for neutron data, a filter to the
+  scans with correlated echem or minus listed scans, x and intensity
+  ranges, a choice of colour maps and a publication-figure export to PNG,
+  PDF or SVG), capacity analysis and ICI (intermittent current
+  interruption) analysis
 - Export the diffraction plots as publication-quality figures (PNG, PDF, SVG)
   or animated GIFs, and the correlated data and analysis results as Excel
   summaries and CSV
@@ -105,6 +109,14 @@ Two modes are available (selected at load time):
   point is taken as simultaneous with the first scan's exposure midpoint (its
   correlation timestamp), and the stored `voltage_timestamp` values stay in the
   echem clock. Useful when diffraction and echem clocks are not synchronised.
+
+In both modes a scan is matched to the nearest echem point within a
+tolerance, 300 s by default and set per run in the upload dialog ("Echem
+time tolerance"). The tolerance applies on both sides of the record: a scan
+whose correlation timestamp lies within it before the first echem point or
+after the last is matched to that end point, and a scan further than the
+tolerance from every point is left uncorrelated. The value used is recorded
+in the file as `operando_electrochemistry/echem_time_tolerance`.
 
 Echem timestamps are read day-first (the UK convention). Arbin exports use US
 month/day order: a date whose day is 12 or below is then read with month and

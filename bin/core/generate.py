@@ -1,12 +1,10 @@
 """
 Raw data -> canonical .nxs orchestration for the core pipeline.
 
-`generate()` is the single entry point: collect files (ZIPs extracted,
-xlsx/csv converted), classify, correlate, and write the canonical NeXus file.
-The GUI then loads that file via nxs_reader — one read path for everything.
-
-Canonical files always store absolute timestamps; relative display is a GUI
-view transform, never baked into the file.
+`generate()` is the single entry point: collect files (ZIPs extracted, xlsx/csv
+converted), classify, correlate and write the canonical NeXus file, which the GUI
+then loads via nxs_reader (one read path for everything). Canonical files always
+store absolute timestamps; relative display is a GUI view transform.
 """
 
 import logging
@@ -19,9 +17,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from . import config as _config
 from .config import (
     BATCH_SIZE,
+    ECHEM_TIME_TOLERANCE,
     MAX_WORKERS,
     PARALLEL_PROCESSING,
     PARALLEL_PROCESSING_THRESHOLD,
@@ -52,8 +50,8 @@ ProgressCallback = Optional[Callable[[str], None]]
 # ============================================================================
 
 def convert_tabular_to_txt(path: str, dest_dir: Optional[str] = None) -> str:
-    """Convert .xlsx/.csv to tab-delimited .txt; returns original path otherwise
-    or on failure. `dest_dir` places the temp file in a caller-managed dir."""
+    """Convert .xlsx/.csv to a tab-delimited temp .txt in `dest_dir` and return its path.
+    Other paths, and failed conversions, are returned unchanged."""
     lower = path.lower()
     if lower.endswith('.xlsx'):
         read = pd.read_excel
@@ -87,7 +85,9 @@ def convert_tabular_to_txt(path: str, dest_dir: Optional[str] = None) -> str:
 # ============================================================================
 
 class FileProcessor:
-    """Collects, extracts, and pre-classifies files from paths, ZIPs, and directories."""
+    """Context-managed collector turning input paths into FileRecords.
+    Its tempdir (ZIP extractions, converted tables) is removed on exit, so every read,
+    the NeXus write included, must happen inside the context."""
 
     def __init__(self, data_source: DataSourceType = DataSourceType.INHOUSE):
         self.data_source = data_source
@@ -97,30 +97,25 @@ class FileProcessor:
         self.nexus_extractor = NexusMetadataExtractor()
 
     def __enter__(self) -> 'FileProcessor':
-        """Create the ZIP-extraction tempdir for the processing session."""
         self.tempdir = tempfile.mkdtemp()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Delete the extraction tempdir (all reads, including the NeXus
-        write, must happen inside the context)."""
         if self.tempdir and os.path.exists(self.tempdir):
             shutil.rmtree(self.tempdir, ignore_errors=True)
 
     def process_paths(self, selected_paths: List[str]) -> List[FileRecord]:
-        """Main entry: collect files, group source-specific ones, process the rest."""
+        """Collect files, group source-specific ones and build records for the rest."""
         all_files = self._collect_all_files(selected_paths)
 
         if not all_files:
             return []
 
-        file_dict = {extracted: original for extracted, original in all_files}
-
         # Source-specific grouping
         if self.data_source == DataSourceType.NEUTRON:
             records = self._process_neutron_files(all_files)
         elif self.data_source == DataSourceType.SYNCHROTRON:
-            synchrotron_groups = self.synchrotron_grouper.group_files(file_dict)
+            synchrotron_groups = self.synchrotron_grouper.group_files(dict(all_files))
             records = self._process_synchrotron_groups(synchrotron_groups)
         else:
             records = []
@@ -175,8 +170,7 @@ class FileProcessor:
         return all_files
 
     def _convert_files_to_txt(self, files: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-        """Convert .xlsx and .csv to tab-delimited .txt for uniform parsing;
-        converted files live in the session tempdir so __exit__ removes them."""
+        """Convert .xlsx/.csv entries to .txt in the session tempdir, which __exit__ removes."""
         return [(convert_tabular_to_txt(extracted, dest_dir=self.tempdir), original)
                 for extracted, original in files]
 
@@ -239,13 +233,11 @@ class FileProcessor:
         """Create records for each synchrotron scan group (requires .nxs anchor)."""
         records: List[FileRecord] = []
 
-        for base_id, file_group in synchrotron_groups.items():
-            if 'nxs' in file_group:
-                record = self._create_synchrotron_record(file_group)
-                if record:
-                    records.append(record)
-                    for file_path in file_group.values():
-                        self.processed_files.add(file_path)
+        for file_group in synchrotron_groups.values():
+            record = self._create_synchrotron_record(file_group)
+            if record:
+                records.append(record)
+                self.processed_files.update(file_group.values())
 
         return records
 
@@ -286,12 +278,11 @@ def _run_pipeline(processor: FileProcessor,
                   input_paths: List[str],
                   data_source: DataSourceType,
                   progress_callback: ProgressCallback,
-                  time_method: TimeMethod) -> Tuple[List[Scan], pd.DataFrame]:
-    """Collect, classify, and correlate using an already-open FileProcessor.
-
-    The processor's context must stay open while the returned scans' file
-    paths are read: see the tempdir constraint on `process_raw`.
-    """
+                  time_method: TimeMethod,
+                  echem_time_tolerance: float = ECHEM_TIME_TOLERANCE
+                  ) -> Tuple[List[Scan], pd.DataFrame]:
+    """Collect, classify and correlate inside an already-open FileProcessor.
+    Its context must stay open while the returned scans' file paths are read."""
     records = processor.process_paths(input_paths)
 
     if not records:
@@ -299,8 +290,8 @@ def _run_pipeline(processor: FileProcessor,
 
     records_df = pd.DataFrame([r.__dict__ for r in records])
 
-    for col in ["oned", "twod", "echem", "neutron_meta", "timestamp",
-                "source_nxs", "path", "original_path"]:
+    # classify_files casts the classification columns itself
+    for col in ["timestamp", "path", "original_path"]:
         if col in records_df.columns:
             records_df[col] = records_df[col].astype("object")
 
@@ -314,6 +305,7 @@ def _run_pipeline(processor: FileProcessor,
         progress_callback("Processing scans and correlating with echem...")
 
     scan_processor = ScanProcessor(time_method, data_source,
+                                   echem_time_tolerance=echem_time_tolerance,
                                    apply_relative_display=False)
     return scan_processor.process_scans(classified_df)
 
@@ -321,30 +313,22 @@ def _run_pipeline(processor: FileProcessor,
 def process_raw(input_paths: List[str],
                 data_source: DataSourceType = DataSourceType.INHOUSE,
                 progress_callback: ProgressCallback = None,
-                time_method: TimeMethod = TimeMethod.ABSOLUTE
+                time_method: TimeMethod = TimeMethod.ABSOLUTE,
+                echem_time_tolerance: float = ECHEM_TIME_TOLERANCE
                 ) -> Tuple[List[Scan], pd.DataFrame]:
-    """Collect, classify, and correlate raw data.
-
-    `time_method` selects how scans are *matched* to echem (RELATIVE re-zeroes
-    both streams, for unsynchronised clocks). Timestamps in the output are
-    always absolute — relative display is a GUI view transform.
-
-    For ZIP inputs the file paths on the returned scans point into a temp
-    directory that is removed when this function returns. Use `generate`
-    (which keeps the extraction alive until the .nxs is written) when the
-    data itself is needed.
-    """
+    """Collect, classify and correlate raw data; timestamps stay absolute whatever `time_method`.
+    ZIP-extracted files the scans point to are deleted on return; use `generate` for the data."""
     with FileProcessor(data_source) as processor:
         return _run_pipeline(processor, input_paths, data_source,
-                             progress_callback, time_method)
+                             progress_callback, time_method,
+                             echem_time_tolerance)
 
 
 def _persist_zip_twod_sources(scans: List[Scan], output_path: str,
                               tempdir: Optional[str],
                               messages: Optional[List[str]] = None) -> Optional[str]:
-    """Copy zip-extracted 2D images to a <stem>_images dir beside output_path
-    and repoint the scans: the extraction tempdir dies with the processor, so
-    by-reference 2D from a ZIP would otherwise never be viewable."""
+    """Copy ZIP-extracted 2D images to <stem>_images beside output_path and repoint the scans.
+    By-reference 2D would otherwise die with the extraction tempdir; return the dir or None."""
     if not tempdir:
         return None
     temp_root = os.path.realpath(tempdir)
@@ -427,24 +411,27 @@ def generate(input_paths: List[str],
              sample_name: Optional[str] = None,
              sample_description: Optional[str] = None,
              sample_preparation_date: Optional[str] = None,
-             cycling_protocol: Optional[Dict[str, Any]] = None
+             cycling_protocol: Optional[Dict[str, Any]] = None,
+             echem_time_tolerance: float = ECHEM_TIME_TOLERANCE
              ) -> Tuple[bool, List[str]]:
-    """Full pipeline: raw paths -> canonical .nxs file at output_path;
-    returns (success, messages). `sample_preparation_date` (ISO 8601) and
-    `cycling_protocol` (keys per nxs_writer.CYCLING_PROTOCOL_FIELDS) are
-    forwarded to the writer."""
+    """Run the full pipeline from raw paths to the canonical .nxs; return (success, messages).
+    The preparation date is ISO 8601; `cycling_protocol` keys follow CYCLING_PROTOCOL_FIELDS."""
     try:
         # The FileProcessor context must span writing too: the writer reads
         # data from the scans' file paths, which for ZIP inputs live in the
         # processor's temp extraction directory.
         with FileProcessor(data_source) as processor:
             scans, echem_df = _run_pipeline(processor, input_paths, data_source,
-                                            progress_callback, time_method)
+                                            progress_callback, time_method,
+                                            echem_time_tolerance)
 
             messages = validate(scans, echem_df)
             fatal = [m for m in messages if not m.startswith("Warning")]
             if fatal:
                 return False, messages
+            # Non-fatal validation findings go to the terminal like every other warning
+            for msg in messages:
+                logger.warning(msg.removeprefix("Warning: "))
 
             if progress_callback:
                 progress_callback("Writing NeXus file...")
@@ -456,9 +443,9 @@ def generate(input_paths: List[str],
                                                        messages)
                 if images_dir:
                     messages.append(
-                        f"Warning: 2D images copied to "
+                        "Warning: 2D images copied to "
                         f"{os.path.basename(images_dir)} so ZIP references "
-                        f"stay viewable")
+                        "stay viewable")
 
             # Convert standard echem xlsx/csv the same way as everything else,
             # keeping the original path for provenance
@@ -475,55 +462,27 @@ def generate(input_paths: List[str],
                                sample_name=sample_name,
                                sample_description=sample_description,
                                sample_preparation_date=sample_preparation_date,
-                               cycling_protocol=cycling_protocol)
+                               cycling_protocol=cycling_protocol,
+                               echem_time_tolerance=echem_time_tolerance)
             writer.write(output_path, scans, echem_df, std_files)
 
-        if _config.USE_PYNXTOOLS_WRITER:
-            _revalidate_with_pynxtools(output_path, data_source)
-
-        return True, messages if messages else ["NeXus file generated successfully"]
+        return True, messages or ["NeXus file generated successfully"]
 
     except Exception as e:
         logger.exception("Error generating NeXus file")
         return False, [f"Error: {e}"]
 
 
-def _revalidate_with_pynxtools(output_path: str,
-                               data_source: DataSourceType) -> None:
-    """Best-effort rewrite through the pynxtools dataconverter (validates
-    against the NXoperando_* definitions). Any failure is logged and the
-    plain NXSWriter file is kept — the GUI never breaks on this path."""
-    tmp_out = output_path + ".pynx.nxs"
-    try:
-        from pynxtools_operaxn.reader import ensure_definitions_installed
-        from pynxtools.dataconverter.convert import convert
-
-        ensure_definitions_installed()
-        nxdl = ('NXoperando_tofnpd' if data_source == DataSourceType.NEUTRON
-                else 'NXoperando_monopd')
-        convert(input_file=(output_path,), reader='operaxn', nxdl=nxdl,
-                output=tmp_out)
-        os.replace(tmp_out, output_path)
-        logger.info(f"Output validated and rewritten by pynxtools ({nxdl})")
-    except Exception as e:
-        logger.warning(f"pynxtools validation pass skipped: {e}")
-        if os.path.isfile(tmp_out):
-            try:
-                os.remove(tmp_out)
-            except OSError:
-                pass
-
-
 def cache_dir() -> str:
-    """Directory for auto-generated canonical files (created on demand)."""
+    """Return the cache directory for auto-generated canonical files, creating it on demand."""
     d = os.path.join(tempfile.gettempdir(), "operaxn_cache")
     os.makedirs(d, exist_ok=True)
     return d
 
 
 def default_cache_path(input_paths: List[str]) -> str:
-    """Location for the auto-generated canonical file: always a user cache
-    directory, never next to the data (beamline mounts are often read-only)."""
+    """Return the cache path for an auto-generated canonical file, named after the first input.
+    Always the user cache, never beside the data: beamline mounts are often read-only."""
     if input_paths:
         stem = os.path.splitext(os.path.basename(os.path.normpath(input_paths[0])))[0]
     else:

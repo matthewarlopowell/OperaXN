@@ -1,5 +1,5 @@
 """
-Shared data model for the OperaXN core pipeline.
+Shared data model for the core pipeline.
 
 `Scan` describes source files on disk (paths, timestamps, correlation
 results); `ScanData` carries the loaded data arrays. `source_nxs` on a Scan
@@ -37,7 +37,7 @@ SUPPORTED_EXTENSIONS = {ft.value for ft in FileType}
 
 
 class DataType(Enum):
-    """What a classified file contains (also the FileRecord column it fills)."""
+    """Kind of content in a classified file (also the FileRecord column it fills)."""
     ONED = "oned"
     TWOD = "twod"
     ECHEM = "echem"
@@ -45,8 +45,8 @@ class DataType(Enum):
 
 
 class TimeMethod(Enum):
-    """Display-time handling. The canonical .nxs always stores absolute
-    timestamps; RELATIVE is a view transform applied by the GUI."""
+    """Scan-to-echem time mode; RELATIVE matches by offsets from each stream's start.
+    The canonical .nxs always stores absolute timestamps; relative display is a GUI view."""
     ABSOLUTE = "absolute"
     RELATIVE = "relative"
 
@@ -68,7 +68,7 @@ class FileRecord:
 
 @dataclass
 class Scan:
-    """A complete scan entry with all correlated data across sources."""
+    """Complete scan entry with all correlated data across sources."""
     scan_num: int
     oned: Optional[str] = None
     twod: Optional[str] = None
@@ -97,12 +97,7 @@ class Scan:
 
 @dataclass
 class ScanData:
-    """A single scan as read back from a .nxs file.
-
-    Unlike `Scan` (which references raw files on disk), this holds the data
-    itself: 1D arrays, an embedded 2D image (or an external source reference),
-    and neutron bank arrays.
-    """
+    """Single scan as read back from a .nxs file: the loaded data, not raw file paths."""
     scan_num: int
     timestamp: Optional[str] = None
     midpoint_timestamp: Optional[str] = None
@@ -115,7 +110,7 @@ class ScanData:
     voltage_max: Optional[float] = None
     current_min: Optional[float] = None
     current_max: Optional[float] = None
-    # Beam monitor record (mode/preset/integral + raw counters), if present
+    # Per-scan beam monitor scalars keyed by dataset name (integral), if present
     monitor: Optional[Dict[str, Any]] = None
     # 1D XRD: {"x": ndarray, "y": ndarray, "e": ndarray?, "source": str} or None
     oned: Optional[Dict[str, Any]] = None

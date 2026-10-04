@@ -1,7 +1,6 @@
-"""Echem analysis checks: capacity/ICI/heatmap maths and GUI wiring."""
+"""Echem analysis: capacity/ICI/heatmap maths, GUI wiring and plot-cache staleness."""
 import inspect
 import os
-import time
 import warnings
 from types import SimpleNamespace
 
@@ -13,17 +12,22 @@ from matplotlib.figure import Figure
 pytestmark = pytest.mark.gui
 
 tk = pytest.importorskip("tkinter")
+from tkinter import filedialog, messagebox  # noqa: E402
 
 import operaxn
 import operaxn.gui as gui_module
 import operaxn.output as output_module
 from operaxn.capacity import (
-    _assign_time, classify_phases, assign_cycles, compute_capacity,
+    _assign_time, assign_cycles, compute_capacity,
     plot_capacity_vs_voltage, plot_time_vs_voltage,
 )
+from operaxn.dialog import parse_scan_range
 from operaxn.gui import ButtonPanel, FileListPanel, OPERAXN
 from operaxn.heatmap import (
-    HeatmapWindow, build_xrd_matrix, echem_scan_curve, scan_positions_seconds,
+    HeatmapWindow, build_xrd_matrix, colormap_name, correlated_rows,
+    echem_scan_curve, exclude_rows, intensity_limits, neutron_axes,
+    neutron_bank_arrays, neutron_banks,
+    publication_figure, row_edges, scan_positions_seconds,
 )
 from operaxn.ici import (
     ICIWindow, PLOT_BG, _SelectorStrip, _compute_all_pulses, _compute_fit,
@@ -37,7 +41,7 @@ V0 = 3.8
 
 
 def build_cycling_df(n_cycles=2, active_s=10, rest_s=5):
-    """Constant-current blocks: +1 mA charge, rest, -1 mA discharge, rest."""
+    """Build constant-current cycles: +1 mA charge, rest, -1 mA discharge, rest."""
     current = []
     for _ in range(n_cycles):
         current += [1.0] * active_s + [0.0] * rest_s
@@ -53,7 +57,7 @@ def build_cycling_df(n_cycles=2, active_s=10, rest_s=5):
 
 @pytest.fixture
 def fit_df():
-    """Exact dV = -I(R + k*sqrt(dt)) relaxation: one 5 s pulse then 40 rest points."""
+    """Return an exact dV = -I(R + k*sqrt(dt)) relaxation: a 5-point pulse then 40 rest points."""
     active_t = np.arange(5, dtype=float)
     rest_t = 4.0 + 0.25 * np.arange(1, 41)
     rest_v = V0 - I_A * (R_TRUE + K_TRUE * np.sqrt(rest_t - rest_t[0]))
@@ -65,7 +69,7 @@ def fit_df():
 
 
 def build_oned_arrays():
-    """Three flat scans on a 50-point grid; scan 3 uses a coarser grid."""
+    """Build three flat 1D scans on a 50-point grid; scan 3 uses a coarser grid."""
     hm_x = np.linspace(10, 80, 50)
     return {
         1: {"x": hm_x, "y": np.full(50, 1.0), "timestamp": "2026-06-01 10:00:00", "echem": 3.2},
@@ -75,8 +79,24 @@ def build_oned_arrays():
     }
 
 
+def build_neutron_arrays():
+    """Build three scans of banks 1 and 3 on TOF and d grids; scan 2 lacks bank 3 d."""
+    tof = np.linspace(1000.0, 20000.0, 40)
+    d = np.linspace(0.3, 6.0, 40)
+    arrays = {}
+    for num in (1, 2, 3):
+        arrays[num] = {
+            "1": {"tof": {"x": tof, "y": np.full(40, float(num))},
+                  "d": {"x": d, "y": np.full(40, 10.0 * num)}},
+            "3": {"tof": {"x": tof, "y": np.full(40, 2.0 * num)},
+                  "d": {"x": d, "y": np.full(40, 20.0 * num)}},
+        }
+    del arrays[2]["3"]["d"]
+    return arrays
+
+
 def build_hm_scans():
-    """Three scans with display timestamps and correlation midpoints 30 s later."""
+    """Build three scans with display timestamps and correlation midpoints 30 s later."""
     return [
         {"scan_num": 1, "timestamp": "2026-06-01 10:00:00",
          "timestamp_for_correlation": pd.Timestamp("2026-06-01 10:00:30")},
@@ -87,11 +107,11 @@ def build_hm_scans():
     ]
 
 
-def test_classify_phases_rests_inherit_preceding_phase():
+def test_assign_cycles_rests_inherit_preceding_phase():
     """Rests are folded into the preceding charge/discharge phase."""
-    charge_df, discharge_df = classify_phases(build_cycling_df())
-    assert len(charge_df) == 2 * 15, f"got {len(charge_df)}"
-    assert len(discharge_df) == 2 * 15, f"got {len(discharge_df)}"
+    phases = assign_cycles(build_cycling_df())["phase"]
+    assert (phases == "charge").sum() == 2 * 15, f"got {(phases == 'charge').sum()}"
+    assert (phases == "discharge").sum() == 2 * 15, f"got {(phases == 'discharge').sum()}"
 
 
 def test_assign_cycles_detects_cycles_and_time_axis():
@@ -179,7 +199,7 @@ def test_detect_pulses_respects_max_rest():
     })
     pulses = _detect_pulses(pulse_df, max_rest=300.0)
     assert len(pulses) == 3, f"got {len(pulses)}"
-    assert bool(pulses[0]["pulse_mask"].sum() == 5 and pulses[0]["relax_mask"].sum() == 10), \
+    assert pulses[0]["pulse_mask"].sum() == 5 and pulses[0]["relax_mask"].sum() == 10, \
         "pulse masks must cover the active period"
     assert all(p["relax_end_t"] - p["pulse_end_t"] < 300 for p in pulses)
 
@@ -205,7 +225,7 @@ def test_narrow_fit_window_rejected(fit_df):
 
 
 def test_compute_all_pulses_returns_one_indexed_fit_per_pulse(fit_df):
-    """_compute_all_pulses yields one fit per detected pulse, tagged pulse_idx."""
+    """_compute_all_pulses yields one fit per detected pulse, tagged with a 1-based pulse_idx."""
     fit_pulses = _detect_pulses(fit_df, max_rest=300.0)
     results = _compute_all_pulses(fit_df, fit_pulses, lambda idx: (0.5, 3.0))
     assert len(results) == 1 and results[0]["pulse_idx"] == 1
@@ -226,6 +246,28 @@ def test_build_xrd_matrix_stacks_and_interpolates():
     assert matrix.shape == (3, 50), f"got {matrix.shape}"
     assert used == [1, 2, 3], "rows must keep scan order"
     assert np.allclose(matrix[2], 3.0), "differing grid must be interpolated"
+
+
+def test_build_xrd_matrix_skips_entries_without_data():
+    """Entries with missing or non 1-D x/y are skipped instead of crashing the heatmap."""
+    x = np.linspace(10, 80, 50)
+    _, matrix, used = build_xrd_matrix({1: {"x": None, "y": None}, 2: {"x": x, "y": np.ones(50)},
+                                        3: {"error": True}, 4: {"x": 5.0, "y": 1.0}})
+    assert used == [2] and matrix.shape == (1, 50)
+
+
+def test_axis_labels_come_from_one_set():
+    """Every window takes its TOF, d-spacing, 2θ and time labels from operaxn.config."""
+    import glob
+    import operaxn.config as cfg
+    assert (cfg.TOF_LABEL, cfg.DSPACING_LABEL, cfg.TWOTHETA_LABEL, cfg.TIME_HOURS_LABEL) == (
+        "Time of flight (μs)", "d-spacing (Å)", "2θ (°)", "Time (h)")
+    stray = ("Time of Flight", "d spacing (", "2θ (degrees)", "Time (hours)", "'t (h)'")
+    for path in glob.glob(os.path.join(os.path.dirname(cfg.__file__), "*.py")):
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        for variant in stray:
+            assert variant not in text, f"{os.path.basename(path)} still writes {variant!r}"
 
 
 def test_scan_positions_absolute_and_relative():
@@ -249,14 +291,14 @@ def test_echem_scan_curve_retains_full_resolution():
 
 
 def test_button_panel_configuration():
-    """Analysis buttons exist, precede export, and use single-codepoint emoji."""
+    """Analysis buttons exist, precede export and use single-codepoint emoji."""
     button_keys = [key for key, _, _, _ in ButtonPanel.BUTTON_CONFIGS]
     assert "capacity_plot" in button_keys
     assert "ici_analysis" in button_keys
     assert "heatmap" in button_keys
     assert button_keys.index("capacity_plot") < button_keys.index("export_plots") \
         and button_keys.index("ici_analysis") < button_keys.index("export_plots")
-    assert all("️" not in text for _, text, _, _ in ButtonPanel.BUTTON_CONFIGS)
+    assert all("\ufe0f" not in text for _, text, _, _ in ButtonPanel.BUTTON_CONFIGS)
 
 
 @pytest.mark.parametrize("attr", [
@@ -274,8 +316,7 @@ def test_app_handler_exists(attr):
 
 
 def test_ici_window_api():
-    """ICIWindow takes source selection/upload hooks; regression edits
-    auto-apply, with apply-all as the only manual action."""
+    """ICIWindow takes source/upload hooks; regression edits auto-apply, apply-all stays manual."""
     params = inspect.signature(ICIWindow.__init__).parameters
     assert "echem_sources" in params
     assert "on_add_source" in params
@@ -351,23 +392,25 @@ def test_analysis_figures_use_light_palette():
 
 
 class _FakeListbox:
-    """Minimal Tk Listbox stand-in whose delete/insert mutate a plain
-    items list (insert appends regardless of index; see is a no-op)."""
+    """Minimal Tk Listbox stand-in backed by a plain items list."""
 
     def __init__(self, items):
         self.items = list(items)
 
     def size(self):
+        """Return the item count."""
         return len(self.items)
 
     def delete(self, index):
+        """Remove the item at index."""
         del self.items[index]
 
     def insert(self, _index, item):
+        """Append item, ignoring the index."""
         self.items.append(item)
 
     def see(self, _index):
-        pass
+        """Ignore scroll requests."""
 
 
 def test_progress_cannot_replace_loaded_scan_rows():
@@ -412,26 +455,8 @@ def test_echem_sources_offers_current_bearing_datasets(monkeypatch):
     assert "voltage_only.txt" not in analysis_sources
 
 
-@pytest.fixture
-def tk_root():
-    """Withdrawn Tk root for windowed checks; Tk() startup can fail
-    transiently on busy displays, so it retries before skipping."""
-    root = None
-    for attempt in range(3):
-        try:
-            root = tk.Tk()
-            root.withdraw()
-            break
-        except Exception:
-            time.sleep(0.5)
-    if root is None:
-        pytest.skip("no display available")
-    yield root
-    root.destroy()
-
-
 def _pump(win, ms):
-    """Blocking pump of the Tk event loop for ms milliseconds."""
+    """Pump the Tk event loop for ms milliseconds, blocking the caller."""
     flag = tk.BooleanVar(win)
     win.after(ms, lambda: flag.set(True))
     win.wait_variable(flag)
@@ -483,15 +508,173 @@ def test_heatmap_window_renders_and_toggles(tk_root):
                                                     for s in ex]})
     try:
         hm.update()
-        assert bool(hm.ax_map.collections), "mesh not drawn"
-        assert hm._y_values()[1] == "Scan number", "must start in scan mode"
+        assert hm.ax_map.collections, "mesh not drawn"
+        assert hm._y_values()[1] == "Time (h)", "must start on the time axis"
+        hm._set_toggle(hm.yaxis_var, hm._y_btns, "scan")
+        assert hm._y_values()[1] == "Scan number"
         hm._set_toggle(hm.yaxis_var, hm._y_btns, "time")
         hm._set_toggle(hm.scale_var, hm._scale_btns, "log")
         hm.update()
         assert hm._y_values()[1] == "Time (h)", \
             "time toggle must resolve to the real time axis, not the fallback"
-        assert bool(hm.ax_map.collections), "time + log toggles must survive"
-        assert bool(hm.ax_v.lines), "voltage track must be plotted"
+        assert hm.ax_map.collections, "time + log toggles must survive"
+        assert hm.ax_v.lines, "voltage track must be plotted"
+        assert "correlated" in hm._scans_btns, "X-ray window shares the scan filter"
+    finally:
+        hm.destroy()
+
+
+def test_neutron_bank_helpers_select_bank_and_axis():
+    """Bank/axis helpers list banks in order and skip scans lacking the axis."""
+    arrays = build_neutron_arrays()
+    assert neutron_banks(arrays) == ["1", "3"]
+    assert neutron_axes(arrays, "3") == ["tof", "d"]
+    picked = neutron_bank_arrays(arrays, "3", "d")
+    assert sorted(picked) == [1, 3], "scan 2 has no bank 3 d data"
+    _x, matrix, used = build_xrd_matrix(picked)
+    assert matrix.shape == (2, 40) and used == [1, 3]
+    assert np.allclose(matrix[1], 60.0)
+    _x, kept, used = correlated_rows(_x, matrix, used, {3, 7})
+    assert used == [3] and np.allclose(kept, 60.0)
+    assert correlated_rows(_x, matrix, [1, 3], set()) == (None, None, [])
+    _x, kept, used = exclude_rows(_x, matrix, [1, 3], {1, 103})
+    assert used == [3] and np.allclose(kept, 60.0)
+    assert exclude_rows(_x, matrix, [1, 3], {1, 3}) == (None, None, [])
+
+
+def test_parse_scan_range_shared_grammar():
+    """One scan-range parser serves the GIF dialog, the GIF export and heatmap exclusions."""
+    assert parse_scan_range("103, 1") == [1, 103]
+    assert parse_scan_range("1-3,7") == [1, 2, 3, 7]
+    assert parse_scan_range("1-5,10-12") == [1, 2, 3, 4, 5, 10, 11, 12]
+    assert parse_scan_range("0-3,9", max_scan=5) == [1, 2, 3], "clamped to 1..max_scan"
+    assert parse_scan_range("") == [] and parse_scan_range("x,1") == []
+
+
+def test_colormap_and_intensity_helpers():
+    """Reverse flips the _r suffix; limits honour entries, ceiling and log."""
+    assert colormap_name("viridis", True) == "viridis_r"
+    assert colormap_name("YlGnBu_r", True) == "YlGnBu"
+    assert colormap_name("inferno", False) == "inferno"
+    m = np.arange(1.0, 101.0).reshape(10, 10)
+    assert intensity_limits(m) == (1.0, 100.0)
+    assert intensity_limits(m, ceiling=90.0)[1] == pytest.approx(90.1)
+    assert intensity_limits(m, vmin=5.0, vmax=50.0) == (5.0, 50.0)
+    lo, hi = intensity_limits(np.zeros((2, 2)), log=True)
+    assert lo > 0 and hi > lo
+    lo, hi = intensity_limits(np.array([[0.0, -1.0, 1.0, 100.0]]), log=True)
+    assert lo == pytest.approx(1.99) and hi == 100.0, \
+        "log floor must come from the positive values, not the zeros"
+    assert row_edges(np.array([1.0, 2.0, 3.0])) == (0.5, 3.5)
+
+
+def test_publication_figure_layout():
+    """Export figure: voltage left sharing y, rasterised map, colour bar."""
+    x = np.linspace(1.0, 5.0, 20)
+    y = np.array([1.0, 2.0, 3.0])
+    m = np.outer(y, x)
+    fig = publication_figure(x, y, m, x_label="d-spacing (Å)", y_label="Time (h)",
+                             cmap="viridis", vmin=1.0, vmax=15.0,
+                             voltage=(np.array([3.0, 3.5, 4.0]), y), title="Bank 3")
+    assert len(fig.axes) == 3
+    ax_v, ax, cax = fig.axes
+    assert ax_v.get_xlabel() == "Voltage (V)" and ax_v.get_ylabel() == "Time (h)"
+    assert ax.get_xlabel() == "d-spacing (Å)" and ax.get_title() == "Bank 3"
+    assert ax.collections[0].get_rasterized(), "map must rasterise for PDF/SVG"
+    assert ax.get_shared_y_axes().joined(ax, ax_v)
+    assert ax.get_ylim() == (0.5, 3.5)
+    assert cax.get_ylabel() == "Intensity (arb. units)"
+    for text in (ax.xaxis.label, ax.title, ax_v.xaxis.label, ax_v.yaxis.label, cax.yaxis.label):
+        assert text.get_color() == "black", "export text must be black"
+    no_v = publication_figure(x, y, m, x_label="2θ (°)", y_label="Scan number",
+                              cmap="inferno", vmin=1.0, vmax=15.0, log=True,
+                              x_range=(2.0, 4.0))
+    assert len(no_v.axes) == 2 and no_v.axes[0].get_xlim() == (2.0, 4.0)
+    assert no_v.axes[0].get_ylabel() == "Scan number"
+
+
+@pytest.mark.display
+def test_heatmap_defaults_to_scan_without_times(tk_root):
+    """Without scan times the heatmap starts on scan numbers and disables the Time toggle."""
+    hm = HeatmapWindow(tk_root, [{"scan_num": n} for n in (1, 2, 3)],
+                       oned_arrays=build_oned_arrays())
+    try:
+        assert hm.yaxis_var.get() == "scan" and hm._y_values()[1] == "Scan number"
+        assert str(hm._y_btns["time"]["state"]) == "disabled"
+    finally:
+        hm.destroy()
+
+
+@pytest.mark.display
+def test_heatmap_window_neutron_banks_and_export(tk_root, tmp_path, monkeypatch):
+    """Neutron window: per-bank maps, TOF/d toggle, ranges, colour map, export."""
+    scans = build_hm_scans()
+    for scan, volts in zip(scans, (3.2, None, 3.6)):
+        if volts is not None:
+            scan["echem"] = volts
+    hm = HeatmapWindow(tk_root, scans, neutron_arrays=build_neutron_arrays(),
+                       neutron_dspacing=True, x_range=(1.0, 4.0))
+    try:
+        hm.update()
+        assert hm.is_neutron and list(hm._bank_btns) == ["1", "3"]
+        assert hm.xaxis_var.get() == "d", "d spacing preference must seed the axis"
+        assert hm.ax_map.get_xlabel() == "d-spacing (Å)"
+        assert hm.ax_map.get_title() == "Bank 1"
+        assert hm.ax_map.get_xlim() == (1.0, 4.0), "x range must seed the entries"
+        assert hm.ax_v.lines, "per-scan voltage fallback must draw"
+
+        hm._set_toggle(hm.xaxis_var, hm._x_btns, "tof")
+        assert hm.ax_map.get_xlabel() == "Time of flight (μs)"
+        assert hm.xmin_var.get() == "" and hm.xmax_var.get() == "", \
+            "an axis change must clear the x range (units changed)"
+        hm._set_toggle(hm.bank_var, hm._bank_btns, "3")
+        assert hm.ax_map.get_title() == "Bank 3" and hm._scan_nums == [1, 2, 3]
+        hm._set_toggle(hm.xaxis_var, hm._x_btns, "d")
+        assert hm._scan_nums == [1, 3], "scan 2 has no bank 3 d pattern"
+
+        hm.cmap_var.set("inferno")
+        hm._toggle_reverse()
+        assert hm.ax_map.collections[-1].get_cmap().name == "inferno_r"
+        hm.zmin_var.set("25")
+        hm.zmax_var.set("55")
+        hm._replot()
+        assert hm.ax_map.collections[-1].get_clim() == (25.0, 55.0)
+        hm._reset_ranges()
+        assert hm.ax_map.collections[-1].get_clim() == (20.0, 60.0)
+
+        hm._set_toggle(hm.bank_var, hm._bank_btns, "1")
+        assert hm._scan_nums == [1, 2, 3]
+        hm._set_toggle(hm.scans_var, hm._scans_btns, "correlated")
+        assert hm._scan_nums == [1, 3], "scan 2 has no correlated echem"
+        hm._set_toggle(hm.yaxis_var, hm._y_btns, "scan")
+        assert hm.render_figure("1").axes[1].get_ylim() == (0.0, 4.0), \
+            "export must use the filtered rows"
+        hm._set_toggle(hm.scans_var, hm._scans_btns, "all")
+        assert hm._scan_nums == [1, 2, 3]
+        hm.exclude_var.set("1, 103")
+        hm._apply_exclusions()
+        assert hm._scan_nums == [2, 3], "excluded scans must drop out"
+        hm._set_toggle(hm.scans_var, hm._scans_btns, "correlated")
+        assert hm._scan_nums == [3], "filters combine"
+        hm.exclude_var.set("")
+        hm._apply_exclusions()
+        hm._set_toggle(hm.scans_var, hm._scans_btns, "all")
+        assert hm._scan_nums == [1, 2, 3]
+
+        single = tmp_path / "bank3.pdf"
+        monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **_k: str(single))
+        monkeypatch.setattr(messagebox, "showinfo", lambda *_a, **_k: None)
+        hm._export_figure()
+        assert single.exists() and single.stat().st_size > 0
+        via_toolbar = tmp_path / "toolbar.svg"
+        monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **_k: str(via_toolbar))
+        hm._canvas.toolbar.save_figure()
+        assert via_toolbar.exists(), "toolbar save must use the publication export"
+        base = tmp_path / "maps.png"
+        monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **_k: str(base))
+        hm._export_all_banks()
+        assert (tmp_path / "maps_bank1.png").exists()
+        assert (tmp_path / "maps_bank3.png").exists()
     finally:
         hm.destroy()
 
@@ -502,7 +685,7 @@ def test_heatmap_window_renders_and_toggles(tk_root):
 
 @pytest.fixture(autouse=True)
 def _clean_plot_cache():
-    """Plot cache is keyed on id(ax) and test axes are freed constantly."""
+    """Clear the id(ax)-keyed plot cache around each test, as test axes are freed constantly."""
     operaxn.clear_plot_cache()
     yield
     operaxn.clear_plot_cache()
@@ -650,8 +833,7 @@ def test_clear_all_clears_plot_cache():
 
 
 def test_needs_recreate_current_rebuild_matrix():
-    """A wanted current trace whose cache entry is gone or whose line is
-    detached always forces a rebuild, never a set_data no-op."""
+    """A wanted current trace with a wiped cache entry or a detached line forces a rebuild."""
     plotter = output_module._echem_plotter
     t = np.arange(10.0)
 
