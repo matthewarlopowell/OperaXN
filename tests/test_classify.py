@@ -134,3 +134,19 @@ def test_classification_manager_inhouse(inhouse_dir):
     echem_rows = out[out["echem"].notna()]
     assert len(echem_rows) == 1, str(out["echem"].tolist())
     assert os.path.basename(echem_rows["echem"].iloc[0]) == "echem.txt"
+
+
+def test_neutron_logbook_single_surname_user(tmp_path):
+    """A WISH-layout line (single surname without a comma, just before the
+    proposal) harvests users and proposal; the POLARIS layout is unchanged."""
+    wish = ('59268\tcell55 event # 1\t"5m 0s"\t"3.0059"\tPerez\t2510713\t'
+            'Fri Feb 28 16:17:29 2025\tFri Feb 28 16:22:36 2025\t24_5')
+    path = tmp_path / "logbook.txt"
+    path.write_text(wish + "\n" + _builders.DETAILED_LOGBOOK_LINE + "\n")
+    df = core.NeutronMetadataParser.parse(str(path))
+    assert df is not None and len(df) == 2, str(df)
+    rows = {r["scan_id"]: r for _, r in df.iterrows()}
+    assert rows["59268"]["users"] == "Perez", str(rows["59268"])
+    assert rows["59268"]["proposal"] == "2510713", str(rows["59268"])
+    assert rows["123456"]["users"] == "Smith,Jones", str(rows["123456"])
+    assert rows["123456"]["proposal"] == "7654321", str(rows["123456"])

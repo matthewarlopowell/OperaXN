@@ -41,16 +41,17 @@ from .classify import (
     SynchrotronFileGrouper,
     TXTClassifier,
     extract_edf_scan_fields,
+    format_profile_block,
     parse_mantid_header,
+    profile_from_mantid_nexus,
 )
-from .profiles import get_profile
 from .correlate import (
     EchemParser,
     ScanProcessor,
     format_relative_time,
     parse_relative_time,
 )
-from .nxs_writer import NXSWriter, write_standard_echem_group
+from .nxs_writer import NXSWriter, get_profile, write_standard_echem_group
 from .nxs_reader import is_canonical_nxs, load
 from .generate import (
     FileProcessor,
@@ -74,6 +75,7 @@ __all__ = [
     'NeutronFileGrouper', 'NeutronMetadataParser', 'NexusMetadataExtractor',
     'SynchrotronFileGrouper', 'TXTClassifier',
     'extract_edf_scan_fields', 'parse_mantid_header', 'get_profile',
+    'profile_from_mantid_nexus', 'format_profile_block',
     # Correlation
     'EchemParser', 'ScanProcessor', 'format_relative_time', 'parse_relative_time',
     # NeXus I/O

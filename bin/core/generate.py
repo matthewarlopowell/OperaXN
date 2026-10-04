@@ -222,7 +222,9 @@ class FileProcessor:
                 if filename.startswith("."):
                     continue
 
-                file_path = os.path.join(root, filename)
+                # normpath: a forward-slash root from the file dialog would
+                # otherwise mix separators with os.walk's tails
+                file_path = os.path.normpath(os.path.join(root, filename))
                 ext = os.path.splitext(file_path)[1].lower()
 
                 if ext == FileType.ZIP.value:

@@ -25,6 +25,7 @@ from .config import (
     LOG_FILE
 )
 from .gui import OPERAXN
+from core import format_profile_block, profile_from_mantid_nexus
 
 # ============================================================================
 # Constants
@@ -824,6 +825,17 @@ def display_dependency_check() -> int:
     return 0
 
 
+def print_instrument_profile(path: str) -> int:
+    """Print the config.INSTRUMENT_PROFILES block derived from a
+    Mantid-processed file; return 1 when the file cannot be read."""
+    try:
+        print(format_profile_block(profile_from_mantid_nexus(path)))
+    except (OSError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 # ============================================================================
 # Command Line Interface
 # ============================================================================
@@ -839,6 +851,7 @@ Examples:
   %(prog)s                           # Launch GUI
   %(prog)s --debug                   # Launch with debug logging
   %(prog)s --check-deps              # Check dependencies and exit
+  %(prog)s --profile RUN.nxs         # Print an instrument-profile block and exit
         """
     )
 
@@ -860,6 +873,13 @@ Examples:
         help='Check dependencies and exit'
     )
 
+    parser.add_argument(
+        '--profile',
+        metavar='FILE',
+        help='Print an instrument-profile block (flight path, per-bank geometry) '
+             'derived from a Mantid-processed .nxs and exit'
+    )
+
     return parser
 
 
@@ -873,6 +893,8 @@ def main(args: Optional[List[str]] = None) -> int:
     parsed_args = parser.parse_args(args)
 
     # Handle info commands
+    if parsed_args.profile:
+        return print_instrument_profile(parsed_args.profile)
     if parsed_args.check_deps:
         return display_dependency_check()
 

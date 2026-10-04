@@ -4,6 +4,7 @@ correlation and generation to canonical .nxs, and back out again via load.
 import os
 import zipfile
 
+import h5py
 import numpy as np
 import pandas as pd
 import pytest
@@ -11,7 +12,7 @@ import pytest
 import core
 
 import _builders
-from _helpers import assert_pynxtools_valid
+from _helpers import assert_pynxtools_valid, need_dataset
 
 
 # ============================================================================
@@ -450,28 +451,20 @@ def test_no_undefined_names_in_packages():
 #                         .hdf + integrated .xy files)
 #     lab_xrd_full/       laboratory XRD full dataset (1D .dat + 2D EDF +
 #                         echem: the complete workflow)
+#     polaris/            Mantid-processed POLARIS file for the instrument
+#                         profile check (POLARIS164798-164802.nxs;
+#                         test_polaris_profile_matches_mantid_file)
 #
 # The entries are placeholders for public example datasets: the assertion
 # floors are calibrated to the authors' local reference data and will be
 # recalibrated as public datasets are released. Each test skips when the
 # env var is unset or its dataset is absent.
 
-def _need(relpath):
-    """Path to a dataset under OPERAXN_TEST_DATA, or skip when absent."""
-    root = os.environ.get("OPERAXN_TEST_DATA")
-    if not root:
-        pytest.skip("OPERAXN_TEST_DATA not set")
-    path = os.path.join(root, relpath)
-    if not os.path.exists(path):
-        pytest.skip(f"{relpath} not present under {root}")
-    return path
-
-
 @pytest.mark.realdata
 def test_neutron_zip(tmp_path):
     """The neutron zip yields >50 scans and >1000 echem rows; every
     scan carries error-bearing banks and some correlate to echem."""
-    src = _need("neutron_tof.zip")
+    src = need_dataset("neutron_tof.zip")
     nxs = str(tmp_path / "neutron_real.nxs")
     ok, msgs = core.generate([src], nxs, core.DataSourceType.NEUTRON)
     assert ok, str(msgs)
@@ -495,7 +488,7 @@ def test_neutron_zip(tmp_path):
 def test_synchrotron_folder(tmp_path):
     """The synchrotron folder generates loadable scans and harvests
     the instrument name as i11-1."""
-    src = _need("synchrotron_i11")
+    src = need_dataset("synchrotron_i11")
     nxs = str(tmp_path / "synchrotron_real.nxs")
     ok, msgs = core.generate([src], nxs, core.DataSourceType.SYNCHROTRON)
     assert ok, str(msgs)
@@ -510,7 +503,7 @@ def test_synchrotron_folder(tmp_path):
 def test_lab_full_folder(tmp_path):
     """The lab XRD folder yields >400 scans with 1D patterns and >400
     with correlated echem."""
-    src = _need("lab_xrd_full")
+    src = need_dataset("lab_xrd_full")
     nxs = str(tmp_path / "lab_full_real.nxs")
     ok, msgs = core.generate([src], nxs, core.DataSourceType.INHOUSE)
     assert ok, str(msgs)
@@ -520,3 +513,115 @@ def test_lab_full_folder(tmp_path):
     assert len(with_1d) > 400, f"{len(with_1d)}/{len(fm.scans)}"
     assert len(matched) > 400, f"{len(matched)}/{len(fm.scans)}"
     assert_pynxtools_valid(nxs, "lab full")
+
+
+@pytest.mark.realdata
+def test_polaris_profile_matches_mantid_file():
+    """The shipped POLARIS constants agree with a Mantid-processed POLARIS
+    file's focussed banks (IDF-wide vs focussed means: 2 mm, 0.06 deg)."""
+    derived = core.profile_from_mantid_nexus(
+        need_dataset("polaris/POLARIS164798-164802.nxs"))
+    shipped = core.config.INSTRUMENT_PROFILES["polaris"]
+    assert derived["instrument_name"] == "POLARIS"
+    assert derived["pre_sample_flightpath_m"] == shipped["pre_sample_flightpath_m"]
+    assert sorted(derived["detector_banks"]) == sorted(shipped["detector_banks"])
+    for bank, spec in shipped["detector_banks"].items():
+        got = derived["detector_banks"][bank]
+        assert abs(got["distance_m"] - spec["distance_m"]) <= 0.0025, (bank, got)
+        assert abs(got["polar_angle_deg"] - spec["polar_angle_deg"]) <= 0.06, (bank, got)
+        assert got["azimuthal_angle_deg"] is None, (bank, got)
+    assert derived["info"]["idf_name"] == "Polaris_upgrade"
+
+
+def test_neutron_midpoint_not_floored(tmp_path):
+    """A run of odd length correlates at its exact half-second midpoint,
+    not at the midpoint floored to the second (which picked the wrong
+    electrochemistry point for 75 of 108 POLARIS runs)."""
+    src = str(tmp_path / "odd_run")
+    os.makedirs(src)
+    # 7 s run: exact midpoint 10:00:03.5, floored 10:00:03
+    with open(os.path.join(src, "logbook.txt"), "w") as f:
+        f.write("123456\tuser\tsample title\tMon Feb 05 10:00:00 2024\t"
+                "Mon Feb 05 10:00:07 2024\t7\tok\textra\n")
+    _builders.write_neutron_banks(src)
+    # Points at 03.0 s and 03.9 s: the exact midpoint is nearer 03.9
+    with open(os.path.join(src, "echem.txt"), "w") as f:
+        f.write("Time\tEwe/V\tI/mA\n"
+                "05/02/2024 09:59:00.0\t3.0000\t0.1000\n"
+                "05/02/2024 10:00:03.0\t3.0000\t0.1000\n"
+                "05/02/2024 10:00:03.9\t3.9000\t0.1000\n"
+                "05/02/2024 10:01:00.0\t3.0000\t0.1000\n")
+    scans, _ = core.process_raw([src], core.DataSourceType.NEUTRON)
+    assert len(scans) == 1
+    assert scans[0].timestamp_for_correlation == pd.Timestamp("2024-02-05 10:00:03.5")
+    assert scans[0].echem == 3.9, f"correlated at the floored midpoint: {scans[0].echem}"
+    out = str(tmp_path / "odd_run.nxs")
+    ok, msgs = core.generate([src], out, core.DataSourceType.NEUTRON)
+    assert ok, str(msgs)
+    with h5py.File(out) as f:
+        env = f["entry/scan_000001/environment"]
+        stored = {k: pd.to_datetime(env[k][()].decode()).tz_localize(None)
+                  for k in ("scan_timestamp", "midpoint_adjusted_timestamp")}
+        assert stored["scan_timestamp"] == stored["midpoint_adjusted_timestamp"]
+        assert stored["scan_timestamp"] == pd.Timestamp("2024-02-05 10:00:03.5")
+        assert abs(env["voltage"][()] - 3.9) < 1e-9
+
+
+def test_window_extrema_span_the_window(pipeline):
+    """voltage/current min and max cover every electrochemistry point inside
+    the acquisition window, both bounds inclusive: scan 1 (10:05, 120 s)
+    sees the 10:05, 10:06 and 10:07 points, and the matched value lies
+    within the range."""
+    scans, _ = pipeline
+    s1 = scans[0]
+    assert (s1.voltage_min, s1.voltage_max) == (3.75, 3.77)
+    assert (s1.current_min, s1.current_max) == (0.105, 0.107)
+    assert s1.voltage_min <= s1.echem <= s1.voltage_max
+
+
+def test_window_extrema_absent_without_exposure(tmp_path):
+    """A scan whose header carries no exposure has no acquisition window, so
+    no extrema are recorded, while the nearest-point voltage still is."""
+    src = str(tmp_path / "no_exposure")
+    os.makedirs(src)
+    lines = ["# Date 2024-02-05T10:05:00", "# tth Intensity"]
+    lines += [f"{x:.4f} {v:.4f}"
+              for x, v in zip(_builders.ONED_X, _builders.inhouse_scan_y(1))]
+    with open(os.path.join(src, "scan_001.dat"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
+    scans, _ = core.process_raw([src], core.DataSourceType.INHOUSE)
+    assert len(scans) == 1 and scans[0].exposure_time is None
+    assert scans[0].echem == 3.75
+    assert scans[0].voltage_min is None and scans[0].voltage_max is None
+
+
+def test_window_extrema_follow_relative_alignment(tmp_path, inhouse_dir):
+    """In relative mode the extrema use the same clock shift as the
+    correlation: the earliest scan midpoint maps onto the first echem point,
+    so scan 1 matches 3.70 V and its shifted window holds 3.70 to 3.71 V."""
+    out = str(tmp_path / "relative.nxs")
+    ok, msgs = core.generate([inhouse_dir], out, core.DataSourceType.INHOUSE,
+                             time_method=core.TimeMethod.RELATIVE)
+    assert ok, str(msgs)
+    s1 = core.load(out).scans[0]
+    assert s1.echem == 3.70
+    assert (s1.voltage_min, s1.voltage_max) == (3.70, 3.71)
+    assert s1.voltage_min <= s1.echem <= s1.voltage_max
+
+
+def test_synchrotron_exposure_is_the_scan_window(tmp_path):
+    """A synchrotron scan's exposure is its recorded window, end minus start
+    (readout and processing included): the detector's own count_time under a
+    device-named NXdetector (i11-1: pixium_hdf) is deliberately not used, so
+    the correlation midpoint stays at the centre of the recorded window."""
+    src = str(tmp_path / "synchrotron")
+    os.makedirs(src)
+    _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00",
+                                     "2024-02-05T10:05:39", count_time=30.0)
+    _builders.write_synchrotron_scan(src, "000002", "2024-02-05T10:10:00",
+                                     "2024-02-05T10:10:39")
+    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
+    scans, _ = core.process_raw([src], core.DataSourceType.SYNCHROTRON)
+    assert [sc.exposure_time for sc in scans] == [39.0, 39.0], \
+        [sc.exposure_time for sc in scans]

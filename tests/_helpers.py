@@ -13,6 +13,18 @@ import pandas as pd
 import pytest
 
 
+def need_dataset(relpath):
+    """Path to a dataset under OPERAXN_TEST_DATA, or skip when absent
+    (the realdata tests)."""
+    root = os.environ.get("OPERAXN_TEST_DATA")
+    if not root:
+        pytest.skip("OPERAXN_TEST_DATA not set")
+    path = os.path.join(root, relpath)
+    if not os.path.exists(path):
+        pytest.skip(f"{relpath} not present under {root}")
+    return path
+
+
 def s(dataset):
     """Scalar string dataset value."""
     v = dataset[()]

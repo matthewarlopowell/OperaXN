@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from .config import ECHEM_LOG_MIN_POINTS, ECHEM_TIME_TOLERANCE
+from .config import ECHEM_TIME_TOLERANCE
 from .model import DataSourceType, Scan, TimeMethod
 from .classify import LOGBOOK_TIME_FORMAT, NeutronFileGrouper, NeutronMetadataParser
 
@@ -449,8 +449,10 @@ class ScanProcessor:
                 neutron_files=neutron_data_files,
                 neutron_start=start_time.strftime('%Y-%m-%d %H:%M:%S'),
                 neutron_end=end_time.strftime('%Y-%m-%d %H:%M:%S'),
-                timestamp=midpoint.strftime('%Y-%m-%d %H:%M:%S'),
-                original_timestamp=midpoint.strftime('%Y-%m-%d %H:%M:%S'),
+                # Exact midpoint: odd-second runs land on .5 s. The display
+                # layer rounds labels to the second; correlation must not.
+                timestamp=str(midpoint),
+                original_timestamp=str(midpoint),
                 timestamp_for_correlation=midpoint,
                 logbook=logbook or None
             )
@@ -539,8 +541,10 @@ class ScanProcessor:
             scan.exposure_time = exposure_time
 
             if self.data_source == DataSourceType.NEUTRON:
-                # Neutron midpoint already computed from start/end
-                scan.timestamp_for_correlation = pd.to_datetime(scan.timestamp) if scan.timestamp else None
+                # The exact midpoint was set from the logbook start/end; fall
+                # back to the display timestamp only when it is missing
+                if scan.timestamp_for_correlation is None and scan.timestamp:
+                    scan.timestamp_for_correlation = pd.to_datetime(scan.timestamp)
             else:
                 if exposure_time and scan.timestamp:
                     original_ts = pd.to_datetime(scan.timestamp)
@@ -682,9 +686,10 @@ class ScanProcessor:
 
     def _annotate_echem_window(self, scan_list: List[Scan],
                                echem_df: pd.DataFrame) -> None:
-        """Fill per-scan echem window summaries: voltage/current min/max,
-        0-based indices into the sorted operando arrays, and (neutron) NXlog
-        segments. Runs before the relative-display rewrite of echem_df."""
+        """Fill the per-scan voltage/current extrema over every electrochemistry
+        point inside the acquisition window, both bounds inclusive, in the same
+        clock alignment as the nearest-point correlation (the Figure 4 window
+        summary). Runs before the relative-display rewrite of echem_df."""
         echem_timestamps = self._parse_echem_timestamps(echem_df)
         if echem_timestamps is None:
             return
@@ -709,38 +714,26 @@ class ScanProcessor:
 
         for scan in scan_list:
             start, end = self._acquisition_window(scan)
-            if start is None:
+            if start is None or end is None:
+                # No window without both bounds (XRD with unknown exposure)
                 continue
-            start = start + offset
-            end = (end + offset) if end is not None else start
+            start, end = start + offset, end + offset
 
+            # Every point with start <= t <= end, both bounds inclusive
             i0 = int(np.searchsorted(ts_values, start.to_datetime64(), side="left"))
             i1 = int(np.searchsorted(ts_values, end.to_datetime64(), side="right"))
             if i1 <= i0:
                 continue
 
-            scan.echem_index_start = i0
-            scan.echem_index_end = i1 - 1
             window_v = voltage[i0:i1]
-            scan.voltage_min = float(np.nanmin(window_v))
-            scan.voltage_max = float(np.nanmax(window_v))
-            window_i = current[i0:i1] if current is not None else None
-            has_current = window_i is not None and not np.all(np.isnan(window_i))
-            if has_current:
-                scan.current_min = float(np.nanmin(window_i))
-                scan.current_max = float(np.nanmax(window_i))
-
-            if (self.data_source == DataSourceType.NEUTRON
-                    and i1 - i0 >= ECHEM_LOG_MIN_POINTS):
-                seg_ts = echem_timestamps.iloc[i0:i1]
-                segment = {
-                    "start": seg_ts.iloc[0].isoformat(),
-                    "time_s": (seg_ts - seg_ts.iloc[0]).dt.total_seconds().to_numpy(),
-                    "voltage": window_v.copy(),
-                }
-                if has_current:
-                    segment["current"] = window_i.copy()
-                scan.echem_segment = segment
+            if not np.all(np.isnan(window_v)):
+                scan.voltage_min = float(np.nanmin(window_v))
+                scan.voltage_max = float(np.nanmax(window_v))
+            if current is not None:
+                window_i = current[i0:i1]
+                if not np.all(np.isnan(window_i)):
+                    scan.current_min = float(np.nanmin(window_i))
+                    scan.current_max = float(np.nanmax(window_i))
 
     def _apply_relative_time(self, scan_list: List[Scan], echem_df: pd.DataFrame) -> None:
         """Replace absolute timestamps with HH:MM:SS relative strings for display."""

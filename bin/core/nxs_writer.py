@@ -3,16 +3,22 @@ NeXus/HDF5 file writer for the core pipeline — schema 4.0, definition 1.0.0.
 
 Layout conforms to the custom application definitions shipped in
 definitions/ (NXoperando_monopd / NXoperando_tofnpd; validated against
-the NXDL schema by tests/test_nxdl.py):
+the NXDL schema by tests/test_nxdl.py). Every group is created with HDF5
+link creation-order tracking and its members are written in the order
+below: the ratified NXmonopd / NXtofnpd sequence first, each OperaXN
+addition directly after the item it extends. Validators ignore member
+order; this is for people and viewers reading the file.
 
 /entry (NXentry)                      one entry for the whole experiment
+    title, start_time, end_time       ISO 8601
     definition = NXoperando_monopd | NXoperando_tofnpd
-    title, start_time, end_time, experiment_identifier
+    experiment_identifier             when harvestable
+    process (NXprocess)               generator + correlation provenance
     pre_sample_flightpath (m)         tofnpd only, from the instrument profile
-    program_name (@version)           generator provenance
-    process (NXprocess)               correlation provenance
+    user (NXuser)                     when harvestable (logbook / beamline file)
     instrument (NXinstrument)         harvested + instrument profile; static
-        name, source (NXsource), crystal (NXcrystal), detector (NXdetector)
+        name, source (NXsource: type/name/probe), crystal (NXcrystal),
+        detector (NXdetector)
             detector_number/distance/polar_angle/azimuthal_angle [nBank]
                                       tofnpd bank geometry from the profile
         edf_metadata / synchrotron_metadata (full raw harvests, NXcollection)
@@ -21,23 +27,32 @@ the NXDL schema by tests/test_nxdl.py):
     cycling_protocol (NXnote)         technique (+ voltage window, C_rate,
                                       instrument, software, raw_data_file);
                                       user-supplied, omitted without technique
-    user (NXuser)                     when harvestable (logbook / beamline file)
+    monitor (NXmonitor)               tofnpd: mode (timer|monitor) + every
+                                      monitor element's detector_number/
+                                      distance/polar_angle/azimuthal_angle
+                                      from the instrument profile; in-house
+                                      monopd: mode timer + the preset every
+                                      acquisition shares
     operando_electrochemistry (NXdata)      time (s, @start ISO)/voltage/current
     standard_electrochemistry (NXenvironment)  file_NNN NXdata children
-    scan_000001..scan_N (NXsubentry)  per acquisition
-        definition = NXmonopd | NXtofnpd (semantic pointer)
-        title, start_time, end_time (ISO 8601)
-        environment (NXenvironment)   scan_timestamp, voltage/current
-                                      (+units), window min/max, capacity
-                                      (mAh, reserved), echem index pointers,
-                                      voltage_log/current_log (NXlog)
-        monitor (NXmonitor)           mode/preset/integral + raw counters
+    scan_000001..scan_N (NXsubentry)  per acquisition, numeric order: only
+                                      what varies per acquisition
         instrument                    soft link to /entry/instrument
-        data (NXdata)                 XRD: polar_angle/data/errors
+        environment (NXenvironment)   start_time/end_time (the acquisition
+                                      window), voltage/current (+units),
+                                      window min/max, scan_timestamp,
+                                      midpoint_adjusted_timestamp,
+                                      voltage_timestamp, exposure_time,
+                                      logbook_entry (neutron)
+        monitor (NXmonitor)           in-house acquisitions whose EDF header
+                                      carries a positive Monitor counter:
+                                      integral
+        data (NXdata)                 XRD: polar_angle/data/data_errors
         image_source (NXnote)         2D image reference (+image_data NXdata
                                       when embedding was chosen)
         bank_N / bank_N_d (NXdata)    neutron: one group per bank and axis
-                                      family (TOF / d-spacing)
+                                      family; data/data_errors then the TOF or
+                                      d-spacing axis
 
 Known, deliberate deviations from NXmonopd/NXtofnpd (documented in the
 definitions): processed intensities are NX_NUMBER, not NX_INT raw counts;
@@ -48,35 +63,36 @@ offset), written via _iso(); string fallbacks preserve unparseable
 values verbatim.
 """
 
-import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import h5py
 import numpy as np
 import pandas as pd
 
-from .config import (DEFINITION_URL_BASE, DEFINITION_VERSION,
-                     ECHEM_TIME_TOLERANCE, GENERATOR_NAME, GENERATOR_VERSION)
+from .config import (DEFAULT_PROFILES, DEFINITION_URL_BASE, DEFINITION_VERSION,
+                     GENERATOR_NAME, GENERATOR_VERSION, INSTRUMENT_PROFILES)
 from .classify import extract_edf_scan_fields, parse_mantid_header
 from .correlate import EchemParser
 from .model import DataSourceType, Scan
-from .profiles import get_profile
 from .readers import FABIO_AVAILABLE, DataReaderFactory, HDFReader, fabio
 
 logger = logging.getLogger(__name__)
 
-# Header fields excluded from the *global* EDF metadata dump. Per-scan fields
-# (monitor counters, exposure) are harvested separately by
-# classify.extract_edf_scan_fields — excluded here only because they vary
-# per scan and would be misleading as experiment-wide values.
+# Header fields excluded from the *global* EDF metadata dump: they vary per
+# exposure (beam-monitor counters, exposure time, image name) and would be
+# misleading as experiment-wide values. Only the Monitor counter is used, per
+# scan, for the subentry monitor integral (classify.extract_edf_scan_fields);
+# the Pilatus counters are the detector's own totals and are not recorded.
 EDF_EXCLUDE_FIELDS = {
     'Date', 'ExposureTime', 'Image', 'Monitor', 'Intensity1', 'title',
     'SumForIntensity1', 'TransmittedFlux', 'Saturation',
     'pilai0', 'pilai1', 'pilct0', 'pilct1', 'pilroi0', 'pilroi1', 'Pil_Roi0'
 }
-NXS_EXCLUDE_FIELDS = {'start_time', 'end_time', 'count_time', 'scan_identifier'}
+# Per-scan items of a source scan .nxs (the window and the run number live
+# in the subentries); count_time stays, it is a detector setting
+NXS_EXCLUDE_FIELDS = {'start_time', 'end_time', 'scan_identifier'}
 
 # Targeted pulls from a source synchrotron .nxs for the NXinstrument slots
 SYNCHROTRON_FIELD_PATHS = {
@@ -236,6 +252,9 @@ _SOURCE_TYPES = (
 )
 _SOURCE_TYPE_CANONICAL = {t.lower(): t for t in _SOURCE_TYPES}
 
+# NXtofnpd monitor/mode enumeration; any other profile value is skipped
+MONITOR_MODES = ('monitor', 'timer')
+
 # entry/cycling_protocol (NXnote) fields, in file order:
 # (kwarg key, dataset name, caster, units). `technique` is required within
 # the group — the writer omits the whole group when it is empty. The GUI's
@@ -313,6 +332,20 @@ def _iso(value: Any) -> Optional[str]:
     return ts.to_pydatetime().astimezone().isoformat()
 
 
+def _nx_group(parent: h5py.Group, name: str, nx_class: str) -> h5py.Group:
+    """Create an NX_class-tagged group that records member creation order,
+    so the file lists in definition order rather than alphabetically."""
+    group = parent.create_group(name, track_order=True)
+    group.attrs['NX_class'] = nx_class
+    return group
+
+
+def _bank_sort_key(item: Tuple[Any, Any]) -> Tuple[int, Any]:
+    """Numeric bank keys first, in numeric order; other keys after, as text."""
+    key = str(item[0])
+    return (0, int(key)) if key.isdigit() else (1, key)
+
+
 def write_echem_series(group: h5py.Group, echem_df: pd.DataFrame) -> None:
     """Write an EchemParser DataFrame into an NXdata group: float seconds +
     time/@start origin (NXlog convention); an all-NaN current is omitted."""
@@ -329,7 +362,6 @@ def write_echem_series(group: h5py.Group, echem_df: pd.DataFrame) -> None:
 
     group.attrs['signal'] = 'voltage'
     group.attrs['axes'] = 'time'
-    group.attrs['time_indices'] = 0
 
     if 'current' in echem_df.columns:
         current = pd.to_numeric(echem_df['current'], errors='coerce').to_numpy(dtype=float)
@@ -346,15 +378,13 @@ def write_standard_echem_group(parent: h5py.Group,
     used by NXSWriter and the GUI's add-echem-after-load path."""
     if 'standard_electrochemistry' in parent:
         del parent['standard_electrochemistry']
-    container = parent.create_group('standard_electrochemistry')
-    container.attrs['NX_class'] = 'NXenvironment'
+    container = _nx_group(parent, 'standard_electrochemistry', 'NXenvironment')
     container.attrs['num_files'] = len(datasets)
     container.create_dataset(
         'description', data='Additional (non-correlated) electrochemistry files')
 
     for index, item in enumerate(datasets, start=1):
-        group = container.create_group(f'file_{index:03d}')
-        group.attrs['NX_class'] = 'NXdata'
+        group = _nx_group(container, f'file_{index:03d}', 'NXdata')
         group.attrs['source_file'] = str(item.get('source_file') or 'echem')
         write_echem_series(group, item['data'])
     return container
@@ -363,6 +393,21 @@ def write_standard_echem_group(parent: h5py.Group,
 # ============================================================================
 # Writer
 # ============================================================================
+
+def get_profile(data_source: DataSourceType,
+                instrument_name: Optional[str] = None) -> Dict[str, Any]:
+    """Instrument profile (config.INSTRUMENT_PROFILES) for a harvested
+    instrument name, falling back to the data-source default; a copy safe
+    to update with harvested values, which always win."""
+    profile = dict(DEFAULT_PROFILES.get(data_source.value, {}))
+    if instrument_name:
+        named = INSTRUMENT_PROFILES.get(str(instrument_name).strip().lower())
+        if named:
+            profile.update(named)
+        else:
+            profile["instrument_name"] = str(instrument_name)
+    return profile
+
 
 class NXSWriter:
     """Writes the canonical schema-4.0 NeXus/HDF5 file."""
@@ -397,43 +442,29 @@ class NXSWriter:
         """Write the full canonical file: metadata, scans, and echem layers."""
         harvest = self._harvest_experiment_metadata(scans)
 
-        with h5py.File(output_path, 'w') as f:
+        # track_order: members list in the order written here (the NXmonopd /
+        # NXtofnpd sequence, additions after the item they extend) instead
+        # of HDF5's default alphabetical index; see the module docstring
+        with h5py.File(output_path, 'w', track_order=True) as f:
             f.attrs['NX_class'] = 'NXroot'
             f.attrs['file_name'] = os.path.basename(output_path)
             f.attrs['file_time'] = _iso(pd.Timestamp.now())
             f.attrs['default'] = 'entry'
 
-            entry = f.create_group('entry')
-            entry.attrs['NX_class'] = 'NXentry'
-
-            definition = ('NXoperando_tofnpd'
-                          if self.data_source == DataSourceType.NEUTRON
-                          else 'NXoperando_monopd')
-            def_ds = entry.create_dataset('definition', data=definition)
-            def_ds.attrs['version'] = DEFINITION_VERSION
-            def_ds.attrs['URL'] = f'{DEFINITION_URL_BASE}{definition}.nxdl.xml'
-
-            prog_ds = entry.create_dataset('program_name', data=GENERATOR_NAME)
-            prog_ds.attrs['version'] = GENERATOR_VERSION
-            prog_ds.attrs['configuration'] = json.dumps({
-                'data_source': self.data_source.value,
-                'correlation_method': self.correlation_method,
-                'include_2d_images': self.include_2d_images,
-                'max_display_size': self.max_display_size,
-            })
-
-            self._write_process(entry, scans)
+            entry = _nx_group(f, 'entry', 'NXentry')
             self._write_entry_fields(entry, scans, harvest)
+            self._write_process(entry, scans)
+            self._write_flightpath(entry, harvest)
+            self._write_user(entry, harvest)
             self._write_instrument(entry, scans, harvest)
             self._write_sample(entry, harvest)
             self._write_cycling_protocol(entry, echem_df)
-            self._write_user(entry, harvest)
-
-            for scan in scans:
-                self._write_scan(entry, scan, harvest)
-
+            self._write_monitor(entry, scans, harvest)
             self._write_operando_echem(entry, echem_df)
             self._write_standard_echem(entry, standard_echem_files)
+
+            for scan in scans:
+                self._write_scan(entry, scan)
 
         logger.info(f"NeXus file written to {output_path}")
 
@@ -480,28 +511,18 @@ class NXSWriter:
 
     def _write_process(self, entry: h5py.Group, scans: List[Scan]) -> None:
         """NXprocess with generator and correlation provenance."""
-        process = entry.create_group('process')
-        process.attrs['NX_class'] = 'NXprocess'
+        process = _nx_group(entry, 'process', 'NXprocess')
         process.create_dataset('program', data=GENERATOR_NAME)
         process.create_dataset('version', data=GENERATOR_VERSION)
         process.create_dataset('date', data=_iso(pd.Timestamp.now()))
         process.create_dataset('data_source', data=self.data_source.value)
         process.create_dataset('correlation_method', data=self.correlation_method)
-        tolerance = process.create_dataset('echem_time_tolerance',
-                                           data=float(ECHEM_TIME_TOLERANCE))
-        tolerance.attrs['units'] = 's'
         process.create_dataset('total_scans', data=len(scans))
-        # 2D options only apply to the XRD definitions; NXoperando_tofnpd
-        # does not declare them
-        if self.data_source != DataSourceType.NEUTRON:
-            process.create_dataset('twod_included', data=self.include_2d_images)
-            if self.include_2d_images and self.max_display_size > 0:
-                process.create_dataset('twod_max_display_size',
-                                       data=self.max_display_size)
 
     def _write_entry_fields(self, entry: h5py.Group, scans: List[Scan],
                             harvest: Dict[str, Any]) -> None:
-        """Entry title, time window, and identifier (user values win)."""
+        """Entry scalars in NXmonopd / NXtofnpd order: title, time window,
+        definition, then the identifier."""
         title = (self.title or harvest.get('run_title') or harvest.get('title')
                  or 'operando diffraction experiment')
         entry.create_dataset('title', data=str(title))
@@ -517,38 +538,45 @@ class NXSWriter:
             end = max(ends, key=_ts_sort_key) if ends else max(starts, key=_ts_sort_key)
             entry.create_dataset('end_time', data=_iso(end) or str(end))
 
+        definition = ('NXoperando_tofnpd'
+                      if self.data_source == DataSourceType.NEUTRON
+                      else 'NXoperando_monopd')
+        def_ds = entry.create_dataset('definition', data=definition)
+        def_ds.attrs['version'] = DEFINITION_VERSION
+        def_ds.attrs['URL'] = f'{DEFINITION_URL_BASE}{definition}.nxdl.xml'
+
         identifier = harvest.get('proposal') or harvest.get('experiment_identifier')
         if identifier:
             entry.create_dataset('experiment_identifier', data=str(identifier))
 
-        # NXtofnpd moderator-to-sample flight path; profile placeholder None
-        # is skipped so nothing is fabricated
+    def _write_flightpath(self, entry: h5py.Group, harvest: Dict[str, Any]) -> None:
+        """NXtofnpd moderator-to-sample flight path; the profile placeholder
+        None is skipped so nothing is fabricated."""
         flightpath = harvest.get('pre_sample_flightpath_m')
-        if self.data_source == DataSourceType.NEUTRON and flightpath is not None:
-            try:
-                ds = entry.create_dataset('pre_sample_flightpath',
-                                          data=float(flightpath))
-                ds.attrs['units'] = 'm'
-            except (ValueError, TypeError):
-                logger.warning(f"Skipping non-numeric pre_sample_flightpath "
-                               f"{flightpath!r}")
+        if self.data_source != DataSourceType.NEUTRON or flightpath is None:
+            return
+        try:
+            ds = entry.create_dataset('pre_sample_flightpath', data=float(flightpath))
+            ds.attrs['units'] = 'm'
+        except (ValueError, TypeError):
+            logger.warning(f"Skipping non-numeric pre_sample_flightpath "
+                           f"{flightpath!r}")
 
     def _write_instrument(self, entry: h5py.Group, scans: List[Scan],
                           harvest: Dict[str, Any]) -> None:
         """NXinstrument: source, crystal, detector, and raw-harvest collections."""
-        inst = entry.create_group('instrument')
-        inst.attrs['NX_class'] = 'NXinstrument'
+        inst = _nx_group(entry, 'instrument', 'NXinstrument')
         # NeXus linking convention: the linked-to object names its own path
         # so consumers can tell the original from the per-scan soft links
         inst.attrs['target'] = '/entry/instrument'
         inst.create_dataset('name', data=str(harvest.get('instrument_name', 'unknown')))
 
-        source = inst.create_group('source')
-        source.attrs['NX_class'] = 'NXsource'
-        source.create_dataset('name', data=str(harvest.get('source_name', 'unknown')))
+        # NXsource fields in NXmonopd order: type, name, probe
+        source = _nx_group(inst, 'source', 'NXsource')
         source_type = str(harvest.get('source_type', 'unknown'))
         source.create_dataset(
             'type', data=_SOURCE_TYPE_CANONICAL.get(source_type.lower(), source_type))
+        source.create_dataset('name', data=str(harvest.get('source_name', 'unknown')))
         source.create_dataset('probe', data=str(harvest.get('probe', 'x-ray')))
 
         # NXcrystal wavelength (monochromatic sources); EDF stores metres
@@ -561,15 +589,23 @@ class NXSWriter:
         elif 'wavelength' in harvest:
             wavelength = harvest['wavelength']
         if wavelength and self.data_source != DataSourceType.NEUTRON:
-            crystal = inst.create_group('crystal')
-            crystal.attrs['NX_class'] = 'NXcrystal'
+            crystal = _nx_group(inst, 'crystal', 'NXcrystal')
             ds = crystal.create_dataset('wavelength', data=float(wavelength))
             ds.attrs['units'] = 'angstrom'
 
-        detector = inst.create_group('detector')
-        detector.attrs['NX_class'] = 'NXdetector'
+        # The detector group is created on first write, so a source with no
+        # detector metadata and no profile geometry leaves no empty group
+        detector: Optional[h5py.Group] = None
+
+        def detector_group() -> h5py.Group:
+            nonlocal detector
+            if detector is None:
+                detector = _nx_group(inst, 'detector', 'NXdetector')
+            return detector
+
         detector_fields = {
-            'description': harvest.get('detector_model'),
+            # EDF detector model (laboratory) or the profile's description
+            'description': harvest.get('detector_model') or harvest.get('detector_description'),
             # EDF SampleDistance only: the synchrotron detector_distance
             # carries no unit at source, so the typed NX_LENGTH slot stays
             # empty (the verbatim value remains in synchrotron_metadata)
@@ -589,22 +625,21 @@ class NXSWriter:
         for name, value in detector_fields.items():
             if value is not None:
                 try:
-                    ds = detector.create_dataset(name, data=float(value))
+                    ds = detector_group().create_dataset(name, data=float(value))
                     if detector_units.get(name):
                         ds.attrs['units'] = detector_units[name]
                 except (ValueError, TypeError):
-                    detector.create_dataset(name, data=str(value))
+                    detector_group().create_dataset(name, data=str(value))
 
         if self.data_source == DataSourceType.NEUTRON:
-            self._write_bank_geometry(detector, harvest.get('detector_banks'))
+            self._write_bank_geometry(detector_group, harvest.get('detector_banks'))
 
         # Full raw harvests preserved as collections
         for key, group_name in (('_edf_global', 'edf_metadata'),
                                 ('_nxs_global', 'synchrotron_metadata')):
             dump = harvest.get(key)
             if dump:
-                grp = inst.create_group(group_name)
-                grp.attrs['NX_class'] = 'NXcollection'
+                grp = _nx_group(inst, group_name, 'NXcollection')
                 for k, v in dump.items():
                     if v is None:
                         continue
@@ -615,8 +650,7 @@ class NXSWriter:
 
     def _write_sample(self, entry: h5py.Group, harvest: Dict[str, Any]) -> None:
         """NXsample; the dialog's sample field overrides harvested names."""
-        sample = entry.create_group('sample')
-        sample.attrs['NX_class'] = 'NXsample'
+        sample = _nx_group(entry, 'sample', 'NXsample')
         # Harvested values (e.g. the EDF Comment header) are stored verbatim,
         # even when the instrument leaves a trailing template separator
         name = (self.sample_name or harvest.get('comment')
@@ -639,40 +673,50 @@ class NXSWriter:
                                f"{self.sample_preparation_date!r} (expected ISO 8601)")
 
     @staticmethod
-    def _write_bank_geometry(detector: h5py.Group,
-                             banks: Optional[Dict[Any, Dict[str, Any]]]) -> None:
-        """NXtofnpd per-bank geometry arrays [nBank] from the instrument
-        profile. All-or-skip per key: an array is written only when every
-        bank supplies that key; detector_number iff at least one array is."""
-        if not banks:
+    def _write_bank_geometry(group: Union[h5py.Group, Callable[[], h5py.Group]],
+                             table: Optional[Dict[Any, Dict[str, Any]]],
+                             what: str = 'detector') -> None:
+        """NXtofnpd geometry arrays from a profile table keyed by element
+        number: detector_number, then distance/polar_angle/azimuthal_angle.
+        Used for the per-bank detector [nBank] and the monitor elements
+        [nMon]. All-or-skip per key: an array is written only when every
+        element supplies that key; detector_number iff at least one array is.
+        group may be a factory, called only when an array is written."""
+        if not table:
             return
         try:
-            by_number = {int(b): (spec or {}) for b, spec in banks.items()}
+            by_number = {int(b): (spec or {}) for b, spec in table.items()}
         except (ValueError, TypeError):
-            logger.warning("Skipping detector geometry: bank keys are not integers")
+            logger.warning(f"Skipping {what} geometry: keys are not integers")
             return
         numbers = sorted(by_number)
         ordered = [by_number[b] for b in numbers]
 
+        # NXtofnpd order: detector_number, distance, polar_angle,
+        # azimuthal_angle. The arrays are gathered first so detector_number
+        # can lead yet still be written only when at least one array is.
         arrays = (('distance', 'distance_m', 'm'),
                   ('polar_angle', 'polar_angle_deg', 'degrees'),
                   ('azimuthal_angle', 'azimuthal_angle_deg', 'degrees'))
-        wrote_any = False
+        complete = []
         for name, key, units in arrays:
-            values = [bank.get(key) for bank in ordered]
+            values = [spec.get(key) for spec in ordered]
             if any(v is None for v in values):
                 continue
             try:
                 data = np.asarray([float(v) for v in values], dtype=float)
             except (ValueError, TypeError):
-                logger.warning(f"Skipping detector {name}: non-numeric bank value")
+                logger.warning(f"Skipping {what} {name}: non-numeric value")
                 continue
-            ds = detector.create_dataset(name, data=data)
+            complete.append((name, data, units))
+        if not complete:
+            return
+        target = group() if callable(group) else group
+        target.create_dataset('detector_number',
+                              data=np.asarray(numbers, dtype=np.int64))
+        for name, data, units in complete:
+            ds = target.create_dataset(name, data=data)
             ds.attrs['units'] = units
-            wrote_any = True
-        if wrote_any:
-            detector.create_dataset('detector_number',
-                                    data=np.asarray(numbers, dtype=np.int64))
 
     def _write_cycling_protocol(self, entry: h5py.Group,
                                 echem_df: pd.DataFrame = None) -> None:
@@ -697,8 +741,7 @@ class NXSWriter:
             if sources:
                 protocol['raw_data_file'] = sources
 
-        note = entry.create_group('cycling_protocol')
-        note.attrs['NX_class'] = 'NXnote'
+        note = _nx_group(entry, 'cycling_protocol', 'NXnote')
         for key, name, caster, units in CYCLING_PROTOCOL_FIELDS:
             value = protocol.get(key)
             if _is_blank(value):
@@ -713,48 +756,58 @@ class NXSWriter:
             if units:
                 ds.attrs['units'] = units
 
+    def _write_monitor(self, entry: h5py.Group, scans: List[Scan],
+                       harvest: Dict[str, Any]) -> None:
+        """Entry-level beam monitor record. tofnpd: the counting mode and the
+        geometry of every monitor element from the profile (none for an
+        unprofiled instrument). In-house monopd: acquisitions count to a time
+        preset, so mode is timer plus the preset when every acquisition
+        shares one exposure. Synchrotron sources record none."""
+        if self.data_source == DataSourceType.NEUTRON:
+            mode = harvest.get('monitor_mode')
+            if _is_blank(mode):
+                return
+            mode = str(mode).strip()
+            if mode not in MONITOR_MODES:
+                logger.warning(f"Skipping monitor: mode {mode!r} not in {MONITOR_MODES}")
+                return
+            monitor = _nx_group(entry, 'monitor', 'NXmonitor')
+            monitor.create_dataset('mode', data=mode)
+            self._write_bank_geometry(monitor, harvest.get('monitors'), 'monitor')
+        elif self.data_source == DataSourceType.INHOUSE:
+            exposures = {round(float(s.exposure_time), 6) for s in scans
+                         if s.exposure_time is not None}
+            if not exposures:
+                return
+            monitor = _nx_group(entry, 'monitor', 'NXmonitor')
+            monitor.create_dataset('mode', data='timer')
+            if len(exposures) == 1:
+                preset = monitor.create_dataset('preset', data=exposures.pop())
+                preset.attrs['units'] = 's'
+
     @staticmethod
     def _write_user(entry: h5py.Group, harvest: Dict[str, Any]) -> None:
         """NXuser, only when a name was harvestable."""
         user_name = harvest.get('users') or harvest.get('user')
         if user_name:
-            user = entry.create_group('user')
-            user.attrs['NX_class'] = 'NXuser'
+            user = _nx_group(entry, 'user', 'NXuser')
             user.create_dataset('name', data=str(user_name))
 
     # --- per-scan subentries ---
 
-    def _write_scan(self, entry: h5py.Group, scan: Scan,
-                    harvest: Dict[str, Any]) -> None:
-        """One scan_N NXsubentry with environment, monitor, and data groups."""
-        sub = entry.create_group(f'scan_{scan.scan_num:06d}')
-        sub.attrs['NX_class'] = 'NXsubentry'
+    def _write_scan(self, entry: h5py.Group, scan: Scan) -> None:
+        """One scan_N NXsubentry: a soft link to the shared instrument, then
+        what varies per acquisition: its environment (time window + cell
+        state), the EDF beam-monitor record when the header carries one,
+        and its diffraction data."""
+        sub = _nx_group(entry, f'scan_{scan.scan_num:06d}', 'NXsubentry')
         sub.attrs['scan_number'] = scan.scan_num
 
-        if scan.neutron_files:
-            definition = 'NXtofnpd'
-        else:
-            definition = 'NXmonopd'
-        sub.create_dataset('definition', data=definition)
-
-        title = None
-        if scan.logbook:
-            title = scan.logbook.get('run_title')
-        sub.create_dataset('title', data=str(title or f'scan {scan.scan_num}'))
-
-        # start_time is the acquisition start; for neutron scans the display
-        # timestamp is the logbook midpoint and lives in environment instead
-        start, end = _scan_window(scan)
-        if start:
-            sub.create_dataset('start_time', data=_iso(start) or str(start))
-        if end is not None:
-            sub.create_dataset('end_time', data=_iso(end) or str(end))
-
-        # Instrument: linked, not copied
+        # Instrument: linked, not copied; the parents put it before the data
         sub['instrument'] = h5py.SoftLink('/entry/instrument')
 
         self._write_environment(sub, scan)
-        self._write_monitor(sub, scan)
+        self._write_scan_monitor(sub, scan)
 
         if scan.oned or scan.twod:
             self._write_xrd_data(sub, scan)
@@ -762,11 +815,11 @@ class NXSWriter:
         if scan.neutron_files:
             self._write_neutron_banks(sub, scan)
 
-    @classmethod
-    def _write_environment(cls, sub: h5py.Group, scan: Scan) -> None:
-        """Electrochemical state at acquisition time (the operando extension)."""
-        env = sub.create_group('environment')
-        env.attrs['NX_class'] = 'NXenvironment'
+    @staticmethod
+    def _write_environment(sub: h5py.Group, scan: Scan) -> None:
+        """Acquisition window plus the electrochemical state of the cell
+        during it (the operando extension)."""
+        env = _nx_group(sub, 'environment', 'NXenvironment')
 
         def scalar(name: str, value: Optional[float], units: str) -> None:
             if value is None:
@@ -779,83 +832,47 @@ class NXSWriter:
             if iso:
                 env.create_dataset(name, data=iso)
 
-        # Display timestamp (neutron: the logbook midpoint); required by the
-        # definitions, so unparseable values are kept verbatim like start_time
-        scan_ts = scan.original_timestamp or scan.timestamp
-        if scan_ts:
-            env.create_dataset('scan_timestamp', data=_iso(scan_ts) or str(scan_ts))
+        # Field order follows the NXoperando definitions: the acquisition
+        # window first. start is the acquisition start; for neutron scans the
+        # display timestamp is the logbook midpoint (scan_timestamp below).
+        start, end = _scan_window(scan)
+        if start:
+            env.create_dataset('start_time', data=_iso(start) or str(start))
+        if end is not None:
+            env.create_dataset('end_time', data=_iso(end) or str(end))
         scalar('voltage', scan.echem, 'V')
         scalar('current', scan.current, 'mA')
         scalar('voltage_min', scan.voltage_min, 'V')
         scalar('voltage_max', scan.voltage_max, 'V')
         scalar('current_min', scan.current_min, 'mA')
         scalar('current_max', scan.current_max, 'mA')
-        scalar('capacity', scan.capacity, 'mAh')
-        date('voltage_timestamp', scan.echem_timestamp)
+        # Display timestamp (neutron: the logbook midpoint); required by the
+        # definitions, so unparseable values are kept verbatim like start_time
+        scan_ts = scan.original_timestamp or scan.timestamp
+        if scan_ts:
+            env.create_dataset('scan_timestamp', data=_iso(scan_ts) or str(scan_ts))
         date('midpoint_adjusted_timestamp', scan.timestamp_for_correlation)
+        date('voltage_timestamp', scan.echem_timestamp)
         scalar('exposure_time', scan.exposure_time, 's')
-        # File names use first/last: "_end" is a reserved NeXus suffix
-        if scan.echem_index_start is not None:
-            env.create_dataset('echem_index_first', data=int(scan.echem_index_start))
-        if scan.echem_index_end is not None:
-            env.create_dataset('echem_index_last', data=int(scan.echem_index_end))
         if scan.logbook and scan.logbook.get('full_line'):
             env.create_dataset('logbook_entry', data=str(scan.logbook['full_line']))
 
-        segment = scan.echem_segment
-        if segment:
-            cls._write_nxlog(env, 'voltage_log', segment, segment['voltage'], 'V')
-            if segment.get('current') is not None:
-                cls._write_nxlog(env, 'current_log', segment,
-                                 segment['current'], 'mA')
-
-    @staticmethod
-    def _write_nxlog(env: h5py.Group, name: str, segment: Dict[str, Any],
-                     values: Any, value_units: str) -> None:
-        """NXlog with float-second time (+@start ISO origin) and value arrays."""
-        log = env.create_group(name)
-        log.attrs['NX_class'] = 'NXlog'
-        time_ds = log.create_dataset(
-            'time', data=np.asarray(segment['time_s'], dtype=float))
-        time_ds.attrs['units'] = 's'
-        time_ds.attrs['start'] = _iso(segment['start'])
-        value_ds = log.create_dataset('value', data=np.asarray(values, dtype=float))
-        value_ds.attrs['units'] = value_units
-
-    def _write_monitor(self, sub: h5py.Group, scan: Scan) -> None:
-        """Beam monitor record: EDF counters when available, timer fallback."""
-        monitor = sub.create_group('monitor')
-        monitor.attrs['NX_class'] = 'NXmonitor'
-
-        counters: Dict[str, float] = {}
-        if scan.twod and str(scan.twod).lower().endswith('.edf'):
-            counters = extract_edf_scan_fields(str(scan.twod)).get('monitor', {})
-
-        monitor.create_dataset('mode', data='timer')
-        if scan.exposure_time is not None:
-            preset = monitor.create_dataset('preset', data=float(scan.exposure_time))
-            preset.attrs['units'] = 's'
-
-        # Best available integral: first positive counter in preference order
-        integral = None
-        for key in ('Monitor', 'pilct1', 'pilai1', 'Intensity1'):
-            val = counters.get(key)
-            if val:
-                integral = float(val)
-                break
-        if integral is not None:
-            integral_ds = monitor.create_dataset('integral', data=integral)
-            integral_ds.attrs['units'] = 'counts'
-
-        # Keep every raw counter — nothing harvested is discarded
-        for key, val in counters.items():
-            try:
-                monitor.create_dataset(key, data=float(val))
-            except Exception:
-                pass
+    def _write_scan_monitor(self, sub: h5py.Group, scan: Scan) -> None:
+        """Beam-monitor counts of one in-house acquisition, from the Monitor
+        counter of its EDF header. No group when the header has none or it
+        read zero (an instrument without a beam monitor); the counting mode
+        and preset are held once at entry level."""
+        if not (scan.twod and str(scan.twod).lower().endswith('.edf')):
+            return
+        integral = extract_edf_scan_fields(str(scan.twod)).get('monitor', {}).get('Monitor')
+        if not integral or float(integral) <= 0:
+            return
+        monitor = _nx_group(sub, 'monitor', 'NXmonitor')
+        integral_ds = monitor.create_dataset('integral', data=float(integral))
+        integral_ds.attrs['units'] = 'counts'
 
     def _write_xrd_data(self, sub: h5py.Group, scan: Scan) -> None:
-        """NXdata with the 1D pattern (plus errors); 2D image at subentry level."""
+        """NXdata with the 1D pattern (plus data_errors); 2D image at subentry level."""
         if scan.oned:
             # Read before creating the group: a read failure must not leave
             # an empty NXdata shell behind
@@ -868,16 +885,14 @@ class NXSWriter:
                 logger.error(f"Error reading 1D data for scan {scan.scan_num}: {e}")
                 arr = None
             if arr is not None:
-                data_group = sub.create_group('data')
-                data_group.attrs['NX_class'] = 'NXdata'
+                data_group = _nx_group(sub, 'data', 'NXdata')
                 angle_ds = data_group.create_dataset('polar_angle', data=arr[:, 0])
                 angle_ds.attrs['units'] = 'degrees'
                 data_group.create_dataset('data', data=arr[:, 1])
                 if arr.shape[1] >= 3:
-                    data_group.create_dataset('errors', data=arr[:, 2])
+                    data_group.create_dataset('data_errors', data=arr[:, 2])
                 data_group.attrs['signal'] = 'data'
                 data_group.attrs['axes'] = 'polar_angle'
-                data_group.attrs['polar_angle_indices'] = 0
                 data_group.attrs['oned_source_file'] = os.path.basename(scan.oned)
 
         if scan.twod:
@@ -892,45 +907,50 @@ class NXSWriter:
         mime = {'.hdf': 'application/x-hdf5',
                 '.edf': 'application/x-esrf-edf'}.get(ext)
 
-        note = sub.create_group('image_source')
-        note.attrs['NX_class'] = 'NXnote'
+        # The note is created before any embed so it precedes image_data in
+        # the subentry; its fields are written once the outcome is known so
+        # they follow the definition order (embedded, original_shape)
+        note = _nx_group(sub, 'image_source', 'NXnote')
+
+        embedded = False
+        original_shape = None
+        if self.include_2d_images:
+            try:
+                if ext == '.hdf':
+                    hdf_reader = HDFReader(max_display_size=self.max_display_size)
+                    data_2d = hdf_reader.read(twod_path)
+                    original_shape = hdf_reader.original_shape
+                else:
+                    data_2d = DataReaderFactory.read_file(twod_path)
+                    original_shape = data_2d.shape
+
+                image = _nx_group(sub, 'image_data', 'NXdata')
+                image.attrs['signal'] = 'data'
+                image_ds = image.create_dataset('data', data=data_2d)
+                image_ds.attrs['interpretation'] = 'image'
+                embedded = True
+            except Exception as e:
+                logger.error(f"Error embedding 2D data for scan {scan.scan_num}: {e}")
+                if 'image_data' in sub:
+                    del sub['image_data']
+
         note.create_dataset('file_name', data=twod_path)
         if mime:
             note.create_dataset('type', data=mime)
         note.create_dataset('description',
                             data=f'2D detector image {basename}')
-        note.create_dataset('max_display_size', data=int(self.max_display_size))
-
-        if not self.include_2d_images:
-            note.create_dataset('embedded', data=False)
-            return
-
-        try:
-            if ext == '.hdf':
-                hdf_reader = HDFReader(max_display_size=self.max_display_size)
-                data_2d = hdf_reader.read(twod_path)
-                original_shape = hdf_reader.original_shape
-            else:
-                data_2d = DataReaderFactory.read_file(twod_path)
-                original_shape = data_2d.shape
-
-            image = sub.create_group('image_data')
-            image.attrs['NX_class'] = 'NXdata'
-            image.attrs['signal'] = 'data'
-            image_ds = image.create_dataset('data', data=data_2d)
-            image_ds.attrs['interpretation'] = 'image'
+        note.create_dataset('embedded', data=embedded)
+        if embedded and original_shape is not None:
             note.create_dataset('original_shape',
                                 data=np.asarray(original_shape, dtype=np.int64))
-            note.create_dataset('embedded', data=True)
-
-        except Exception as e:
-            logger.error(f"Error embedding 2D data for scan {scan.scan_num}: {e}")
-            note.create_dataset('embedded', data=False)
 
     def _write_neutron_banks(self, sub: h5py.Group, scan: Scan) -> None:
         """One NXdata per bank and axis family: bank_N (native TOF) plus
         bank_N_d (d-spacing) — keep-all-data, one axis family per group."""
-        for meas_num, meas_files in scan.neutron_files.items():
+        # Banks in numeric order, TOF before d-spacing for each; fields in
+        # NXtofnpd's NXdata order (data before the axis), data_errors after data
+        for meas_num, meas_files in sorted(scan.neutron_files.items(),
+                                           key=_bank_sort_key):
             for key, (suffix, x_name) in {
                 'tof': ('', 'time_of_flight'),
                 'd': ('_d', 'd_spacing'),
@@ -938,18 +958,24 @@ class NXSWriter:
                 if key not in meas_files:
                     continue
                 path = meas_files[key]
-                bank = sub.create_group(f'bank_{meas_num}{suffix}')
-                bank.attrs['NX_class'] = 'NXdata'
-                # grouper keys are strings; the schema wants NX_INT
-                bank.attrs['measurement_number'] = (
-                    int(meas_num) if str(meas_num).isdigit() else meas_num)
-                bank.attrs['source_file'] = os.path.basename(path)
+                name = f'bank_{meas_num}{suffix}'
+                # Read before creating the group: a failed read must not
+                # leave an empty NXdata shell (the definition requires data)
                 try:
                     arr = DataReaderFactory.read_file(path, is_neutron=True)
-                    x_ds = bank.create_dataset(x_name, data=arr[:, 0])
+                except Exception as e:
+                    logger.error(f"Error reading {key} data {path}: {e}")
+                    continue
+                bank = _nx_group(sub, name, 'NXdata')
+                try:
+                    # grouper keys are strings; the schema wants NX_INT
+                    bank.attrs['measurement_number'] = (
+                        int(meas_num) if str(meas_num).isdigit() else meas_num)
+                    bank.attrs['source_file'] = os.path.basename(path)
                     bank.create_dataset('data', data=arr[:, 1])
                     if arr.shape[1] >= 3:
-                        bank.create_dataset('errors', data=arr[:, 2])
+                        bank.create_dataset('data_errors', data=arr[:, 2])
+                    x_ds = bank.create_dataset(x_name, data=arr[:, 0])
 
                     header = parse_mantid_header(path)
                     label = header.get('x_unit')
@@ -966,7 +992,8 @@ class NXSWriter:
                     bank.attrs['signal'] = 'data'
                     bank.attrs['axes'] = x_name
                 except Exception as e:
-                    logger.error(f"Error reading {key} data: {e}")
+                    logger.error(f"Error writing {name}: {e}")
+                    del sub[name]
 
     # --- electrochemistry layers ---
 
@@ -976,8 +1003,7 @@ class NXSWriter:
         if echem_df is None or echem_df.empty:
             return
 
-        echem_group = entry.create_group('operando_electrochemistry')
-        echem_group.attrs['NX_class'] = 'NXdata'
+        echem_group = _nx_group(entry, 'operando_electrochemistry', 'NXdata')
         write_echem_series(echem_group, echem_df)
         entry.attrs['default'] = 'operando_electrochemistry'
 
