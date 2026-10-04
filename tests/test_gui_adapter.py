@@ -618,6 +618,16 @@ def test_experiment_metadata_rows_bank_geometry(polaris_src):
         {"field": "detector bank 2", "value": "L2 1.783 m, 2theta 25.99 deg"},
         {"field": "monitor mode", "value": "timer"},
         {"field": "monitor 671", "value": "3.270 m, 2theta 0.00 deg"}]
+    # An in-house monitor (mode and preset, no element arrays) and a monitor
+    # table whose arrays disagree in length yield no element rows
+    inhouse = {"monitor": {"mode": "timer", "preset": 120.0}}
+    assert experiment_metadata_rows(inhouse) == [
+        {"field": "monitor mode", "value": "timer"},
+        {"field": "monitor preset", "value": "120 s"}]
+    ragged = {"monitor": {"mode": "timer", "detector_number": np.array([611, 612]),
+                          "distance": np.array([7.641]),
+                          "polar_angle": np.array([180.0, 180.0])}}
+    assert experiment_metadata_rows(ragged) == [{"field": "monitor mode", "value": "timer"}]
 
     process_paths([polaris_src], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.NEUTRON)

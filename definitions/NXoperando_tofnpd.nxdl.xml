@@ -344,7 +344,7 @@
             <group type="NXdata" nameType="any" minOccurs="0" maxOccurs="unbounded">
                 <doc>One source file, named file_NNN (file_001, file_002, ...).</doc>
                 <attribute name="source_file" optional="true"/>
-                    <field name="time" type="NX_FLOAT" units="NX_TIME">
+                <field name="time" type="NX_FLOAT" units="NX_TIME">
                     <attribute name="start" type="NX_DATE_TIME"/>
                 </field>
                 <field name="voltage" type="NX_FLOAT" units="NX_VOLTAGE"/>

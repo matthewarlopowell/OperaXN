@@ -138,15 +138,28 @@ def test_classification_manager_inhouse(inhouse_dir):
 
 def test_neutron_logbook_single_surname_user(tmp_path):
     """A WISH-layout line (single surname without a comma, just before the
-    proposal) harvests users and proposal; the POLARIS layout is unchanged."""
-    wish = ('59268\tcell55 event # 1\t"5m 0s"\t"3.0059"\tPerez\t2510713\t'
-            'Fri Feb 28 16:17:29 2025\tFri Feb 28 16:22:36 2025\t24_5')
+    proposal) harvests users and proposal; the POLARIS layout is unchanged.
+    Only a lone capitalised word is taken as that surname: free text in the
+    column before the proposal leaves users unassigned, and a surname with
+    an apostrophe or hyphen is accepted."""
+    def wish_line(run, user, start_min):
+        return (f'{run}\tcell55 event # 1\t"5m 0s"\t"3.0059"\t{user}\t2510713\t'
+                f'Fri Feb 28 16:{start_min:02d}:29 2025\t'
+                f'Fri Feb 28 16:{start_min + 5:02d}:36 2025\t24_5')
+
+    lines = [wish_line("59268", "Perez", 17), wish_line("59269", "no beam", 27),
+             wish_line("59270", "O'Neil-Smith", 37), wish_line("59271", "ok", 47),
+             _builders.DETAILED_LOGBOOK_LINE]
     path = tmp_path / "logbook.txt"
-    path.write_text(wish + "\n" + _builders.DETAILED_LOGBOOK_LINE + "\n")
+    path.write_text("\n".join(lines) + "\n")
     df = core.NeutronMetadataParser.parse(str(path))
-    assert df is not None and len(df) == 2, str(df)
+    assert df is not None and len(df) == 5, str(df)
     rows = {r["scan_id"]: r for _, r in df.iterrows()}
     assert rows["59268"]["users"] == "Perez", str(rows["59268"])
     assert rows["59268"]["proposal"] == "2510713", str(rows["59268"])
+    assert pd.isna(rows["59269"]["users"]), "free text taken as the user"
+    assert rows["59269"]["proposal"] == "2510713", str(rows["59269"])
+    assert rows["59270"]["users"] == "O'Neil-Smith", str(rows["59270"])
+    assert pd.isna(rows["59271"]["users"]), "lowercase word taken as the user"
     assert rows["123456"]["users"] == "Smith,Jones", str(rows["123456"])
     assert rows["123456"]["proposal"] == "7654321", str(rows["123456"])

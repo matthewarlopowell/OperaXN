@@ -65,7 +65,7 @@ values verbatim.
 
 import logging
 import os
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import h5py
 import numpy as np
@@ -254,6 +254,9 @@ _SOURCE_TYPE_CANONICAL = {t.lower(): t for t in _SOURCE_TYPES}
 
 # NXtofnpd monitor/mode enumeration; any other profile value is skipped
 MONITOR_MODES = ('monitor', 'timer')
+
+# Prepared NXtofnpd geometry: (element numbers, [(dataset name, values, units)])
+Geometry = Tuple[List[int], List[Tuple[str, np.ndarray, str]]]
 
 # entry/cycling_protocol (NXnote) fields, in file order:
 # (kwarg key, dataset name, caster, units). `technique` is required within
@@ -593,16 +596,10 @@ class NXSWriter:
             ds = crystal.create_dataset('wavelength', data=float(wavelength))
             ds.attrs['units'] = 'angstrom'
 
-        # The detector group is created on first write, so a source with no
-        # detector metadata and no profile geometry leaves no empty group
-        detector: Optional[h5py.Group] = None
-
-        def detector_group() -> h5py.Group:
-            nonlocal detector
-            if detector is None:
-                detector = _nx_group(inst, 'detector', 'NXdetector')
-            return detector
-
+        # Detector fields and profile geometry are gathered first and the
+        # group is created only when there is something to write, so a
+        # source with no detector metadata and no profile geometry leaves
+        # no empty group
         detector_fields = {
             # EDF detector model (laboratory) or the profile's description
             'description': harvest.get('detector_model') or harvest.get('detector_description'),
@@ -622,17 +619,21 @@ class NXSWriter:
             'beam_center_x': 'pixel',
             'beam_center_y': 'pixel',
         }
-        for name, value in detector_fields.items():
-            if value is not None:
+        present = {name: value for name, value in detector_fields.items()
+                   if value is not None}
+        geometry = (self._geometry_arrays(harvest.get('detector_banks'))
+                    if self.data_source == DataSourceType.NEUTRON else None)
+        if present or geometry:
+            detector = _nx_group(inst, 'detector', 'NXdetector')
+            for name, value in present.items():
                 try:
-                    ds = detector_group().create_dataset(name, data=float(value))
+                    ds = detector.create_dataset(name, data=float(value))
                     if detector_units.get(name):
                         ds.attrs['units'] = detector_units[name]
                 except (ValueError, TypeError):
-                    detector_group().create_dataset(name, data=str(value))
-
-        if self.data_source == DataSourceType.NEUTRON:
-            self._write_bank_geometry(detector_group, harvest.get('detector_banks'))
+                    detector.create_dataset(name, data=str(value))
+            if geometry:
+                self._write_geometry(detector, geometry)
 
         # Full raw harvests preserved as collections
         for key, group_name in (('_edf_global', 'edf_metadata'),
@@ -673,28 +674,24 @@ class NXSWriter:
                                f"{self.sample_preparation_date!r} (expected ISO 8601)")
 
     @staticmethod
-    def _write_bank_geometry(group: Union[h5py.Group, Callable[[], h5py.Group]],
-                             table: Optional[Dict[Any, Dict[str, Any]]],
-                             what: str = 'detector') -> None:
+    def _geometry_arrays(table: Optional[Dict[Any, Dict[str, Any]]],
+                         what: str = 'detector') -> Optional[Geometry]:
         """NXtofnpd geometry arrays from a profile table keyed by element
-        number: detector_number, then distance/polar_angle/azimuthal_angle.
-        Used for the per-bank detector [nBank] and the monitor elements
-        [nMon]. All-or-skip per key: an array is written only when every
-        element supplies that key; detector_number iff at least one array is.
-        group may be a factory, called only when an array is written."""
+        number, for the per-bank detector [nBank] and the monitor elements
+        [nMon]: (element numbers, [(name, data, units), ...]) in NXtofnpd
+        order (distance, polar_angle, azimuthal_angle), or None when there
+        is nothing to write. All-or-skip per key: an array is included only
+        when every element supplies that key."""
         if not table:
-            return
+            return None
         try:
             by_number = {int(b): (spec or {}) for b, spec in table.items()}
         except (ValueError, TypeError):
             logger.warning(f"Skipping {what} geometry: keys are not integers")
-            return
+            return None
         numbers = sorted(by_number)
         ordered = [by_number[b] for b in numbers]
 
-        # NXtofnpd order: detector_number, distance, polar_angle,
-        # azimuthal_angle. The arrays are gathered first so detector_number
-        # can lead yet still be written only when at least one array is.
         arrays = (('distance', 'distance_m', 'm'),
                   ('polar_angle', 'polar_angle_deg', 'degrees'),
                   ('azimuthal_angle', 'azimuthal_angle_deg', 'degrees'))
@@ -709,13 +706,17 @@ class NXSWriter:
                 logger.warning(f"Skipping {what} {name}: non-numeric value")
                 continue
             complete.append((name, data, units))
-        if not complete:
-            return
-        target = group() if callable(group) else group
-        target.create_dataset('detector_number',
-                              data=np.asarray(numbers, dtype=np.int64))
-        for name, data, units in complete:
-            ds = target.create_dataset(name, data=data)
+        return (numbers, complete) if complete else None
+
+    @staticmethod
+    def _write_geometry(group: h5py.Group, geometry: Geometry) -> None:
+        """Write prepared geometry arrays into group: detector_number leads
+        (NXtofnpd order), then each array with its units."""
+        numbers, arrays = geometry
+        group.create_dataset('detector_number',
+                             data=np.asarray(numbers, dtype=np.int64))
+        for name, data, units in arrays:
+            ds = group.create_dataset(name, data=data)
             ds.attrs['units'] = units
 
     def _write_cycling_protocol(self, entry: h5py.Group,
@@ -773,7 +774,9 @@ class NXSWriter:
                 return
             monitor = _nx_group(entry, 'monitor', 'NXmonitor')
             monitor.create_dataset('mode', data=mode)
-            self._write_bank_geometry(monitor, harvest.get('monitors'), 'monitor')
+            geometry = self._geometry_arrays(harvest.get('monitors'), 'monitor')
+            if geometry:
+                self._write_geometry(monitor, geometry)
         elif self.data_source == DataSourceType.INHOUSE:
             exposures = {round(float(s.exposure_time), 6) for s in scans
                          if s.exposure_time is not None}

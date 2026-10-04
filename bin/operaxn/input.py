@@ -337,7 +337,8 @@ def experiment_metadata_rows(meta: Dict[str, Any]) -> List[Dict[str, str]]:
                      "value": str(meta["pre_sample_flightpath"])})
     instrument = meta.get("instrument")
     if isinstance(instrument, dict):
-        rows.extend(_bank_geometry_rows(instrument.get("detector")))
+        rows.extend(_geometry_rows(instrument.get("detector"), "detector bank",
+                                   "L2 {d:.3f} m, 2theta {p:.2f} deg"))
     monitor = meta.get("monitor")
     if isinstance(monitor, dict):
         if monitor.get("mode") is not None:
@@ -345,7 +346,7 @@ def experiment_metadata_rows(meta: Dict[str, Any]) -> List[Dict[str, str]]:
         if monitor.get("preset") is not None:
             rows.append({"field": "monitor preset",
                          "value": f"{float(monitor['preset']):g} s"})
-        rows.extend(_monitor_rows(monitor))
+        rows.extend(_geometry_rows(monitor, "monitor", "{d:.3f} m, 2theta {p:.2f} deg"))
 
     # Known dataset names only (the flattened group also carries NX_class)
     protocol = meta.get("cycling_protocol")
@@ -359,49 +360,27 @@ def experiment_metadata_rows(meta: Dict[str, Any]) -> List[Dict[str, str]]:
     return rows
 
 
-def _bank_geometry_rows(detector: Any) -> List[Dict[str, str]]:
-    """One row per detector bank from the tofnpd per-bank geometry arrays;
-    [] when the arrays are absent or incomplete (e.g. the scalar laboratory
-    detector distance)."""
-    if not isinstance(detector, dict):
+def _geometry_rows(table: Any, label: str, value_format: str) -> List[Dict[str, str]]:
+    """One row per element of a tofnpd geometry table (the per-bank detector
+    arrays or the monitor elements): detector_number with distance and
+    polar_angle arrays of one length. [] when the arrays are absent or
+    incomplete (e.g. the scalar laboratory detector distance). Rows are
+    labelled "<label> <number>" and valued by value_format with d (distance,
+    m) and p (polar angle, degrees)."""
+    if not isinstance(table, dict):
         return []
-    numbers = detector.get("detector_number")
-    distance = detector.get("distance")
-    polar = detector.get("polar_angle")
-    if numbers is None or distance is None or polar is None:
+    columns = [table.get(k) for k in ("detector_number", "distance", "polar_angle")]
+    if any(c is None for c in columns):
         return []
     try:
-        numbers = [int(n) for n in np.atleast_1d(numbers)]
-        distance = [float(d) for d in np.atleast_1d(distance)]
-        polar = [float(p) for p in np.atleast_1d(polar)]
+        numbers = [int(n) for n in np.atleast_1d(columns[0])]
+        distance = [float(d) for d in np.atleast_1d(columns[1])]
+        polar = [float(p) for p in np.atleast_1d(columns[2])]
     except (TypeError, ValueError):
         return []
     if not len(numbers) == len(distance) == len(polar):
         return []
-    return [{"field": f"detector bank {n}",
-             "value": f"L2 {d:.3f} m, 2theta {p:.2f} deg"}
-            for n, d, p in zip(numbers, distance, polar)]
-
-
-def _monitor_rows(monitor: Any) -> List[Dict[str, str]]:
-    """One row per beam-monitor element from the tofnpd monitor arrays
-    (distance and 2theta); [] when the arrays are absent or incomplete."""
-    if not isinstance(monitor, dict):
-        return []
-    numbers = monitor.get("detector_number")
-    distance = monitor.get("distance")
-    polar = monitor.get("polar_angle")
-    if numbers is None or distance is None or polar is None:
-        return []
-    try:
-        numbers = [int(n) for n in np.atleast_1d(numbers)]
-        distance = [float(d) for d in np.atleast_1d(distance)]
-        polar = [float(p) for p in np.atleast_1d(polar)]
-    except (TypeError, ValueError):
-        return []
-    if not len(numbers) == len(distance) == len(polar):
-        return []
-    return [{"field": f"monitor {n}", "value": f"{d:.3f} m, 2theta {p:.2f} deg"}
+    return [{"field": f"{label} {n}", "value": value_format.format(d=d, p=p)}
             for n, d, p in zip(numbers, distance, polar)]
 
 

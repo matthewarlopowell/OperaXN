@@ -29,8 +29,11 @@ if FABIO_AVAILABLE:
 logger = logging.getLogger(__name__)
 
 WEEKDAYS = ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"]
-# Logbook user field: surnames, optionally comma-separated ("Perez", "Smith,Jones")
+# Logbook user field: comma-separated surnames ("Smith,Jones")
 USER_TOKEN_RE = re.compile(r"[A-Za-z ,.\-']+")
+# A lone surname (no comma marks it as the user field): one capitalised
+# word, hyphens and apostrophes allowed ("Perez", "O'Neil", "Smith-Jones")
+SURNAME_RE = re.compile(r"[A-Z][A-Za-z.\-']*")
 LOGBOOK_TIME_FORMAT = '%a %b %d %H:%M:%S %Y'
 
 
@@ -418,11 +421,13 @@ class NeutronMetadataParser:
                 proposal_idx = idx
 
         # A single surname carries no comma; in every logbook layout seen so
-        # far the user field is the one just before the proposal number
+        # far the user field is the one just before the proposal number.
+        # Only a lone capitalised word is accepted there, so free text in
+        # that column ("no beam") is left unassigned rather than stored as
+        # the user
         if "users" not in extras and proposal_idx is not None and proposal_idx >= 3:
             token = parts[proposal_idx - 1].strip().strip('"')
-            if (token and not any(d in token for d in WEEKDAYS)
-                    and USER_TOKEN_RE.fullmatch(token)):
+            if SURNAME_RE.fullmatch(token):
                 extras["users"] = token
 
         return extras

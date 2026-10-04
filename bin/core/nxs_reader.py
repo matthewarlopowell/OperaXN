@@ -45,12 +45,28 @@ def _display_ts(value: Any) -> Any:
 
 
 def _entry_is_canonical(entry) -> bool:
-    """True when /entry carries our provenance or scan_ subgroups."""
-    return (entry is not None and isinstance(entry, h5py.Group)
-            and ('generator' in entry.attrs
-                 or 'process' in entry
-                 or 'definition' in entry
-                 or any(_SCAN_GROUP_RE.fullmatch(k) for k in entry.keys())))
+    """True when /entry carries OperaXN provenance or our scan_ subgroups:
+    the v3 generator attribute, a definition naming an NXoperando_*
+    application definition, or a generating program named operaxn
+    (process/program, or program_name in files written before 17 Sep 2026).
+    The generic NeXus names alone (a 'definition' or 'process' member) do
+    not qualify: raw facility files carry them too."""
+    if entry is None or not isinstance(entry, h5py.Group):
+        return False
+    if 'generator' in entry.attrs:
+        return True
+    if any(_SCAN_GROUP_RE.fullmatch(k) for k in entry.keys()):
+        return True
+    definition = _decode(_dataset_scalar(entry, 'definition'))
+    if isinstance(definition, str) and definition.startswith('NXoperando'):
+        return True
+    process = entry.get('process')
+    program = (_dataset_scalar(process, 'program')
+               if isinstance(process, h5py.Group) else None)
+    if program is None:
+        program = _dataset_scalar(entry, 'program_name')
+    program = _decode(program)
+    return isinstance(program, str) and program.lower().startswith('operaxn')
 
 
 def is_canonical_nxs(path: str) -> bool:

@@ -485,3 +485,28 @@ def test_monopd_monitor_integral_from_positive_counter(tmp_path):
         assert mon["integral"].attrs.get("units") == "counts"
         assert "monitor" not in e["scan_000002"], "zero counter: no integral"
     assert_pynxtools_valid(out, "monitor integral")
+
+
+def test_monopd_monitor_mode_only_for_mixed_exposures(tmp_path):
+    """In-house acquisitions with differing exposures share no preset: the
+    entry-level monitor holds mode timer alone, each acquisition keeps its
+    own exposure_time, and the file validates."""
+    src = str(tmp_path / "mixed")
+    os.makedirs(src)
+    for i, (ts, exposure) in enumerate(zip(_builders.SCAN_TIMES, ("120.0", "60.0", "120.0")),
+                                       start=1):
+        _builders.write_xrd_dat(os.path.join(src, f"scan_{i:03d}.dat"), ts,
+                                exposure=exposure, y=_builders.inhouse_scan_y(i))
+    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
+    out = str(tmp_path / "mixed.nxs")
+    ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
+    assert ok, str(msgs)
+    with h5py.File(out) as f:
+        e = f["entry"]
+        assert _members(e["monitor"]) == ["mode"], list(e["monitor"])
+        assert s(e["monitor/mode"]) == "timer"
+        assert "preset" not in e["monitor"], "a preset was written for mixed exposures"
+        exposures = [e[f"scan_{i:06d}/environment/exposure_time"][()] for i in (1, 2, 3)]
+        assert exposures == [120.0, 60.0, 120.0], exposures
+    assert core.load(out).global_metadata["monitor"].get("preset") is None
+    assert_pynxtools_valid(out, "mode-only monitor")

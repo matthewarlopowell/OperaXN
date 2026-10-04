@@ -464,3 +464,44 @@ def test_reader_accepts_pre_rename_errors_name(tmp_path, inhouse_src):
     m2 = core.load(nxs2)
     traces = [t for bk in m2.scans[0].neutron.values() for t in bk.values()]
     assert traces and all("e" in t for t in traces), [sorted(t) for t in traces]
+
+
+def test_is_canonical_requires_operaxn_provenance(tmp_path, inhouse_nxs):
+    """Generic NeXus members do not make a file ours: a raw facility file
+    with /entry/definition and /entry/process is left to generation, while
+    OperaXN provenance in any of its forms (an NXoperando definition,
+    process/program operaxn, the pre-17-Sep program_name, or scan_
+    subentries) is recognised."""
+    def nxs_with(name, build):
+        path = str(tmp_path / f"{name}.nxs")
+        with h5py.File(path, "w") as f:
+            entry = f.create_group("entry")
+            entry.attrs["NX_class"] = "NXentry"
+            build(entry)
+        return path
+
+    def foreign(entry):
+        entry["definition"] = "NXmonopd"
+        process = entry.create_group("process")
+        process.attrs["NX_class"] = "NXprocess"
+        process["program"] = "Mantid"
+        process["version"] = "6.16.1"
+
+    def our_definition(entry):
+        entry["definition"] = "NXoperando_tofnpd"
+
+    def our_process(entry):
+        entry.create_group("process")["program"] = "operaxn"
+
+    def pre_rename(entry):
+        entry["program_name"] = "operaxn-core"
+
+    def scans_only(entry):
+        entry.create_group("scan_000001").attrs["NX_class"] = "NXsubentry"
+
+    assert not core.is_canonical_nxs(nxs_with("foreign", foreign))
+    assert not core.is_canonical_nxs(nxs_with("empty", lambda entry: None))
+    for name, build in (("definition", our_definition), ("process", our_process),
+                        ("program_name", pre_rename), ("scans", scans_only)):
+        assert core.is_canonical_nxs(nxs_with(name, build)), name
+    assert core.is_canonical_nxs(inhouse_nxs)
