@@ -1,6 +1,10 @@
-"""Shared fixtures over synthetic tmp_path datasets; imports prefer the
-installed package and fall back to bin/ for bare checkouts."""
+"""Shared fixtures over synthetic tmp_path datasets.
+
+Imports prefer the installed package and fall back to bin/ for bare checkouts.
+"""
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,19 +24,44 @@ import pytest
 import _builders
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _private_tempdir(tmp_path_factory):
+    """Point tempfile, and so the session cache, at a pytest folder, never the user's real cache."""
+    previous = tempfile.tempdir
+    tempfile.tempdir = str(tmp_path_factory.mktemp("systemp"))
+    yield
+    tempfile.tempdir = previous
+
+
 @pytest.fixture(autouse=True)
 def _clear_reader_cache():
-    """Cache hygiene: readers' module-global file cache is keyed on
-    path/size/mtime, so clear around every test to keep tmp_path reuse
-    from serving stale data."""
+    """Clear the path/size/mtime-keyed reader cache around each test, as tmp_paths get reused."""
     core.clear_global_cache()
     yield
     core.clear_global_cache()
 
 
 @pytest.fixture
+def tk_root():
+    """Yield a withdrawn Tk root, retrying Tk() startup (flaky on busy displays) before skipping."""
+    tk = pytest.importorskip("tkinter")
+    root = None
+    for _ in range(3):
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            break
+        except Exception:
+            time.sleep(0.5)
+    if root is None:
+        pytest.skip("no display available")
+    yield root
+    root.destroy()
+
+
+@pytest.fixture
 def inhouse_dir(tmp_path):
-    """3 XRD scans at 10:05/10:10/10:15 + echem (60 s cadence from 10:00,
+    """Return a dir of 3 XRD scans at 10:05/10:10/10:15 + echem (60 s cadence from 10:00,
     V = 3.7 + 0.01/step). Known-good: scan 1 midpoint 10:06 -> V = 3.76."""
     d = tmp_path / "inhouse"
     _builders.write_inhouse_dir(str(d))
@@ -41,7 +70,7 @@ def inhouse_dir(tmp_path):
 
 @pytest.fixture
 def neutron_dir(tmp_path):
-    """Logbook 10:00-10:30 + 2 banks x (tof, d) + echem.
+    """Return a dir of a 10:00-10:30 logbook + 2 banks x (TOF, d) + echem.
     Known-good: midpoint 10:15 -> V = 3.85."""
     d = tmp_path / "neutron"
     _builders.write_neutron_dir(str(d))
@@ -54,7 +83,7 @@ def neutron_dir(tmp_path):
 
 @pytest.fixture(scope="module")
 def inhouse_src(tmp_path_factory):
-    """Source directory for in-house generation, shared across the module."""
+    """Return the detailed in-house source directory, shared across the module."""
     d = str(tmp_path_factory.mktemp("schema_src") / "inhouse")
     _builders.write_detailed_inhouse_dir(d)
     return d
@@ -62,7 +91,7 @@ def inhouse_src(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def inhouse_nxs(tmp_path_factory, inhouse_src):
-    """Generated NXoperando_monopd file with a standard-echem sidecar."""
+    """Return a generated NXoperando_monopd file with a standard-echem sidecar."""
     base = tmp_path_factory.mktemp("schema_inhouse")
     std = str(base / "standard.txt")
     _builders.write_echem_txt(std, n_rows=10)
@@ -75,7 +104,7 @@ def inhouse_nxs(tmp_path_factory, inhouse_src):
 
 @pytest.fixture(scope="module")
 def neutron_nxs(tmp_path_factory):
-    """Generated NXoperando_tofnpd file from the Mantid-style fixture."""
+    """Return a generated NXoperando_tofnpd file from the Mantid-style fixture."""
     base = tmp_path_factory.mktemp("schema_neutron")
     src = str(base / "neutron")
     _builders.write_detailed_neutron_dir(src)
@@ -87,7 +116,7 @@ def neutron_nxs(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def override_nxs(tmp_path_factory, inhouse_src):
-    """Generated file with title/sample_name/sample_description overrides."""
+    """Return a generated file with title/sample_name/sample_description overrides."""
     out = str(tmp_path_factory.mktemp("schema_override") / "override.nxs")
     ok, msgs = core.generate([inhouse_src], out, core.DataSourceType.INHOUSE,
                              title="My Operando Study", sample_name="NMC811 pouch",
@@ -98,7 +127,7 @@ def override_nxs(tmp_path_factory, inhouse_src):
 
 @pytest.fixture(scope="module")
 def protocol_nxs(tmp_path_factory, inhouse_src):
-    """Generated file with a sample preparation date and full cycling protocol."""
+    """Return a generated file with a sample preparation date and full cycling protocol."""
     out = str(tmp_path_factory.mktemp("schema_protocol") / "protocol.nxs")
     ok, msgs = core.generate([inhouse_src], out, core.DataSourceType.INHOUSE,
                              sample_preparation_date="2024-01-15",
@@ -109,7 +138,7 @@ def protocol_nxs(tmp_path_factory, inhouse_src):
 
 @pytest.fixture
 def polaris_src(tmp_path):
-    """Neutron source whose Mantid headers name POLARIS (selects the profile)."""
+    """Return a neutron source dir whose Mantid headers name POLARIS (selects the profile)."""
     d = str(tmp_path / "polaris")
     _builders.write_detailed_neutron_dir(d)
     return d
@@ -117,7 +146,7 @@ def polaris_src(tmp_path):
 
 @pytest.fixture(scope="module")
 def legacy_v3_nxs(tmp_path_factory):
-    """Hand-built schema-v3 file: legacy attrs, unit-suffixed names, combined banks."""
+    """Return a hand-built schema-v3 file: legacy attrs, unit-suffixed names, combined banks."""
     path = str(tmp_path_factory.mktemp("schema_v3") / "legacy_v3.nxs")
     with h5py.File(path, "w") as f:
         e = f.create_group("entry")

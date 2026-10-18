@@ -40,7 +40,7 @@ a human-entered field that will be made required at NIAC submission.
 | `sample/description` | required | recommended | Human-entered; cannot be harvested from source data. | tighten at NIAC |
 | `cycling_protocol` (NXnote) | required | recommended; `technique` required within the group | Human-entered; the writer omits the whole group when `technique` is empty so no non-conforming file can be produced. | tighten at NIAC |
 | `operando_electrochemistry` | required | recommended | Absent from diffraction-only files (no electrochemistry supplied). | forced |
-| `environment/voltage`, `environment/current` | required | recommended | Present when the scan was correlated within the correlation tolerance (300 s); absent for uncorrelated scans and diffraction-only files. | forced |
+| `environment/voltage`, `environment/current` | required | recommended | Present when the scan was matched to an electrochemistry point less than the correlation tolerance away, as recorded in `operando_electrochemistry/echem_time_tolerance` (set per run in the upload dialog, 300 s by default; a file without that field was matched with 300 s); absent for uncorrelated scans and diffraction-only files. | forced |
 | `environment/voltage_min`, `voltage_max`, `current_min`, `current_max` | required | optional | Extrema over every electrochemistry point inside [`start_time`, `end_time`], both bounds inclusive, in the same clock alignment as the correlation; absent when the window holds no point (short exposures against a sparse logging cadence) or `end_time` is unknown. | forced |
 | `environment/scan_timestamp` | required | required | Always written (presence guarantee equals `start_time`'s). | matches |
 | `end_time` (entry) | optional | optional | | matches |
@@ -63,7 +63,11 @@ only the Figure 4 content still validates): `definition@version` and
 extra `instrument` fields and the verbatim
 `edf_metadata` / `synchrotron_metadata` NXcollection harvests; `user`;
 `standard_electrochemistry` (non-correlated electrochemistry files);
-`environment/voltage_timestamp` and `logbook_entry`; `data/data_errors`;
+`operando_electrochemistry/echem_time_tolerance` (the per-run correlation
+tolerance the scan subentries were matched with: a scan matches when the
+two timestamps are less than it apart, on both sides of the record);
+`environment/voltage_timestamp` and `logbook_entry`;
+`data/data_errors`;
 `image_source` and `image_data`; per-bank NXdata attributes (`spectrum`,
 `y_unit`, `x_label`,
 `source_file`, `measurement_number`); tofnpd per-bank detector geometry
@@ -114,6 +118,9 @@ definition, with each OperaXN addition directly after the item it extends:
   `crystal` and `detector` exist only when they have content
 - monitor: tofnpd `mode`, `detector_number`, `distance`, `polar_angle`,
   `azimuthal_angle`; monopd `mode`, `preset`
+- operando_electrochemistry: `time`, `voltage`, `current`,
+  `echem_time_tolerance` (the `standard_electrochemistry` file groups carry
+  the first three only)
 - subentry: `instrument` (soft link to `/entry/instrument`), `environment`
   (`start_time`, `end_time`, `voltage`, `current`, `voltage_min`,
   `voltage_max`, `current_min`, `current_max`, `scan_timestamp`,

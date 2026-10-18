@@ -1,5 +1,5 @@
 """
-OperaXN core — the pipeline shared by NeXus generation and the GUI.
+OperaXN core: the pipeline shared by NeXus generation and the GUI.
 
 Architecture: every raw-data upload is first generated into a canonical .nxs
 file (`generate`), and the GUI runs purely by interpreting that file

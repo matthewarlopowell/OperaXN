@@ -1,7 +1,8 @@
 """
-Themed Tkinter dialogs. BaseDialog provides the house style (non-modal,
-shrink-to-fit sizing, surface-matched widget helpers); concrete dialogs
-cover upload options, plot settings, exports, GIF creation, and progress.
+Themed Tkinter dialogs for upload options, plot settings, exports, GIFs and progress.
+
+BaseDialog provides the house style: non-modal, shrink-to-fit sizing and
+surface-matched widget helpers.
 """
 
 import ctypes
@@ -17,11 +18,14 @@ from typing import Dict, List, Callable, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 
-from core import TimeMethod, is_canonical_nxs
+from core import ECHEM_TIME_TOLERANCE, TimeMethod, is_canonical_nxs
+from core.config import MAX_ECHEM_TIME_TOLERANCE
 
 from .output import clear_plot_cache
 from .config import (
     DataSourceType,
+    DSPACING_LABEL,
+    TOF_LABEL,
     DEFAULT_GIF_DPI,
     DEFAULT_GIF_FPS,
     DEFAULT_GIF_LOOP,
@@ -29,6 +33,7 @@ from .config import (
     DEFAULT_TWOD_XMIN_PERCENT,
     EXPORT_DPI,
     OPERAXNTheme,
+    SYNCHROTRON_MAX_DISPLAY_SIZE,
     SYNCHROTRON_WAVELENGTH,
     WINDOW_SIZES,
     XRAY_WAVELENGTH,
@@ -57,6 +62,7 @@ class GIFSettings:
     loop: int
     scan_list: List[int] = field(default_factory=list)
 
+
 @dataclass
 class UploadOptions:
     """Structured result from UploadOptionsDialog."""
@@ -71,7 +77,7 @@ class UploadOptions:
     sample_preparation_date: str = None
     cycling_protocol: Dict[str, Any] = None
     standard_echem_files: List[str] = None
-
+    echem_time_tolerance: float = None  # seconds; None = core default
 
 
 # ============================================================================
@@ -79,15 +85,12 @@ class UploadOptions:
 # ============================================================================
 
 class BaseDialog(tk.Toplevel):
-    """Themed non-modal Toplevel: centres on its parent, cancels on
-    Escape/window close, and provides surface-matched widget helpers."""
+    """Themed non-modal Toplevel, centred on its parent, with surface-matched widget helpers."""
 
     def __init__(self, master: tk.Misc, title: str, geometry: str) -> None:
         super().__init__(master)
         self.master = master
         self.result = None
-
-        # Apply theme
         self.configure(bg=OPERAXNTheme.COLORS['bg_primary'])
 
         self.title(title)
@@ -98,21 +101,13 @@ class BaseDialog(tk.Toplevel):
 
         # Dialogs are deliberately non-modal (no grab_set): they float above
         # the app (transient) but the main window stays fully interactive.
-
-        # Bind escape key to cancel
         self.bind('<Escape>', lambda e: self.cancel())
-
-        # Protocol for window close
         self.protocol("WM_DELETE_WINDOW", self.cancel)
 
     def _work_area(self) -> Optional[Tuple[int, int, int, int]]:
-        """Desktop work area (left, top, right, bottom) of the monitor this
-        dialog is on, or None when it cannot be determined.
-
-        Queried per-monitor, not via SPI_GETWORKAREA alone, which reports the
-        primary monitor only. The app never sets DPI awareness, so these
-        USER32 values arrive in the same virtualised units Tk uses.
-        """
+        """Return this dialog's monitor work area (left, top, right, bottom), or None.
+        Per monitor, as SPI_GETWORKAREA (the fallback) sees only the primary; no DPI
+        awareness is set, so these USER32 values arrive in Tk's virtualised units."""
         if sys.platform != "win32":
             return None
         try:
@@ -140,12 +135,9 @@ class BaseDialog(tk.Toplevel):
         return None
 
     def _frame_overhead(self) -> Tuple[int, int]:
-        """(horizontal, vertical) size of the window decoration, measured in
-        Tk's own coordinates so DPI virtualisation cannot desynchronise it.
-
-        Only meaningful once the window is mapped; implausible readings fall
-        back to zero, which costs a slightly tall window, never a broken one.
-        """
+        """Return the window decoration's (horizontal, vertical) size in Tk's own units.
+        Tk units keep it in step under DPI virtualisation; valid once mapped. Implausible
+        readings give (0, 0), which costs a slightly tall window, never a broken one."""
         side = self.winfo_rootx() - self.winfo_x()
         top = self.winfo_rooty() - self.winfo_y()
         if not (0 <= side <= 200 and 0 <= top <= 200):
@@ -156,12 +148,8 @@ class BaseDialog(tk.Toplevel):
     def _fit_client(work_area: Optional[Tuple[int, int, int, int]],
                     overhead: Tuple[int, int],
                     fallback: Tuple[int, int]) -> Tuple[int, int]:
-        """Largest client size whose whole window frame stays inside the work
-        area; `fallback` (wm_maxsize) verbatim when the work area is unknown.
-
-        Split out from shrink_to_fit so the arithmetic is testable without a
-        display.
-        """
+        """Return the largest client size whose framed window fits the work area.
+        An unknown area gives `fallback` (wm_maxsize); static, so testable headless."""
         if work_area is None:
             return fallback
         left, top, right, bottom = work_area
@@ -200,17 +188,12 @@ class BaseDialog(tk.Toplevel):
         self.geometry(f"+{x}+{y}")
 
     def shrink_to_fit(self, min_width: int = 340) -> None:
-        """Size the window to its content (plus margins) and re-center.
-
-        Call at the end of _create_widgets: fixed pixel geometries clip
-        content under Windows DPI scaling; content-driven sizing does not.
-        Both axes are clamped to the desktop work area LESS the window
-        decoration, so tall content can never push a dialog's buttons
-        off-screen; dialogs whose content can outgrow that must scroll.
-        (wm_maxsize is not that bound -- on Windows it comes from the maximum
-        track size, overshoots the work area and ignores the title bar.)
-        """
+        """Size the window to its content plus margins and re-centre, once the widgets exist.
+        Fixed geometries clip under Windows DPI scaling. Clamped to the work area less the
+        decoration, so dialogs that can outgrow it must scroll."""
         self.update_idletasks()
+        # wm_maxsize is only the fallback: on Windows it is the maximum track
+        # size, which overshoots the work area and ignores the title bar.
         max_width, max_height = self._fit_client(
             self._work_area(), self._frame_overhead(), self.wm_maxsize())
         width = min(max(min_width, self.winfo_reqwidth() + 56), max_width)
@@ -233,8 +216,7 @@ class BaseDialog(tk.Toplevel):
     # ========================================================================
 
     def _surface_bg(self, parent: tk.Widget) -> str:
-        """Background of the surface a widget sits on (its parent's bg), so
-        themed widgets never show a mismatched box behind them."""
+        """Return `parent`'s background so themed widgets never show a mismatched box."""
         try:
             return parent.cget('bg')
         except tk.TclError:
@@ -266,8 +248,7 @@ class BaseDialog(tk.Toplevel):
                              command: Callable = None,
                              style: str = "primary",
                              width: int = 12) -> tk.Button:
-        """Create a flat button in a primary/secondary/danger style whose
-        background swaps on hover; unknown styles fall back to secondary."""
+        """Create a flat button whose background swaps on hover; unknown styles use secondary."""
         parent = parent or self
 
         # Style configuration
@@ -312,10 +293,7 @@ class BaseDialog(tk.Toplevel):
     def create_button_frame(self, buttons: List[Tuple[str, Callable, str]],
                             pady: int = 20, side: str = "top") -> tk.Frame:
         """Create and pack a button row from (text, command, style) tuples.
-
-        Pass side='bottom' (packing it before any expanding content) to pin
-        the row so it keeps its space when the content is taller than the
-        window."""
+        side='bottom', packed before any expanding content, keeps the row visible on overflow."""
         frame = tk.Frame(self, bg=OPERAXNTheme.COLORS['bg_primary'])
         frame.pack(pady=pady, side=side)
 
@@ -427,41 +405,32 @@ class BaseDialog(tk.Toplevel):
 # ============================================================================
 
 class PlotSettingsDialog(BaseDialog):
-    """Tabbed axis-range/display-mode settings; edits apply live to the
-    shared config and redraw the main window's plots."""
+    """Tabbed axis-range and display-mode settings, applied live to the shared config and plots."""
 
     def __init__(self, master: tk.Misc, config: Any, on_update: Callable) -> None:
-        is_neutron = (hasattr(config, 'data_source') and
-                      config.data_source == DataSourceType.NEUTRON)
+        is_neutron = getattr(config, 'data_source', None) == DataSourceType.NEUTRON
         height = "475" if is_neutron else "375"
 
         super().__init__(master, "Plot Settings", f"400x{height}")
         self.config = config
         self.on_update = on_update
-        self.main_app = master
 
         self._create_widgets()
         self.shrink_to_fit()
 
     def _create_widgets(self) -> None:
         """Build the notebook: a neutron tab for neutron data, else 1D/2D."""
-        # Setup notebook style
         self._setup_notebook_style()
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
 
-        if hasattr(self.config, 'data_source'):
-            if self.config.data_source == DataSourceType.NEUTRON:
-                self._create_neutron_tab(notebook)
-            else:
-                self._create_oned_tab(notebook)
-                self._create_twod_tab(notebook)
+        if getattr(self.config, 'data_source', None) == DataSourceType.NEUTRON:
+            self._create_neutron_tab(notebook)
         else:
             self._create_oned_tab(notebook)
             self._create_twod_tab(notebook)
 
-        # Close button
         close_btn = self.create_themed_button(
             text="Close",
             command=self.destroy,
@@ -477,7 +446,7 @@ class PlotSettingsDialog(BaseDialog):
         style.configure('TNotebook', background=C['bg_primary'],
                         bordercolor=C['border'],
                         lightcolor=C['bg_primary'], darkcolor=C['bg_primary'])
-        # clam tabs draw their face from light/dark edge colours too — set all
+        # clam tabs draw their face from light/dark edge colours too: set all
         # of them or unselected tabs keep the default light face
         style.configure('TNotebook.Tab',
                         background=C['bg_secondary'],
@@ -503,9 +472,7 @@ class PlotSettingsDialog(BaseDialog):
         entry = self.create_themed_entry(parent, var, width=12)
         entry.grid(row=row, column=col + 1, padx=5, pady=5)
 
-        if not on_change:
-            on_change = self._apply_settings
-
+        on_change = on_change or self._apply_settings
         entry.bind("<Return>", lambda e: on_change())
         entry.bind("<FocusOut>", lambda e: self._validate_entry(key, var))
 
@@ -513,27 +480,24 @@ class PlotSettingsDialog(BaseDialog):
 
     def _create_scale_with_label(self, parent: tk.Widget, label: str, var_name: str,
                                  value: float, row: int) -> None:
-        """Create a 0-100 scale with a live "NN%" label, stored on self as
-        var_name and var_name_label; dragging applies the settings."""
+        """Create a 0-100 scale with a live "NN%" label; dragging applies the settings.
+        The variable and label are stored on self as var_name and var_name_label."""
         self.create_themed_label(parent, label, font_type="body").grid(
             row=row, column=0, padx=5, pady=5, sticky='w'
         )
 
-        setattr(self, var_name, tk.DoubleVar(value=value))
-        var = getattr(self, var_name)
+        var = tk.DoubleVar(value=value)
+        setattr(self, var_name, var)
 
         scale = self.create_themed_scale(parent, var, 0, 100, showvalue=False)
         scale.grid(row=row, column=1, padx=5, pady=5)
 
-        # Value label
-        label_var_name = f"{var_name}_label"
         value_label = self.create_themed_label(
             parent, f"{value:.0f}%", font_type="body"
         )
         value_label.grid(row=row, column=2, padx=5, pady=5)
-        setattr(self, label_var_name, value_label)
+        setattr(self, f"{var_name}_label", value_label)
 
-        # Update label on change
         scale.config(command=lambda v: [
             self._update_scale_label(var_name, v),
             self._apply_settings()
@@ -547,31 +511,27 @@ class PlotSettingsDialog(BaseDialog):
             label.config(text=f"{float(value):.0f}%")
 
     def _validate_entry(self, key: str, var: tk.StringVar) -> None:
-        """Validate entry field; empty treated as auto-scale."""
+        """Store an entry's limit in config; blank or 'auto' means None (auto-scale).
+        Anything else unparseable is cleared to blank and stored as None."""
         try:
             value_str = var.get().strip()
 
             if not value_str or value_str.lower() == 'auto':
-                # Set to None for auto-scaling
                 self._set_config_value(key, None)
                 if not value_str:
                     var.set("")
             else:
-                # Try to parse as float
-                float_val = float(value_str)
-                self._set_config_value(key, float_val)
+                self._set_config_value(key, float(value_str))
 
         except (ValueError, tk.TclError):
             var.set("")
             self._set_config_value(key, None)
 
     def _set_config_value(self, key: str, value: Any) -> None:
-        """Map a field key to its config attribute; unknown attrs ignored."""
+        """Set the config attribute a field key maps to; unknown attributes are ignored."""
         mapping = {
             'xmin': 'oned_xmin', 'xmax': 'oned_xmax',
             'ymin': 'oned_ymin', 'ymax': 'oned_ymax',
-            'neutron_xmin': 'neutron_xmin', 'neutron_xmax': 'neutron_xmax',
-            'neutron_ymin': 'neutron_ymin', 'neutron_ymax': 'neutron_ymax'
         }
 
         config_key = mapping.get(key, key)
@@ -590,13 +550,13 @@ class PlotSettingsDialog(BaseDialog):
         self.neutron_display_var = tk.BooleanVar(value=self.config.show_neutron_dspacing)
 
         self.create_themed_radiobutton(
-            mode_frame, "Time of Flight (TOF) (μs)",
+            mode_frame, TOF_LABEL,
             self.neutron_display_var, False,
             self._on_neutron_mode_change
         ).pack(anchor="w", pady=5)
 
         self.create_themed_radiobutton(
-            mode_frame, "d-spacing (Å)",
+            mode_frame, DSPACING_LABEL,
             self.neutron_display_var, True,
             self._on_neutron_mode_change
         ).pack(anchor="w", pady=5)
@@ -644,7 +604,6 @@ class PlotSettingsDialog(BaseDialog):
 
     def _on_neutron_mode_change(self) -> None:
         """Clear the X limits (TOF and d-spacing units differ) and apply."""
-        # Clear X-axis limits when switching modes
         self.neutron_xmin_var.set("")
         self.neutron_xmax_var.set("")
         self.config.neutron_xmin = None
@@ -657,24 +616,15 @@ class PlotSettingsDialog(BaseDialog):
         if hasattr(self, 'neutron_display_var'):
             self.config.show_neutron_dspacing = self.neutron_display_var.get()
 
-            # Validate all neutron fields
             for key in ['neutron_xmin', 'neutron_xmax', 'neutron_ymin', 'neutron_ymax']:
                 var_name = f"{key}_var"
                 if hasattr(self, var_name):
                     self._validate_entry(key, getattr(self, var_name))
 
-            # Clear cache and update
             clear_plot_cache()
 
             if self.on_update:
                 self.on_update()
-
-            # Force redraw
-            if hasattr(self.main_app, '_update_plots'):
-                self.main_app._update_plots()
-
-            if hasattr(self.main_app, 'canvas') and self.main_app.canvas:
-                self.main_app.canvas.draw_idle()
 
     def _create_oned_tab(self, notebook: ttk.Notebook) -> None:
         """Build the 1D tab: X/Y ranges and the d-spacing toggle."""
@@ -683,7 +633,7 @@ class PlotSettingsDialog(BaseDialog):
 
         # X-axis range
         self.x_frame_label = self.create_themed_labelframe(
-            tab, "X-Axis Range (2θ degrees)", pady=5
+            tab, "X-Axis Range (2θ [°])", pady=5
         )
         self.x_frame_label.pack(fill="x", padx=10, pady=10)
 
@@ -725,7 +675,7 @@ class PlotSettingsDialog(BaseDialog):
             self._convert_xaxis_to_dspacing()
 
     def _on_dspacing_toggle(self) -> None:
-        """Convert entered X limits between 2θ and d-spacing, then apply."""
+        """Convert entered X limits between 2-theta and d-spacing, then apply."""
         new_dspacing = self.dspacing_var.get()
 
         if new_dspacing != self.config.show_dspacing:
@@ -733,15 +683,14 @@ class PlotSettingsDialog(BaseDialog):
                 self.x_frame_label.config(text="X-Axis Range (d-spacing [Å])")
                 self._convert_xaxis_to_dspacing()
             else:
-                self.x_frame_label.config(text="X-Axis Range (2θ degrees)")
+                self.x_frame_label.config(text="X-Axis Range (2θ [°])")
                 self._convert_xaxis_to_twotheta()
 
         self._apply_settings()
 
     def _get_wavelength(self) -> float:
         """Return the X-ray wavelength for the current data source."""
-        if (hasattr(self.config, 'data_source') and
-                self.config.data_source == DataSourceType.SYNCHROTRON):
+        if getattr(self.config, 'data_source', None) == DataSourceType.SYNCHROTRON:
             return SYNCHROTRON_WAVELENGTH
         return XRAY_WAVELENGTH
 
@@ -749,7 +698,7 @@ class PlotSettingsDialog(BaseDialog):
         """Convert X-axis entry values from 2-theta to d-spacing."""
         wavelength = self._get_wavelength()
 
-        for var, _ in [(self.xmin_var, 'xmin'), (self.xmax_var, 'xmax')]:
+        for var in (self.xmin_var, self.xmax_var):
             value_str = var.get().strip()
             if value_str:
                 try:
@@ -757,21 +706,17 @@ class PlotSettingsDialog(BaseDialog):
                     theta_rad = np.deg2rad(two_theta / 2.0)
                     if theta_rad > 0:
                         d_val = wavelength / (2 * np.sin(theta_rad))
-                        if not np.isinf(d_val) and not np.isnan(d_val):
-                            var.set(f"{d_val:.4f}")
-                        else:
-                            var.set("")
+                        var.set(f"{d_val:.4f}" if np.isfinite(d_val) else "")
                     else:
                         var.set("")
                 except (ValueError, TypeError) as e:
-                    logging.getLogger(__name__).debug(
-                        "Could not convert 2θ to d-spacing: %s", e)
+                    logger.debug("Could not convert 2θ to d-spacing: %s", e)
 
     def _convert_xaxis_to_twotheta(self) -> None:
         """Convert X-axis entry values from d-spacing to 2-theta."""
         wavelength = self._get_wavelength()
 
-        for var, _ in [(self.xmin_var, 'xmin'), (self.xmax_var, 'xmax')]:
+        for var in (self.xmin_var, self.xmax_var):
             value_str = var.get().strip()
             if value_str:
                 try:
@@ -784,17 +729,12 @@ class PlotSettingsDialog(BaseDialog):
                     else:
                         var.set("")
                 except (ValueError, TypeError, ZeroDivisionError) as e:
-                    logging.getLogger(__name__).debug(
-                        "Could not convert d-spacing to 2θ: %s", e)
+                    logger.debug("Could not convert d-spacing to 2θ: %s", e)
 
     def _apply_settings(self) -> None:
-        """Validate every field into config and redraw; the plot cache is
-        cleared when the d-spacing mode changed."""
+        """Validate every field into config and redraw; a d-spacing toggle clears the plot cache."""
         try:
-            # Store old d-spacing setting
             old_dspacing = self.config.show_dspacing if hasattr(self, 'dspacing_var') else False
-
-            # Update d-spacing
             if hasattr(self, 'dspacing_var'):
                 self.config.show_dspacing = self.dspacing_var.get()
 
@@ -812,20 +752,12 @@ class PlotSettingsDialog(BaseDialog):
                 if hasattr(self, var_name):
                     setattr(self.config, key, getattr(self, var_name).get())
 
-            # Trigger update
             if self.on_update:
                 self.on_update()
 
             # Clear cache if d-spacing changed
             if old_dspacing != getattr(self.config, 'show_dspacing', False):
                 clear_plot_cache()
-
-                if hasattr(self.main_app, '_update_plots'):
-                    self.main_app._update_plots()
-
-            # Redraw
-            if hasattr(self.main_app, 'canvas') and self.main_app.canvas:
-                self.main_app.canvas.draw_idle()
 
         except ValueError as e:
             messagebox.showerror("Invalid Input", str(e), parent=self)
@@ -860,14 +792,11 @@ class PlotSettingsDialog(BaseDialog):
 # ============================================================================
 
 class ExportOptionsDialog(BaseDialog):
-    """Export type and format selection dialog."""
+    """Export scope, plot-type and DPI selection dialog."""
 
     def __init__(self, master: tk.Misc, is_neutron: bool = False) -> None:
         self.is_neutron = is_neutron
-        if is_neutron:
-            window_size = WINDOW_SIZES['export_neutron']
-        else:
-            window_size = WINDOW_SIZES['export_xrd']
+        window_size = WINDOW_SIZES['export_neutron' if is_neutron else 'export_xrd']
         super().__init__(master, "Export Options", window_size)
         self._create_widgets()
         self.shrink_to_fit()
@@ -899,19 +828,14 @@ class ExportOptionsDialog(BaseDialog):
         plot_frame.pack(pady=5)
 
         self.plot_vars = {}
-
         if self.is_neutron:
-            # Neutron mode
-            plot_types = [
-                ("echem", "Echem Values")
-            ]
+            plot_types = [("echem", "Echem Values")]
         else:
-            # X-ray mode
             plot_types = [
                 ("oned", "1D XRD Data"),
                 ("twod", "2D XRD Data"),
                 ("echem", "Echem Values")
-                ]
+            ]
 
         for key, text in plot_types:
             self.plot_vars[key] = tk.BooleanVar(value=True)
@@ -946,7 +870,7 @@ class ExportOptionsDialog(BaseDialog):
         ])
 
     def _do_export(self) -> None:
-        """Validate selections and set export result."""
+        """Store the selections as the result and close; X-ray needs a plot type ticked."""
         if not any(var.get() for var in self.plot_vars.values()) and not self.is_neutron:
             messagebox.showwarning("No Selection",
                                    "Please select at least one plot type to export",
@@ -964,6 +888,22 @@ class ExportOptionsDialog(BaseDialog):
 # ============================================================================
 # GIF Settings Dialog
 # ============================================================================
+
+def parse_scan_range(text: str, max_scan: Optional[int] = None) -> List[int]:
+    """Parse "1-5", "1,3,5" or "1-5,10-15" into sorted unique scan numbers from 1
+    (up to max_scan when given); malformed input yields []."""
+    try:
+        scans = set()
+        for part in text.replace(" ", "").split(","):
+            if part.count("-") == 1:
+                start, end = map(int, part.split("-"))
+                scans.update(range(start, end + 1))
+            else:
+                scans.add(int(part))
+    except (ValueError, TypeError, AttributeError):
+        return []
+    return [s for s in sorted(scans) if s >= 1 and (max_scan is None or s <= max_scan)]
+
 
 class GIFSettingsDialog(BaseDialog):
     """GIF creation settings dialog."""
@@ -1029,8 +969,8 @@ class GIFSettingsDialog(BaseDialog):
         ])
 
     def _create(self) -> None:
-        """Validate and set GIF creation result."""
-        scan_list = self._parse_scan_range(self.range_var.get())
+        """Store the settings as the result and close; warn when the range selects no scans."""
+        scan_list = parse_scan_range(self.range_var.get(), self.num_scans)
         if not scan_list:
             messagebox.showwarning("Invalid Range",
                                    "Please enter a valid scan range",
@@ -1045,34 +985,14 @@ class GIFSettingsDialog(BaseDialog):
         )
         self.destroy()
 
-    def _parse_scan_range(self, scan_range: str) -> List[int]:
-        """Parse "1-5,8"-style input into sorted unique in-range scan
-        numbers; malformed input yields an empty list."""
-        try:
-            scan_list = []
-            parts = scan_range.replace(" ", "").split(",")
-
-            for part in parts:
-                if "-" in part and part.count("-") == 1:
-                    start, end = map(int, part.split("-"))
-                    scan_list.extend(range(start, end + 1))
-                else:
-                    scan_list.append(int(part))
-
-            scan_list = sorted(set(scan_list))
-            return [s for s in scan_list if 1 <= s <= self.num_scans]
-        except (ValueError, TypeError, AttributeError):
-            return []
-
 
 # ============================================================================
 # Upload Options Dialog
 # ============================================================================
 
 class UploadOptionsDialog(BaseDialog):
-    """Single upload window for every load/generation option (data
-    selection, source, time correlation, 2D handling, experiment details,
-    standard echem); generation-only options grey out for a direct .nxs."""
+    """Single upload window for every load and generation option.
+    Generation-only options grey out for a directly opened .nxs."""
 
     DISPLAY_OPTIONS = ["No downsampling", "4096", "2048", "1024", "512"]
 
@@ -1096,11 +1016,8 @@ class UploadOptionsDialog(BaseDialog):
     # --- scrollable body (the button row stays pinned below it) ---
 
     def _build_scroll_area(self) -> tk.Frame:
-        """Scrollable content area; returns the frame sections are built in.
-
-        The outer frame is packed last (see _create_widgets) so the pinned
-        button row reserves its space first and can never be squeezed out.
-        """
+        """Build the scrollable area and return the frame the sections go in.
+        Its outer frame is packed last (see _create_widgets) so the button row keeps its space."""
         bg = OPERAXNTheme.COLORS['bg_primary']
         outer = tk.Frame(self, bg=bg)
         self._scroll_outer = outer
@@ -1138,12 +1055,12 @@ class UploadOptionsDialog(BaseDialog):
         self._on_body_configure()
 
     def _on_wheel(self, event: tk.Event) -> None:
-        """Wheel scrolls the content only while it actually overflows."""
+        """Scroll the content on the mouse wheel, only while it overflows."""
         if self._scrollbar.winfo_ismapped():
             self._canvas.yview_scroll(int(-event.delta / 120), "units")
 
     def _resize_to_content(self) -> None:
-        """Re-size to the content, clamped to the work area by shrink_to_fit."""
+        """Resize to the content, clamped to the work area by shrink_to_fit."""
         self.update_idletasks()
         self._canvas.configure(height=self._body.winfo_reqheight())
         self.shrink_to_fit(min_width=540)
@@ -1200,17 +1117,25 @@ class UploadOptionsDialog(BaseDialog):
             self.create_themed_radiobutton(
                 time_frame, label, self.time_var, value).pack(anchor="w", pady=1)
 
+        # Nearest-neighbour match bound, applied on both sides of the echem
+        # record; generation-only and recorded in the file
+        tolerance_row = tk.Frame(time_frame, bg=OPERAXNTheme.COLORS['bg_primary'])
+        tolerance_row.pack(anchor="w", pady=(6, 0))
+        self.create_themed_label(tolerance_row, "Echem time tolerance (s):",
+                                 side="left", padx=(0, 8))
+        self.tolerance_var = tk.StringVar(value=f"{ECHEM_TIME_TOLERANCE:g}")
+        self.tolerance_entry = self._entry(tolerance_row, self.tolerance_var, width=8)
+        self.tolerance_entry.pack(side="left")
+
         # --- 2D settings ---
         self.create_themed_label(self._body, "2D detector images:",
                                  font_type="heading", pady=(14, 4))
         twod_frame = self._block()
         size_row = tk.Frame(twod_frame, bg=OPERAXNTheme.COLORS['bg_primary'])
         size_row.pack(anchor="w")
-        tk.Label(size_row, text="Max 2D size (n x n):",
-                 font=OPERAXNTheme.FONTS['body'],
-                 bg=OPERAXNTheme.COLORS['bg_primary'],
-                 fg=OPERAXNTheme.COLORS['text_primary']).pack(side="left", padx=(0, 8))
-        self.size_var = tk.StringVar(value="4096")
+        self.create_themed_label(size_row, "Max 2D size (n x n):",
+                                 side="left", padx=(0, 8))
+        self.size_var = tk.StringVar(value=str(SYNCHROTRON_MAX_DISPLAY_SIZE))
         self.size_menu = tk.OptionMenu(size_row, self.size_var, *self.DISPLAY_OPTIONS)
         self.size_menu.config(
             bg=OPERAXNTheme.COLORS['bg_tertiary'],
@@ -1273,11 +1198,8 @@ class UploadOptionsDialog(BaseDialog):
                 ("Sample name:", self.sample_var),
                 ("Cell description:", self.sample_desc_var),
                 ("Preparation date (YYYY-MM-DD):", self.prep_date_var)]):
-            tk.Label(details, text=label,
-                     font=OPERAXNTheme.FONTS['body'],
-                     bg=OPERAXNTheme.COLORS['bg_primary'],
-                     fg=OPERAXNTheme.COLORS['text_primary']
-                     ).grid(row=row, column=0, sticky="e", padx=(0, 8), pady=2)
+            self.create_themed_label(details, label).grid(
+                row=row, column=0, sticky="e", padx=(0, 8), pady=2)
             entry = self._entry(details, var, width=28)
             entry.grid(row=row, column=1, sticky="ew", pady=2)
             self._meta_entries.append(entry)
@@ -1357,7 +1279,7 @@ class UploadOptionsDialog(BaseDialog):
         self._scroll_outer.pack(side="top", fill="both", expand=True)
 
     def _block(self, parent: tk.Widget = None) -> tk.Frame:
-        """Centered content block; widgets inside anchor west (house style)."""
+        """Pack and return a centred content block; widgets inside anchor west."""
         frame = tk.Frame(parent or self._body,
                          bg=OPERAXNTheme.COLORS['bg_primary'])
         frame.pack()
@@ -1365,7 +1287,7 @@ class UploadOptionsDialog(BaseDialog):
 
     def _entry(self, parent: tk.Widget, var: tk.StringVar, width: int,
                readonly: bool = False) -> tk.Entry:
-        """Themed entry, optionally read-only (for picker-filled fields)."""
+        """Create a themed entry, optionally read-only (for picker-filled fields)."""
         kwargs = ({"state": "readonly",
                    "readonlybackground": OPERAXNTheme.COLORS['bg_tertiary']}
                   if readonly else {})
@@ -1373,7 +1295,7 @@ class UploadOptionsDialog(BaseDialog):
 
     @staticmethod
     def _small_button(parent: tk.Widget, text: str, command) -> tk.Button:
-        """Compact themed picker button, packed to the left."""
+        """Create a compact themed picker button, packed to the left."""
         btn = tk.Button(parent, text=text, command=command, width=9,
                         bg=OPERAXNTheme.COLORS['button_bg'],
                         fg=OPERAXNTheme.COLORS['button_text'],
@@ -1431,13 +1353,9 @@ class UploadOptionsDialog(BaseDialog):
     # --- dynamic enabling ---
 
     def _is_direct_nxs(self) -> bool:
-        """True when the selection is a single canonical .nxs opened directly.
-
-        Matches the backend test in input.process_paths: a third-party .nxs is
-        still regenerated, so its generation options must stay live. The
-        canonical probe reads only a few keys, but it is cached per path
-        because every source radio click re-runs the state update.
-        """
+        """True when the selection is one canonical .nxs, as in input.process_paths.
+        A third-party .nxs is regenerated, so its options stay live. Cached per path, as
+        every source radio click re-runs the state update."""
         if len(self._paths) != 1 or not self._paths[0].lower().endswith(".nxs"):
             return False
         path = self._paths[0]
@@ -1463,6 +1381,7 @@ class UploadOptionsDialog(BaseDialog):
             self.include_2d_var.set(False)
         self.std_select_btn.config(state=gen_state)
         self.std_clear_btn.config(state=gen_state)
+        self.tolerance_entry.config(state=gen_state)
 
         # Experiment metadata is generation-only too: _confirm drops it for a
         # direct .nxs, so leaving it typeable would silently discard the input.
@@ -1476,29 +1395,23 @@ class UploadOptionsDialog(BaseDialog):
     # --- result ---
 
     def _confirm(self) -> None:
-        """Build the UploadOptions result and close; an empty selection is
-        valid only to append standard echem to already-loaded data."""
-        if not self._paths:
-            if not (self._has_loaded_data and self._std_echem):
-                messagebox.showerror("Error", "Please select files or a directory",
-                                     parent=self)
-                return
+        """Build the UploadOptions result and close.
+        An empty selection is valid only to append standard echem to already-loaded data."""
+        if not self._paths and not (self._has_loaded_data and self._std_echem):
+            messagebox.showerror("Error", "Please select files or a directory",
+                                 parent=self)
+            return
 
         size_val = self.size_var.get()
         display_size = 0 if size_val == "No downsampling" else int(size_val)
 
-        source_map = {
-            "inhouse": DataSourceType.INHOUSE,
-            "synchrotron": DataSourceType.SYNCHROTRON,
-            "neutron": DataSourceType.NEUTRON,
-        }
-
         # The whole metadata block is generation-only: a directly opened .nxs
         # ignores it, so the fields are greyed there and nothing is collected
-        # (and their validation is skipped).
-        if self._is_direct_nxs():
+        # (and their validation is skipped). Appending standard echem alone
+        # ignores it too.
+        if self._is_direct_nxs() or not self._paths:
             title = sample_name = sample_description = None
-            prep_date, protocol = None, None
+            prep_date, protocol, tolerance = None, None, None
         else:
             title = self.title_var.get().strip() or None
             sample_name = self.sample_var.get().strip() or None
@@ -1509,10 +1422,13 @@ class UploadOptionsDialog(BaseDialog):
             protocol = self._validated_protocol()
             if protocol is False:
                 return
+            tolerance = self._validated_tolerance()
+            if tolerance is False:
+                return
 
         self.result = UploadOptions(
             paths=list(self._paths),
-            data_source=source_map[self.source_var.get()],
+            data_source=DataSourceType(self.source_var.get()),
             time_method=TimeMethod(self.time_var.get()),
             display_size=display_size,
             include_2d=self.include_2d_var.get(),
@@ -1522,12 +1438,13 @@ class UploadOptionsDialog(BaseDialog):
             sample_preparation_date=prep_date,
             cycling_protocol=protocol,
             standard_echem_files=list(self._std_echem) or None,
+            echem_time_tolerance=tolerance,
         )
         self.destroy()
 
     def _validated_prep_date(self):
-        """Stripped preparation date, None when blank, or False (after an
-        error box) when it does not parse as ISO 8601."""
+        """Return the stripped preparation date, or None when blank.
+        False (after an error box) means it does not parse as ISO 8601."""
         text = self.prep_date_var.get().strip()
         if not text:
             return None
@@ -1541,9 +1458,28 @@ class UploadOptionsDialog(BaseDialog):
             return False
         return text
 
+    def _validated_tolerance(self):
+        """Return the echem time tolerance in seconds; None (the core default) when blank.
+        False (after an error box) means the field is not a positive finite number;
+        anything above core's limit falls back to that limit."""
+        text = self.tolerance_var.get().strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            value = None
+        if value is None or not np.isfinite(value) or value <= 0:
+            messagebox.showerror(
+                "Echem time tolerance",
+                f"'{text}' is not a positive number of seconds",
+                parent=self)
+            return False
+        return min(value, MAX_ECHEM_TIME_TOLERANCE)
+
     def _validated_protocol(self):
-        """Cycling-protocol dict (empty fields omitted), None when every
-        field is blank, or False (after an error box) when invalid."""
+        """Return the cycling-protocol dict (blank fields omitted), or None when all are blank.
+        False (after an error box) means a field is invalid."""
         fields = [
             ("technique", self.proto_technique_var),
             ("voltage_window_lower", self.proto_v_lower_var),
@@ -1617,8 +1553,7 @@ class ProgressDialog(BaseDialog):
         self.update()
 
     def update_progress(self, value: int, text: str) -> bool:
-        """Set bar value and label text, forcing a repaint; returns False
-        if the dialog was closed (so callers can stop reporting)."""
+        """Set the bar value and label text and repaint; return False once the dialog is closed."""
         if not self.winfo_exists():
             return False
 

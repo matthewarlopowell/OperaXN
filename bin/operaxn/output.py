@@ -1,6 +1,8 @@
 """
-Matplotlib plotting layer: themed figure layouts, 1D/2D/echem/neutron
-plotters with a plot-object cache, and publication-quality figure export.
+Matplotlib plotting layer: figure layouts, 1D/2D/echem/neutron plotters and single-scan export.
+
+Plotters cache their artists per axes and update them in place between scans; clear axes
+through clear_plot_axes so cache entries and companion axes (colorbar, twinx) go with them.
 """
 
 import logging
@@ -21,6 +23,10 @@ from matplotlib.ticker import ScalarFormatter
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from .config import (
+    DSPACING_LABEL,
+    TIME_HOURS_LABEL,
+    TOF_LABEL,
+    TWOTHETA_LABEL,
     CACHE_ENABLED,
     COLORMAP,
     DEFAULT_AXIS_PADDING_PERCENT,
@@ -37,7 +43,6 @@ from .config import (
     LARGE_IMAGE_THRESHOLD,
     LINE_WIDTH,
     LRU_CACHE_MAXSIZE,
-    MAX_CACHE_SIZE_MB,
     SECONDS_PER_HOUR,
     SYNCHROTRON_WAVELENGTH,
     TICK_FONT_SIZE,
@@ -90,36 +95,16 @@ class PlotConfig:
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'PlotConfig':
-        """Create PlotConfig from dictionary, applying defaults for missing fields."""
+        """Build a PlotConfig from a dict; unknown keys are ignored, missing fields default."""
         if not config_dict:
             return cls()
-
-        # Set defaults for missing fields
-        defaults = {
-            'neutron_xmin': None,
-            'neutron_xmax': None,
-            'neutron_ymin': None,
-            'neutron_ymax': None,
-            'show_neutron_dspacing': False,
-            'twod_xmin_percent': DEFAULT_TWOD_XMIN_PERCENT,
-            'twod_xmax_percent': DEFAULT_TWOD_XMAX_PERCENT,
-            'twod_ymin_percent': DEFAULT_TWOD_YMIN_PERCENT,
-            'twod_ymax_percent': DEFAULT_TWOD_YMAX_PERCENT,
-            'use_cache': CACHE_ENABLED,
-            'is_neutron': False
-        }
-
-        # Merge onto a copy: mutating the caller's dict would surprise
-        # callers that reuse or serialise their config
-        config_dict = {**defaults, **config_dict}
-
         return cls(**{k: v for k, v in config_dict.items()
                       if k in cls.__dataclass_fields__})
 
 
 @dataclass
 class FigureLayout:
-    """Dataclass holding figure size, DPI, and axes arrangement."""
+    """Figure size, DPI, axes arrangement and gridspec spacing for one layout."""
     figure_size: Tuple[float, float]
     dpi: int
     axes_arrangement: Dict[str, Any]
@@ -134,12 +119,11 @@ class FigureLayout:
 # ============================================================================
 
 class PlotObjectCache:
-    """Thread-safe LRU cache for matplotlib plot objects."""
+    """Thread-safe cache of matplotlib artists, evicting the least frequently used past 100."""
 
-    def __init__(self, max_size_mb: int = MAX_CACHE_SIZE_MB) -> None:
+    def __init__(self) -> None:
         self.cache = {}
         self.lock = threading.Lock()
-        self.max_size_bytes = max_size_mb * 1024 * 1024
         self.access_count = {}
         self.enabled = CACHE_ENABLED
 
@@ -153,12 +137,11 @@ class PlotObjectCache:
             return self.cache.get(key)
 
     def set(self, key: str, obj: Any) -> None:
-        """Store an object with LRU eviction; no-op while disabled."""
+        """Store an object, evicting the 20 least-used entries when full; no-op while disabled."""
         if not self.enabled:
             return
         with self.lock:
             if len(self.cache) > 100:
-                # LRU eviction
                 sorted_keys = sorted(self.access_count.keys(),
                                      key=lambda k: self.access_count.get(k, 0))
                 for k in sorted_keys[:20]:
@@ -169,7 +152,7 @@ class PlotObjectCache:
             self.access_count[key] = 1
 
     def remove(self, key: str) -> None:
-        """Remove cached object by key."""
+        """Remove the cached object for key, if present."""
         with self.lock:
             self.cache.pop(key, None)
             self.access_count.pop(key, None)
@@ -181,7 +164,6 @@ class PlotObjectCache:
             self.access_count.clear()
 
 
-# Global cache instance
 _plot_cache = PlotObjectCache()
 
 
@@ -246,7 +228,7 @@ class DataTransformer:
     def theta_to_d_spacing(two_theta: Union[float, np.ndarray],
                            wavelength: float = XRAY_WAVELENGTH,
                            is_synchrotron: bool = False) -> np.ndarray:
-        """Convert 2-theta angles to d-spacing via Bragg's law."""
+        """Convert 2-theta to d-spacing via Bragg's law; is_synchrotron overrides wavelength."""
         if is_synchrotron:
             wavelength = SYNCHROTRON_WAVELENGTH
 
@@ -287,7 +269,6 @@ class BasePlotter(ABC):
     @abstractmethod
     def plot(self, ax: plt.Axes, *args: Any, **kwargs: Any) -> Any:
         """Render data onto the given axes."""
-        pass
 
     def clear(self, ax: plt.Axes, cache_prefix: Optional[str] = None) -> None:
         """Clear axes and remove associated cache entry."""
@@ -305,7 +286,7 @@ class BasePlotter(ABC):
                          config_max: Optional[float],
                          is_y: bool = False,
                          padding_percent: float = DEFAULT_AXIS_PADDING_PERCENT) -> Tuple[float, float]:
-        """Calculate axis limits from data range with optional padding."""
+        """Return (min, max) from the data range, y padded; configured limits override."""
         if config_min is not None and config_max is not None:
             return config_min, config_max
 
@@ -313,7 +294,7 @@ class BasePlotter(ABC):
         data_max = np.nanmax(data) if len(data) > 0 else 1
 
         if is_y:
-            # Add padding to y-axis
+            # Pad y, but never pad a positive minimum below zero
             data_range = data_max - data_min
             padding = data_range * padding_percent / 100.0
             data_max = data_max + padding
@@ -349,13 +330,11 @@ class NeutronPlotter(BasePlotter):
         if config is None:
             config = PlotConfig()
 
-        # Clear all neutron axes
         for bank_num in range(1, 6):
             ax_key = f'neutron_{bank_num}'
             if ax_key in axes_dict:
                 axes_dict[ax_key].clear()
 
-        # Plot each bank
         for bank_num in range(1, 6):
             self._plot_bank(axes_dict, neutron_data, str(bank_num), config)
 
@@ -375,7 +354,6 @@ class NeutronPlotter(BasePlotter):
 
         measurement_data = neutron_data[bank_num]
 
-        # Choose data source based on config
         data, xlabel = self._get_data_source(measurement_data, bank_num, config)
 
         if data is None:
@@ -387,10 +365,8 @@ class NeutronPlotter(BasePlotter):
         if self.cache_enabled:
             _plot_cache.remove(cache_key)
 
-        # Plot data
         ax.plot(data['x'], data['y'], linewidth=self._line_width, color='blue')
 
-        # Format axis
         x_lim = self._get_axis_limits(data['x'], config.neutron_xmin, config.neutron_xmax)
         y_lim = self._get_axis_limits(data['y'], config.neutron_ymin, config.neutron_ymax, is_y=True)
 
@@ -401,31 +377,29 @@ class NeutronPlotter(BasePlotter):
 
         ax.set_title(f"Bank {bank_num}", fontsize=LABEL_FONT_SIZE - 1)
 
-        # Cache if enabled
         if ax.lines and config.use_cache:
             _plot_cache.set(cache_key, ax.lines[0])
 
     def _get_data_source(self, measurement_data: Dict[str, Any], bank_num: str,
                          config: PlotConfig) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        """Select TOF or d-spacing data source for a bank."""
+        """Return a bank's (data, x label), falling back to the other x axis when missing."""
         if config.show_neutron_dspacing:
             if 'd' in measurement_data:
-                return measurement_data['d'], "d-spacing (Å)"
+                return measurement_data['d'], DSPACING_LABEL
             elif 'tof' in measurement_data:
                 logger.debug("d-spacing not available for bank %s, showing TOF", bank_num)
-                return measurement_data['tof'], "Time of Flight (μs)"
+                return measurement_data['tof'], TOF_LABEL
         else:
             if 'tof' in measurement_data:
-                return measurement_data['tof'], "Time of Flight (μs)"
+                return measurement_data['tof'], TOF_LABEL
             elif 'd' in measurement_data:
                 logger.debug("TOF not available for bank %s, showing d-spacing", bank_num)
-                return measurement_data['d'], "d-spacing (Å)"
+                return measurement_data['d'], DSPACING_LABEL
 
         return None, None
 
     def plot(self, ax: plt.Axes, *args: Any, **kwargs: Any) -> None:
-        """Not used for neutron; delegates to plot_grid instead."""
-        pass
+        """Do nothing: neutron banks are drawn by plot_grid."""
 
 
 class OneDPlotter(BasePlotter):
@@ -462,14 +436,11 @@ class OneDPlotter(BasePlotter):
                      config: PlotConfig) -> None:
         """Update data on an existing cached plot line."""
         if config.show_dspacing:
-            d_data = self.transformer.theta_to_d_spacing(
+            x_data = self.transformer.theta_to_d_spacing(
                 x_data, is_synchrotron=config.is_synchrotron
             )
-            plot_line.set_data(d_data, y_data)
-            self._format_dspacing_axis(ax, d_data, y_data, config)
-        else:
-            plot_line.set_data(x_data, y_data)
-            self._format_twotheta_axis(ax, x_data, y_data, config)
+        plot_line.set_data(x_data, y_data)
+        self._format_oned_axis(ax, x_data, y_data, config)
 
     def _create_plot(self, ax: plt.Axes, x_data: np.ndarray,
                      y_data: np.ndarray, config: PlotConfig,
@@ -478,37 +449,24 @@ class OneDPlotter(BasePlotter):
         self.clear(ax, "oned")
 
         if config.show_dspacing:
-            d_data = self.transformer.theta_to_d_spacing(
+            x_data = self.transformer.theta_to_d_spacing(
                 x_data, is_synchrotron=config.is_synchrotron
             )
-            ax.plot(d_data, y_data, "b-", linewidth=self._line_width)
-            self._format_dspacing_axis(ax, d_data, y_data, config)
-        else:
-            ax.plot(x_data, y_data, "b-", linewidth=self._line_width)
-            self._format_twotheta_axis(ax, x_data, y_data, config)
+        ax.plot(x_data, y_data, "b-", linewidth=self._line_width)
+        self._format_oned_axis(ax, x_data, y_data, config)
 
         if ax.lines and config.use_cache:
             _plot_cache.set(cache_key, ax.lines[0])
 
-    def _format_twotheta_axis(self, ax: plt.Axes, x_data: np.ndarray,
-                              y_data: np.ndarray, config: PlotConfig) -> None:
-        """Apply 2-theta axis labels and limits."""
+    def _format_oned_axis(self, ax: plt.Axes, x_data: np.ndarray,
+                          y_data: np.ndarray, config: PlotConfig) -> None:
+        """Apply 2-theta or d-spacing (per config.show_dspacing) labels and limits."""
         x_lim = self._get_axis_limits(x_data, config.oned_xmin, config.oned_xmax)
         y_lim = self._get_axis_limits(y_data, config.oned_ymin, config.oned_ymax, is_y=True)
+        xlabel = DSPACING_LABEL if config.show_dspacing else TWOTHETA_LABEL
 
         self.formatter.format_axis(
-            ax, "2θ (degrees)", "Intensity (counts)",
-            xlim=x_lim, ylim=y_lim, scientific_y=True
-        )
-
-    def _format_dspacing_axis(self, ax: plt.Axes, d_data: np.ndarray,
-                              y_data: np.ndarray, config: PlotConfig) -> None:
-        """Apply d-spacing axis labels and limits."""
-        x_lim = self._get_axis_limits(d_data, config.oned_xmin, config.oned_xmax)
-        y_lim = self._get_axis_limits(y_data, config.oned_ymin, config.oned_ymax, is_y=True)
-
-        self.formatter.format_axis(
-            ax, "d-spacing (Å)", "Intensity (counts)",
+            ax, xlabel, "Intensity (counts)",
             xlim=x_lim, ylim=y_lim, scientific_y=True
         )
 
@@ -549,8 +507,8 @@ class TwoDPlotter(BasePlotter):
                                      extent, cache_key, config)
 
     def clear(self, ax: plt.Axes, cache_prefix: Optional[str] = None) -> None:
-        """Clear axes and cache entry, removing any companion colorbar axes
-        (ax.clear() leaves the _colorbar_ax attribute and its axes behind)."""
+        """Clear axes and cache entry, also removing any companion colorbar axes.
+        ax.clear() alone leaves the _colorbar_ax attribute and its axes behind."""
         super().clear(ax, cache_prefix)
         if hasattr(ax, '_colorbar_ax'):
             try:
@@ -565,7 +523,7 @@ class TwoDPlotter(BasePlotter):
 
     def _calculate_extent(self, image_data: np.ndarray,
                           config: PlotConfig) -> Tuple[float, float, float, float]:
-        """Calculate image extent after applying crop percentages."""
+        """Return the image extent after applying the crop percentages."""
         base_extent = (0, 1, 0, 1) if config.is_synchrotron else (0, 1 / 2.5, 0, 1)
 
         x_min, x_max, y_min, y_max = base_extent
@@ -590,13 +548,12 @@ class TwoDPlotter(BasePlotter):
         """Crop image array to the configured percentage bounds."""
         height, width = image_data.shape
 
-        # Calculate crop indices
         x_min_idx = int(width * config.twod_xmin_percent / 100)
         x_max_idx = int(width * config.twod_xmax_percent / 100)
         y_min_idx = int(height * config.twod_ymin_percent / 100)
         y_max_idx = int(height * config.twod_ymax_percent / 100)
 
-        # Ensure valid indices
+        # Clamp to the image, keeping at least one pixel per axis
         x_min_idx = max(0, min(x_min_idx, width - 1))
         x_max_idx = max(x_min_idx + 1, min(x_max_idx, width))
         y_min_idx = max(0, min(y_min_idx, height - 1))
@@ -606,7 +563,7 @@ class TwoDPlotter(BasePlotter):
 
     def _calculate_intensity_limits(self, image_data: np.ndarray,
                                     intensity_limits: Optional[Tuple[float, float]]) -> Tuple[float, float]:
-        """Derive vmin/vmax intensity limits from image data."""
+        """Return (vmin, vmax) from valid given limits or the data, floored for LogNorm."""
         if intensity_limits and intensity_limits[0] < intensity_limits[1]:
             vmin, vmax = intensity_limits
         else:
@@ -624,7 +581,8 @@ class TwoDPlotter(BasePlotter):
                 vmin, vmax = valid_data.min(), valid_data.max()
 
         vmin = max(vmin, VMIN_FLOOR)
-        vmax = max(vmax, vmin * 10) if vmax <= vmin else vmax
+        if vmax <= vmin:
+            vmax = vmin * 10
 
         return vmin, vmax
 
@@ -679,7 +637,7 @@ class TwoDPlotter(BasePlotter):
         return im
 
     def _add_colorbar(self, ax: plt.Axes, im: Any) -> None:
-        """Add intensity colour bar to the 2D plot."""
+        """Attach the intensity colour bar unless the axes already has one."""
         if hasattr(ax, '_colorbar_ax'):
             return
 
@@ -724,7 +682,7 @@ class EchemPlotter(BasePlotter):
         self._update_scan_marker(ax, scan_times, current_scan_idx, config)
 
         if show_voltage or show_current:
-            ax.set_xlabel("Time (hours)", fontsize=LABEL_FONT_SIZE)
+            ax.set_xlabel(TIME_HOURS_LABEL, fontsize=LABEL_FONT_SIZE)
             ax.tick_params(axis='x', labelsize=TICK_FONT_SIZE)
 
     def clear(self, ax: plt.Axes, cache_prefix: Optional[str] = None) -> None:
@@ -737,7 +695,7 @@ class EchemPlotter(BasePlotter):
 
     def _should_show_current(self, config: PlotConfig,
                              current_data: Optional[np.ndarray]) -> bool:
-        """Return True if current data is valid and enabled."""
+        """True when current display is on and the data holds a non-NaN value."""
         return (config.show_current and
                 current_data is not None and
                 len(current_data) > 0 and
@@ -745,8 +703,8 @@ class EchemPlotter(BasePlotter):
 
     @staticmethod
     def _line_attached(line: Any, ax: plt.Axes) -> bool:
-        """True when the cached line still belongs to this axes or its twin
-        (a raw ax.clear() detaches lines without evicting the cache)."""
+        """True when the cached line still belongs to this axes or its twin.
+        A raw ax.clear() detaches lines without evicting the cache."""
         if line is None:
             return False
         if line in ax.lines:
@@ -756,7 +714,7 @@ class EchemPlotter(BasePlotter):
 
     def _needs_recreate(self, ax: plt.Axes, show_voltage: bool,
                         show_current: bool) -> bool:
-        """Return True if the plot must be rebuilt from scratch."""
+        """True when the plot must be rebuilt rather than updated in place."""
         voltage_line = _plot_cache.get(self._get_cache_key(ax, "echem_v"))
         current_line = _plot_cache.get(self._get_cache_key(ax, "echem_c"))
 
@@ -889,7 +847,7 @@ class EchemPlotter(BasePlotter):
     def _update_scan_marker(self, ax: plt.Axes, scan_times: Optional[List[float]],
                             current_scan_idx: Optional[int],
                             config: Optional[PlotConfig] = None) -> None:
-        """Add or update vertical scan-position marker line."""
+        """Place, move or hide the dashed scan-position marker."""
         cache_key = self._get_cache_key(ax, "echem_marker")
         marker_line = _plot_cache.get(cache_key)
 
@@ -920,7 +878,7 @@ class EchemPlotter(BasePlotter):
 # ============================================================================
 
 class FigureLayoutManager:
-    """Creates matplotlib figures with data-driven subplot arrangements."""
+    """Factory for matplotlib figures whose subplot arrangement follows the available data."""
 
     LAYOUT_CONFIGS = {
         LayoutType.ALL: FigureLayout(
@@ -979,7 +937,6 @@ class FigureLayoutManager:
         title = self._create_title(scan_num, echem_value, current_value, has_neutron)
         fig.suptitle(title, fontsize=TITLE_FONT_SIZE, fontweight="bold")
 
-        # Adjust spacing
         if layout_type == LayoutType.NEUTRON_GRID:
             fig.subplots_adjust(top=0.92, bottom=0.08, left=0.06, right=0.94,
                                 hspace=0.35, wspace=0.2)
@@ -1068,9 +1025,10 @@ class FigureLayoutManager:
 
         return axes
 
-    def _create_title(self, scan_num: int, echem_value: Optional[float],
+    @staticmethod
+    def _create_title(scan_num: int, echem_value: Optional[float],
                       current_value: Optional[float], has_neutron: bool = False) -> str:
-        """Build scan title string with optional voltage and current."""
+        """Build the scan title string with optional voltage and current."""
         title = f"{'Neutron ' if has_neutron else ''}Scan {scan_num}"
         if echem_value is not None:
             title += f" (V: {echem_value:.3f} V"
@@ -1100,7 +1058,7 @@ def plot_oned_data(ax: plt.Axes, x_data: np.ndarray, y_data: np.ndarray,
                    current_value: Optional[float] = None,
                    plot_config: Optional[Dict[str, Any]] = None) -> None:
     """Plot 1D XRD intensity pattern on the given axes."""
-    config = PlotConfig.from_dict(plot_config) if plot_config else PlotConfig()
+    config = PlotConfig.from_dict(plot_config)
     _oned_plotter.plot(ax, x_data, y_data, scan_num, echem_value, current_value, config)
 
 
@@ -1111,7 +1069,7 @@ def plot_twod_data(ax: plt.Axes, image_data: np.ndarray, scan_num: int,
                    plot_config: Optional[Dict[str, Any]] = None,
                    extent: Optional[Tuple[float, float, float, float]] = None) -> Any:
     """Plot 2D XRD detector image on the given axes."""
-    config = PlotConfig.from_dict(plot_config) if plot_config else PlotConfig()
+    config = PlotConfig.from_dict(plot_config)
     return _twod_plotter.plot(ax, image_data, scan_num, echem_value,
                               current_value, intensity_limits, config, extent)
 
@@ -1122,7 +1080,7 @@ def plot_echem_data(ax: plt.Axes, time_data: np.ndarray, voltage_data: np.ndarra
                     current_scan_idx: Optional[int] = None,
                     plot_config: Optional[Dict[str, Any]] = None) -> None:
     """Plot electrochemistry voltage/current vs time."""
-    config = PlotConfig.from_dict(plot_config) if plot_config else PlotConfig()
+    config = PlotConfig.from_dict(plot_config)
     _echem_plotter.plot(ax, time_data, voltage_data, current_data,
                         scan_times, current_scan_idx, config)
 
@@ -1134,7 +1092,7 @@ def plot_neutron_data(fig: plt.Figure, axes_dict: Dict[str, plt.Axes],
                       current_value: Optional[float] = None,
                       plot_config: Optional[Dict[str, Any]] = None) -> None:
     """Plot neutron bank data across a 2x3 grid layout."""
-    config = PlotConfig.from_dict(plot_config) if plot_config else PlotConfig()
+    config = PlotConfig.from_dict(plot_config)
     _neutron_plotter.plot_grid(fig, axes_dict, neutron_data, scan_num,
                                echem_value, current_value, config)
 
@@ -1147,13 +1105,13 @@ def create_figure_layout(has_oned: bool, has_twod: bool, has_echem: bool,
                          current_value: Optional[float] = None,
                          plot_config: Optional[Dict[str, Any]] = None) -> Tuple[plt.Figure, Dict[str, plt.Axes]]:
     """Create figure and axes dict sized for the available data types."""
-    config = PlotConfig.from_dict(plot_config) if plot_config else PlotConfig()
+    config = PlotConfig.from_dict(plot_config)
     fig, axes = _layout_manager.create_layout(
         has_oned, has_twod, has_echem, has_neutron,
         figure_dpi, scan_num, echem_value, current_value, config
     )
 
-    # Handle special case for echem_single layout
+    # ECHEM_SINGLE: the layout manager only creates the echem axes; add the 1D/2D one below
     if has_echem and (has_oned or has_twod) and not (has_oned and has_twod) and not has_neutron:
         gs = fig.add_gridspec(2, 1, height_ratios=[1, 1.5], hspace=0.4)
         if has_oned:
@@ -1171,7 +1129,8 @@ def export_single_scan(scan_data: Dict[str, Any], output_path: str,
                        plot_config: Optional[Dict[str, Any]] = None,
                        show_scan_markers: bool = False,
                        extent: Optional[Tuple[float, float, float, float]] = None) -> None:
-    """Render a single scan to an image file at export resolution."""
+    """Render one scan's 1D/2D or neutron panels to an image file at export_dpi.
+    The echem panel is never drawn; plot_types['echem'] only toggles the title's V/I values."""
     if plot_types is None:
         plot_types = {"oned": True, "twod": True, "echem": True}
 
@@ -1230,8 +1189,7 @@ def clear_plot_cache() -> None:
 
 
 def clear_plot_axes(ax: plt.Axes, kind: str) -> None:
-    """Clear axes via the owning plotter so cache entries and companion
-    axes (colorbar, twinx) are removed with the artists."""
+    """Clear axes via the owning plotter so cache entries and colorbar/twinx axes go too."""
     if kind == "oned":
         _oned_plotter.clear(ax, "oned")
     elif kind == "twod":
@@ -1245,9 +1203,8 @@ def clear_plot_axes(ax: plt.Axes, kind: str) -> None:
 def get_scan_time_positions(scans: List[Dict[str, Any]],
                             echem_df: pd.DataFrame,
                             time_method: str = "absolute") -> List[Optional[float]]:
-    """Scan timestamps in seconds for echem plot markers, aligned 1:1 with
-    `scans` (None for scans without a usable timestamp, so index i always
-    refers to scan i)."""
+    """Return scan marker times in seconds, aligned 1:1 with `scans` (None for an untimed scan).
+    Times count from the echem start, or are the HH:MM:SS offset if relative; [] without echem."""
     if echem_df is None or echem_df.empty:
         return []
 
@@ -1257,7 +1214,7 @@ def get_scan_time_positions(scans: List[Dict[str, Any]],
         for scan in scans:
             seconds = None
             ts = scan.get("timestamp")
-            if ts and isinstance(ts, str) and ":" in ts:
+            if isinstance(ts, str) and ":" in ts:
                 parts = ts.split(":")
                 seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
             scan_times.append(seconds)
@@ -1270,7 +1227,7 @@ def get_scan_time_positions(scans: List[Dict[str, Any]],
                 # the echem point the scan was correlated against
                 scan_time = scan.get("timestamp_for_correlation")
                 if scan_time is None:
-                    scan_time = pd.to_datetime(scan["timestamp"])
+                    scan_time = scan["timestamp"]
                 time_diff = (pd.to_datetime(scan_time) - echem_start).total_seconds()
             scan_times.append(time_diff)
 

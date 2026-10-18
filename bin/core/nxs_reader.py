@@ -1,16 +1,9 @@
 """
 NeXus/HDF5 file reader for the core pipeline.
 
-Loads a canonical .nxs into an ExperimentModel. Dispatches on layout:
-- schema 4.0/3.0: single /entry with scan_NNNNNN NXsubentries; one loader
-  reads both, trying v4 names first (voltage, time/@start, bank_N +
-  bank_N_d, image_source) with v3 fallbacks ("voltage (V)", string
-  timestamps, combined bank groups, twod_* attributes).
-- schema 2.0 / legacy v1 files: root-level scan_NNNN groups
-  (metadata / xrd_data / neutron_data).
-
-Partial files render whatever they contain. Timestamps handed to the GUI
-are normalised to 'YYYY-MM-DD HH:MM:SS' whatever the file stores.
+Loads a canonical .nxs into an ExperimentModel. Schema 4.0/3.0 files (one /entry of
+scan_NNNNNN NXsubentries) share one loader, v4 names first with v3 fallbacks; schema 2.0
+and v1 files use root-level scan_NNNN groups. Partial files render whatever they contain.
 """
 
 import logging
@@ -45,13 +38,10 @@ def _display_ts(value: Any) -> Any:
 
 
 def _entry_is_canonical(entry) -> bool:
-    """True when /entry carries OperaXN provenance or our scan_ subgroups:
-    the v3 generator attribute, a definition naming an NXoperando_*
-    application definition, or a generating program named operaxn
-    (process/program, or program_name in files written before 17 Sep 2026).
-    The generic NeXus names alone (a 'definition' or 'process' member) do
-    not qualify: raw facility files carry them too."""
-    if entry is None or not isinstance(entry, h5py.Group):
+    """True when /entry has scan_ subgroups or OperaXN provenance.
+    Provenance is a v3 @generator, an NXoperando* definition or an operaxn process/program
+    (program_name before 17 Sep 2026); raw files carry a bare definition or process too."""
+    if not isinstance(entry, h5py.Group):
         return False
     if 'generator' in entry.attrs:
         return True
@@ -70,8 +60,7 @@ def _entry_is_canonical(entry) -> bool:
 
 
 def is_canonical_nxs(path: str) -> bool:
-    """True if the file looks like one of our generated files, as opposed to a
-    raw beamline .nxs."""
+    """True when the file looks like an OperaXN-generated .nxs rather than a raw beamline one."""
     try:
         with h5py.File(path, 'r') as f:
             # v4/v3 layout: /entry with our provenance or scan_ subgroups
@@ -92,9 +81,7 @@ def load(path: str) -> ExperimentModel:
 
     with h5py.File(path, 'r') as f:
         entry = f.get('entry')
-        is_v3 = _entry_is_canonical(entry)
-
-        if is_v3:
+        if _entry_is_canonical(entry):
             _load_v3(entry, model)
         else:
             _load_legacy(f, model)
@@ -118,8 +105,7 @@ def _scan_groups(parent: h5py.Group):
 # ============================================================================
 
 def _load_v3(entry: h5py.Group, model: ExperimentModel) -> None:
-    """Populate the model from a /entry NXentry (schema 4.0/3.0 layouts,
-    v4 names first with v3 fallbacks)."""
+    """Populate the model from a schema 4.0/3.0 /entry NXentry."""
     _read_global_metadata_v3(entry, model)
     _read_operando_echem(entry, model)
     _read_standard_echem(entry, model)
@@ -129,9 +115,8 @@ def _load_v3(entry: h5py.Group, model: ExperimentModel) -> None:
 
 
 def _read_global_metadata_v3(entry: h5py.Group, model: ExperimentModel) -> None:
-    """Entry fields/attrs + instrument/sample/user groups -> flat metadata.
-    v4 provenance (process/program, process/version, ...) lands on the same
-    keys the v3 entry attrs used, so GUI consumers see one shape for both."""
+    """Read entry attrs, fields and metadata groups into model.global_metadata.
+    v4 process fields map onto the v3 attr keys (program -> generator) so both read alike."""
     out: Dict[str, Any] = {}
 
     for attr_name, attr_val in entry.attrs.items():
@@ -168,6 +153,14 @@ def _read_global_metadata_v3(entry: h5py.Group, model: ExperimentModel) -> None:
             if version is not None:
                 out['generator_version'] = _decode(version)
 
+    # The echem-to-scan correlation tolerance (s) sits with the record it
+    # bounds; files written before it was recorded carry no key
+    echem = entry.get('operando_electrochemistry')
+    if isinstance(echem, h5py.Group):
+        tolerance = _float_or_none(_dataset_scalar(echem, 'echem_time_tolerance'))
+        if tolerance is not None:
+            out['echem_time_tolerance'] = tolerance
+
     for group_name in ('instrument', 'sample', 'user', 'cycling_protocol', 'monitor'):
         grp = entry.get(group_name)
         if isinstance(grp, h5py.Group):
@@ -178,7 +171,7 @@ def _read_global_metadata_v3(entry: h5py.Group, model: ExperimentModel) -> None:
 
 
 def _flatten_group(grp: h5py.Group, max_depth: int = 3) -> Dict[str, Any]:
-    """Recursively flatten a metadata group into nested dicts of decoded values."""
+    """Return a group as nested dicts of decoded values; datasets over 100 items are skipped."""
     out: Dict[str, Any] = {}
     for attr_name, attr_val in grp.attrs.items():
         out[attr_name] = _decode(attr_val)
@@ -193,7 +186,7 @@ def _flatten_group(grp: h5py.Group, max_depth: int = 3) -> Dict[str, Any]:
 
 
 def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
-    """One scan_N NXsubentry -> ScanData (environment, monitor, data, banks)."""
+    """Read one scan_N NXsubentry (environment, monitor, data, banks) into a ScanData."""
     scan_num = int(_SCAN_GROUP_RE.fullmatch(name).group(1))
     scan = ScanData(scan_num=int(sub.attrs.get('scan_number', scan_num)))
 
@@ -280,18 +273,18 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
         b = sub[key]
         bank_num, is_d = m.group(1), bool(m.group(2))
         if is_d:
-            trace = _read_bank_trace(b, 'd_spacing', 'data', 'data_errors',
-                                     ('source_file',))
+            trace = _read_trace(b, 'd_spacing', 'data', 'data_errors',
+                                ('source_file',))
             if trace:
                 banks.setdefault(bank_num, {})['d'] = trace
         else:
-            trace = _read_bank_trace(b, 'time_of_flight', 'data', 'data_errors',
-                                     ('source_file', 'tof_source_file'))
+            trace = _read_trace(b, 'time_of_flight', 'data', 'data_errors',
+                                ('source_file', 'tof_source_file'))
             if trace:
                 banks.setdefault(bank_num, {})['tof'] = trace
             # v3 combined group: d family lives alongside TOF
-            trace = _read_bank_trace(b, 'd_spacing', 'd_data', 'd_errors',
-                                     ('d_source_file',))
+            trace = _read_trace(b, 'd_spacing', 'd_data', 'd_errors',
+                                ('d_source_file',))
             if trace:
                 banks.setdefault(bank_num, {})['d'] = trace
     if banks:
@@ -301,22 +294,15 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
 
 
 def _read_xrd_v3(grp: h5py.Group, scan: ScanData) -> None:
-    """1D pattern (with errors) plus the 2D image or its source reference."""
-    x = _dataset_1d(grp, 'polar_angle')
-    y = _dataset_1d(grp, 'data')
-    if x is not None and y is not None and len(x) == len(y):
-        oned = {
-            "x": np.asarray(x, dtype=float),
-            "y": np.asarray(y, dtype=float),
-            "source": _decode(grp.attrs.get('oned_source_file')),
-        }
-        e = _dataset_1d(grp, 'data_errors')
-        if e is None:
-            e = _dataset_1d(grp, 'errors')  # files written before the data_errors name
-        if e is not None and len(e) == len(x):
-            oned["e"] = np.asarray(e, dtype=float)
+    """Read the 1D pattern (with errors) and the v3 twod_* 2D attrs from the data group."""
+    oned = _read_trace(grp, 'polar_angle', 'data', 'data_errors', ('oned_source_file',))
+    if oned:
         scan.oned = oned
+    _read_twod_attrs(grp, scan)
 
+
+def _read_twod_attrs(grp: h5py.Group, scan: ScanData) -> None:
+    """Set the 2D source, embed flag and embedded image from twod_* attrs (v3 and legacy)."""
     scan.twod_source = _decode(grp.attrs.get('twod_source_path')) or \
         _decode(grp.attrs.get('twod_source'))
     embedded = grp.attrs.get('twod_embedded')
@@ -326,9 +312,9 @@ def _read_xrd_v3(grp: h5py.Group, scan: ScanData) -> None:
         scan.twod = np.asarray(grp['twod_image'][()], dtype=float)
 
 
-def _read_bank_trace(b: h5py.Group, x_name: str, y_name: str, e_name: str,
-                     source_attrs: tuple) -> Optional[Dict[str, Any]]:
-    """One x/y(/e) trace from a bank NXdata group, or None when absent."""
+def _read_trace(b: h5py.Group, x_name: str, y_name: str, e_name: str,
+                source_attrs: tuple) -> Optional[Dict[str, Any]]:
+    """Return one x/y(/e) trace from an NXdata group, or None when absent or mismatched."""
     x = _dataset_1d(b, x_name)
     y = _dataset_1d(b, y_name)
     if x is None or y is None or len(x) != len(y):
@@ -366,7 +352,7 @@ def _load_legacy(f: h5py.File, model: ExperimentModel) -> None:
 
 
 def _read_global_metadata_legacy(f: h5py.File, model: ExperimentModel) -> None:
-    """Contents of the root global_metadata group, when present."""
+    """Read the root global_metadata group, when present, into model.global_metadata."""
     if 'global_metadata' not in f:
         return
 
@@ -388,7 +374,7 @@ def _read_global_metadata_legacy(f: h5py.File, model: ExperimentModel) -> None:
 
 
 def _read_scan_legacy(scan_grp: h5py.Group, name: str) -> ScanData:
-    """One legacy scan group -> ScanData (metadata/xrd_data/neutron_data)."""
+    """Read one legacy scan group (metadata, xrd_data, neutron_data) into a ScanData."""
     scan_num = int(_SCAN_GROUP_RE.fullmatch(name).group(1))
     scan = ScanData(scan_num=int(scan_grp.attrs.get('scan_number', scan_num)))
 
@@ -413,13 +399,7 @@ def _read_scan_legacy(scan_grp: h5py.Group, name: str) -> ScanData:
                 "source": _decode(xrd.attrs.get('oned_source_file')),
             }
 
-        scan.twod_source = _decode(xrd.attrs.get('twod_source_path')) or \
-            _decode(xrd.attrs.get('twod_source'))
-        embedded = xrd.attrs.get('twod_embedded')
-        scan.twod_embedded = bool(embedded) if embedded is not None else False
-
-        if scan.twod_embedded and 'twod_image' in xrd:
-            scan.twod = np.asarray(xrd['twod_image'][()], dtype=float)
+        _read_twod_attrs(xrd, scan)
 
     if 'neutron_data' in scan_grp:
         ng = scan_grp['neutron_data']
@@ -461,8 +441,8 @@ def _read_scan_legacy(scan_grp: h5py.Group, name: str) -> ScanData:
 # ============================================================================
 
 def _read_echem_series(grp: h5py.Group) -> Optional[pd.DataFrame]:
-    """One echem NXdata group -> timestamp/echem_data/current DataFrame.
-    Reads the v4 time/@start convention first, then the v3 string arrays."""
+    """Read one echem NXdata group into a timestamp/echem_data/current DataFrame, or None.
+    Tries the v4 time/@start convention first, then the v3 string arrays."""
     # v4: time/@start + voltage/current
     v = _dataset_1d(grp, 'voltage')
     time_item = grp.get('time')
@@ -498,7 +478,7 @@ def _read_echem_series(grp: h5py.Group) -> Optional[pd.DataFrame]:
 
 
 def _read_operando_echem(parent: h5py.Group, model: ExperimentModel) -> None:
-    """Cycling protocol -> model.echem_df (empty frame when absent/invalid)."""
+    """Read operando_electrochemistry into model.echem_df (empty when absent or unreadable)."""
     df = None
     if 'operando_electrochemistry' in parent:
         df = _read_echem_series(parent['operando_electrochemistry'])
@@ -508,7 +488,7 @@ def _read_operando_echem(parent: h5py.Group, model: ExperimentModel) -> None:
 
 
 def _read_standard_echem(parent: h5py.Group, model: ExperimentModel) -> None:
-    """Each stored file_N dataset -> model.standard_echem entry."""
+    """Append each standard_electrochemistry file_N group to model.standard_echem."""
     if 'standard_electrochemistry' not in parent:
         return
 
@@ -536,7 +516,7 @@ def _read_standard_echem(parent: h5py.Group, model: ExperimentModel) -> None:
 # ============================================================================
 
 def _dataset_scalar(grp: h5py.Group, name: str) -> Optional[Any]:
-    """Raw value of a scalar dataset, or None when absent/unreadable."""
+    """Return a dataset's raw value, or None when absent or unreadable."""
     try:
         if name in grp:
             return grp[name][()]
@@ -546,7 +526,7 @@ def _dataset_scalar(grp: h5py.Group, name: str) -> Optional[Any]:
 
 
 def _first_scalar(grp: h5py.Group, *names: str) -> Optional[Any]:
-    """First present scalar dataset among names (v4 name, then v3 fallback)."""
+    """Return the first present scalar among names (v4 name, then v3 fallback)."""
     for name in names:
         val = _dataset_scalar(grp, name)
         if val is not None:
@@ -554,9 +534,8 @@ def _first_scalar(grp: h5py.Group, *names: str) -> Optional[Any]:
     return None
 
 
-
 def _dataset_1d(grp: h5py.Group, name: str) -> Optional[np.ndarray]:
-    """Dataset flattened to 1D, or None when absent/unreadable."""
+    """Return a dataset flattened to 1D, or None when absent or unreadable."""
     try:
         if name in grp:
             return np.array(grp[name][()]).reshape(-1)
@@ -566,7 +545,7 @@ def _dataset_1d(grp: h5py.Group, name: str) -> Optional[np.ndarray]:
 
 
 def _float_or_none(value: Any) -> Optional[float]:
-    """Value as float, or None when missing or non-numeric."""
+    """Return the value as a float, or None when missing or non-numeric."""
     if value is None:
         return None
     try:
@@ -576,7 +555,7 @@ def _float_or_none(value: Any) -> Optional[float]:
 
 
 def _decode(value: Any) -> Optional[Any]:
-    """Native Python value for HDF5 bytes/numpy scalars (arrays -> lists)."""
+    """Return HDF5 bytes or numpy values as native Python ones (multi-item arrays become lists)."""
     if value is None:
         return None
     if isinstance(value, bytes):
