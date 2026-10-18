@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  NXoperando_monopd — application definition for operando powder diffraction
+  NXoperando_monopd: application definition for operando powder diffraction
   of electrochemical cells using monochromatic X-rays or neutrons.
 
   Status: draft authored by the OperaXN project (WMG, University of Warwick);
@@ -12,17 +12,17 @@
   stored as one NXsubentry holding only its diffraction data and its
   environment (acquisition window and electrochemical state of the cell).
 
-  Version 1.0.0 — first release, shipped with OperaXN 2.0.0. Follows the
+  Version 1.0.0: first release, shipped with OperaXN 2.0.0. Follows the
   published specification (Tan et al., ACS Energy Lett.,
   doi:10.1021/acsenergylett.6c01791, Figure 4).
 
   Documented deviations from NXmonopd (intentional), in brief:
-  * detector data is NX_NUMBER, not NX_INT — patterns are azimuthally
+  * detector data is NX_NUMBER, not NX_INT, as patterns are azimuthally
     averaged, processed intensities;
   * an optional "data_errors" field carries the propagated uncertainties
     (Sigma_I), which NXmonopd does not define.
-  The complete deviation tables — against the published Figure 4 and against
-  the ratified NXmonopd/NXtofnpd parents — are maintained in
+  The complete deviation tables (against the published Figure 4 and against
+  the ratified NXmonopd/NXtofnpd parents) are maintained in
   definitions/README.md alongside this file.
 
   Time-of-flight neutron data uses the companion definition NXoperando_tofnpd.
@@ -273,6 +273,23 @@
                     <dim index="1" value="nE"/>
                 </dimensions>
             </field>
+            <field name="echem_time_tolerance" type="NX_FLOAT" units="NX_TIME" recommended="true">
+                <doc>
+                    Correlation tolerance used to match the scan subentries to
+                    this record: a scan is matched to the point nearest its
+                    correlation timestamp when the two lie less than this many
+                    seconds apart, and its environment/voltage and
+                    environment/current are then that point's values. The rule
+                    is two-sided: a scan whose correlation timestamp lies less
+                    than the tolerance before the first point or after the last point
+                    of the record is matched to that end point, and a scan
+                    at least the tolerance from every point stays
+                    uncorrelated. Set per run at generation (OperaXN default
+                    300 s; a file without this field was matched with 300 s);
+                    recommended because an OperaXN file always carries
+                    it and a file holding only the Figure 4 content does not.
+                </doc>
+            </field>
         </group>
 
         <group name="standard_electrochemistry" type="NXenvironment" optional="true">
@@ -328,13 +345,14 @@
                         midpoint-adjusted scan timestamp. Required in the
                         published Figure 4; recommended here because it is
                         present only when the acquisition was correlated with
-                        an electrochemistry point within the correlation
-                        tolerance, 300 s in OperaXN 2.0.0 (absent for
-                        uncorrelated scans and for diffraction-only files).
+                        an electrochemistry point less than the correlation
+                        tolerance away, as recorded in
+                        operando_electrochemistry/echem_time_tolerance (absent
+                        for uncorrelated scans and for diffraction-only files).
                         The tolerance also applies beyond either end of the
                         electrochemistry record: a scan whose correlation
-                        timestamp lies within 300 s before its first point or
-                        after its last is matched to that end point; its
+                        timestamp lies less than that tolerance before its first
+                        point or after its last is matched to that end point; its
                         voltage_min/voltage_max are then absent only when the
                         acquisition window itself holds no point.
                     </doc>
@@ -343,7 +361,8 @@
                     <doc>
                         Cell current at the matched electrochemistry point.
                         Same presence rule as voltage: written only when the
-                        scan was correlated within the correlation tolerance.
+                        scan was matched less than the correlation tolerance
+                        from an electrochemistry point.
                     </doc>
                 </field>
                 <field name="voltage_min" type="NX_FLOAT" units="NX_VOLTAGE" optional="true">

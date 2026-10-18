@@ -1,8 +1,8 @@
 """
-Shared configuration for the OperaXN core pipeline.
+Shared configuration for the core pipeline.
 
-GUI-specific settings (theme, window sizes, plot appearance) stay in the
-respective application packages; only values the core pipeline needs live here.
+GUI-specific settings (theme, window sizes, plot appearance) live in
+operaxn.config; only values the core pipeline needs live here.
 """
 
 import multiprocessing
@@ -23,15 +23,12 @@ DEFINITION_VERSION = "1.0.0"
 DEFINITION_URL_BASE = ("https://github.com/matthewarlopowell/OperaXN/"
                        "blob/main/definitions/")
 
-# After writing, validate and rewrite generated files through the pynxtools
-# dataconverter (checking them against the NXoperando_* definitions).
-# Requires pynxtools with an 'operaxn' reader registered; when anything is
-# missing or fails the plain NXSWriter file is kept, so the GUI never breaks.
-USE_PYNXTOOLS_WRITER = False
-
 # --- Correlation ---
 
 ECHEM_TIME_TOLERANCE = 300  # seconds, echem-to-scan nearest-neighbour matching
+# Largest usable tolerance (about 31.7 years): the correlator shifts timestamps by it,
+# and pandas timestamps must stay within 1677-2262
+MAX_ECHEM_TIME_TOLERANCE = 1e9  # seconds
 MAX_EXPOSURE_TIME = 3600  # seconds, reject computed exposures above this
 
 # --- Scan identification ---
@@ -155,8 +152,8 @@ INSTRUMENT_PROFILES = {
     },
 }
 
-# Fallbacks by data source (DataSourceType value) when no instrument name
-# could be harvested
+# Base profile by data source (DataSourceType value), overlaid by the named
+# instrument profile when one matches the harvested name
 DEFAULT_PROFILES = {
     "inhouse": {
         "source_name": "laboratory X-ray source",
@@ -184,8 +181,8 @@ CACHE_ENABLED = True
 MAX_CACHE_SIZE_MB = 1000
 PARALLEL_PROCESSING = True
 MAX_WORKERS = min(multiprocessing.cpu_count(), 8)
-BATCH_SIZE = 20
-PARALLEL_PROCESSING_THRESHOLD = 20  # min files to trigger parallel processing
+BATCH_SIZE = 20  # minimum files per parallel chunk
+PARALLEL_PROCESSING_THRESHOLD = 20  # go parallel above this many files
 
 # --- 2D data handling ---
 

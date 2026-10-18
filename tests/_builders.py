@@ -1,25 +1,14 @@
-"""Synthetic dataset builders shared by the test suite.
+"""Synthetic dataset builders shared by the test suite; no data files are committed.
 
-All datasets are generated at test time; no data files are committed.
-The default values are chosen so correlation results are exact by
-construction: echem runs at 60 s cadence from 10:00 with
-V = 3.7 + 0.01/step, so an XRD scan at 10:05 with 120 s exposure
-correlates at its 10:06 midpoint to V = 3.76, and a neutron scan
-logged 10:00-10:30 correlates at its 10:15 midpoint to V = 3.85.
-
-Two families of dataset live here and are deliberately different.
-The plain family (ONED_X/TOF_X/D_X/SCAN_TIMES/LOGBOOK_LINE,
-write_inhouse_dir, write_neutron_dir) is the minimal one most tests
-use: 50/40-point grids, 3 scans, a simple logbook. The DETAILED_*
-family (write_detailed_inhouse_dir, write_detailed_neutron_dir) uses
-30-point grids, 2 scans, and a richer logbook because the schema tests
-need to exercise the Sigma error column, Mantid headers naming POLARIS,
-the EDF harvest, and the alternate logbook column layout with the
-timestamps in the trailing fields. Keep the two apart: collapsing them
-onto one set of values would drop that coverage.
-
-examples/make_example_data.py duplicates these writers (deliberately
-standalone) -- keep the two in sync when changing values here.
+Defaults make correlation exact: echem runs at 60 s cadence from 10:00
+with V = 3.7 + 0.01/step, so an XRD scan at 10:05 with 120 s exposure
+correlates at its 10:06 midpoint to V = 3.76, and a neutron scan logged
+10:00-10:30 at its 10:15 midpoint to V = 3.85. The plain family
+(50/40-point grids, 3 scans, simple logbook) serves most tests; the
+DETAILED_* family (30-point grids, 2 scans, richer logbook) covers the
+Sigma column, POLARIS Mantid headers, EDF harvest and trailing-timestamp
+logbook layout, so keep the two apart. examples/make_example_data.py
+duplicates these writers standalone: keep the values in sync.
 """
 import os
 import zipfile
@@ -40,13 +29,13 @@ LOGBOOK_LINE = ("123456\tuser\tsample title\tMon Feb 05 10:00:00 2024\t"
 
 
 def inhouse_scan_y(i):
-    """Intensity array written for 1-based in-house scan number ``i``."""
+    """Return the intensity array written for 1-based in-house scan number ``i``."""
     return 100 + 10 * i + np.arange(50, dtype=float)
 
 
 def write_xrd_dat(path, timestamp, exposure="120.0", y=None):
-    """XRD .dat file: '# Date' (timestamp must be the last token),
-    '# ExposureTime', and a column-header comment, then x/y data rows."""
+    """Write an XRD .dat: '# Date <timestamp>', '# ExposureTime', a column header, x/y rows.
+    The timestamp must be the last token of the '# Date' line."""
     if y is None:
         y = inhouse_scan_y(1)
     lines = [f"# Date {timestamp}", f"# ExposureTime {exposure}", "# tth Intensity"]
@@ -57,7 +46,7 @@ def write_xrd_dat(path, timestamp, exposure="120.0", y=None):
 
 def write_echem_txt(path, n_rows=40, v0=3.7, dv=0.01, i0=0.1, di=0.001,
                     date="05/02/2024", hour=10):
-    """Echem .txt: tab-delimited header + dayfirst timestamps at 60 s cadence."""
+    """Write an echem .txt: tab-delimited header and dayfirst timestamps at 60 s cadence."""
     rows = ["Time\tEwe/V\tI/mA"]
     for m in range(n_rows):
         rows.append(f"{date} {hour}:{m:02d}:00\t{v0 + m * dv:.4f}\t{i0 + m * di:.4f}")
@@ -66,8 +55,8 @@ def write_echem_txt(path, n_rows=40, v0=3.7, dv=0.01, i0=0.1, di=0.001,
 
 
 def write_arbin_xlsx(path, n_rows=40, v0=3.7, dv=0.01, i0=0.1, di=0.001):
-    """Arbin-style echem .xlsx: absolute Date_Time plus an elapsed-seconds
-    Test_Time(s) trap column; values match write_echem_txt's anchors."""
+    """Write an Arbin-style echem .xlsx matching write_echem_txt's anchors: absolute
+    Date_Time plus an elapsed-seconds Test_Time(s) trap column."""
     times = pd.date_range("2024-02-05 10:00:00", periods=n_rows, freq="60s")
     df = pd.DataFrame({
         "Data_Point": np.arange(1, n_rows + 1),
@@ -79,17 +68,22 @@ def write_arbin_xlsx(path, n_rows=40, v0=3.7, dv=0.01, i0=0.1, di=0.001):
     df.to_excel(path, index=False)
 
 
-def write_inhouse_dir(dirpath):
-    """3 XRD scans at 10:05/10:10/10:15 + echem covering 10:00-10:39."""
-    os.makedirs(dirpath, exist_ok=True)
+def write_inhouse_scans(dirpath):
+    """Write the 3 plain XRD scans (10:05/10:10/10:15) into an existing dirpath."""
     for i, ts in enumerate(SCAN_TIMES, start=1):
         write_xrd_dat(os.path.join(dirpath, f"scan_{i:03d}.dat"), ts,
                       y=inhouse_scan_y(i))
+
+
+def write_inhouse_dir(dirpath):
+    """Write 3 XRD scans at 10:05/10:10/10:15 and echem covering 10:00-10:39."""
+    os.makedirs(dirpath, exist_ok=True)
+    write_inhouse_scans(dirpath)
     write_echem_txt(os.path.join(dirpath, "echem.txt"))
 
 
 def write_neutron_banks(dirpath, scan_id="123456", banks=(1, 2)):
-    """Per bank: <id>-<bank>-0.dat (TOF) and <id>-<bank>-d-0.dat (d-spacing)."""
+    """Write <id>-<bank>-0.dat (TOF) and <id>-<bank>-d-0.dat (d-spacing) for each bank."""
     for bank in banks:
         tof_y = 50.0 + bank + np.arange(40, dtype=float)
         d_y = 70.0 + bank + np.arange(40, dtype=float)
@@ -104,7 +98,7 @@ def write_neutron_banks(dirpath, scan_id="123456", banks=(1, 2)):
 
 
 def write_neutron_dir(dirpath):
-    """Logbook (10:00-10:30) + 2 banks x (tof, d) + echem covering the window."""
+    """Write a 10:00-10:30 logbook, 2 banks x (TOF, d) and echem covering the window."""
     os.makedirs(dirpath, exist_ok=True)
     with open(os.path.join(dirpath, "logbook.txt"), "w") as f:
         f.write(LOGBOOK_LINE + "\n")
@@ -134,8 +128,7 @@ CYCLING_PROTOCOL = {
 
 
 def write_edf_image(path, timestamp, offset=1.0, monitor="0"):
-    """8x8 EDF image carrying the header fields the writer harvests;
-    ``monitor`` is the beam-monitor counter (0: no monitor)."""
+    """Write an 8x8 EDF image with the harvested header fields; ``monitor`` "0" means none."""
     import fabio
     img = fabio.edfimage.EdfImage(
         data=np.arange(64, dtype=np.float32).reshape(8, 8) + offset,
@@ -147,14 +140,14 @@ def write_edf_image(path, timestamp, offset=1.0, monitor="0"):
 
 
 def write_twod_dir(dirpath):
-    """One XRD .dat plus one EDF image at the same timestamp (2D fixtures)."""
+    """Write one XRD .dat and one EDF image at the same timestamp (2D fixtures)."""
     os.makedirs(dirpath, exist_ok=True)
     write_xrd_dat(os.path.join(dirpath, "scan_001.dat"), SCAN_TIMES[0])
     write_edf_image(os.path.join(dirpath, "image_001.edf"), SCAN_TIMES[0])
 
 
 def write_twod_zip(zip_path, workdir):
-    """ZIP holding write_twod_dir's files, staged under workdir."""
+    """Write a ZIP of write_twod_dir's files, staged under workdir, and return its path."""
     src = os.path.join(str(workdir), "twod_src")
     write_twod_dir(src)
     with zipfile.ZipFile(zip_path, "w") as z:
@@ -164,8 +157,7 @@ def write_twod_zip(zip_path, workdir):
 
 
 def write_detailed_inhouse_dir(dirpath):
-    """Two 30-point XRD scans + echem + EDF (when fabio is present);
-    the detailed variant, for the Sigma error column and the EDF harvest."""
+    """Write two 30-point XRD scans with Sigma, echem, and an EDF image when fabio is present."""
     os.makedirs(dirpath)
     for i, ts in enumerate(DETAILED_SCAN_TIMES, start=1):
         y = 100.0 * i + np.arange(30)
@@ -182,8 +174,7 @@ def write_detailed_inhouse_dir(dirpath):
 
 
 def write_detailed_neutron_dir(dirpath):
-    """Logbook + 2 Mantid banks x (TOF, d) + 40-row echem; the detailed
-    variant, for the Mantid headers and trailing-timestamp logbook layout."""
+    """Write a trailing-timestamp logbook, 2 Mantid POLARIS banks x (TOF, d) and 40-row echem."""
     os.makedirs(dirpath)
     with open(os.path.join(dirpath, "logbook.txt"), "w") as f:
         f.write(DETAILED_LOGBOOK_LINE + "\n")
@@ -221,15 +212,14 @@ MANTID_IDF = """<?xml version="1.0" encoding="UTF-8" ?>
 
 
 def _mantid_string(group, name, text):
-    """Mantid stores strings as a shape-(1,) fixed-length bytes dataset."""
+    """Write ``text`` as Mantid stores strings: a shape-(1,) fixed-length bytes dataset."""
     raw = text.encode()
     group.create_dataset(name, data=np.array([raw], dtype=f"S{len(raw)}"))
 
 
 def write_mantid_processed_file(path):
-    """Mantid SaveNexusProcessed lookalike with two focussed banks: bank 1 a
-    ring of 8 elements at 2theta 10 deg, bank 2 a single panel of 4 elements
-    around phi 90 deg at 2theta 90 deg; instrument TESTINST, IDF above."""
+    """Write a Mantid SaveNexusProcessed lookalike for instrument TESTINST with MANTID_IDF.
+    Bank 1: 8-element ring at 2theta 10 deg; bank 2: 4-element panel at 2theta 90, phi 90 deg."""
     ring = np.array([[2.25, 10.0, phi] for phi in range(0, 360, 45)], dtype=float)
     panel = np.array([[1.0, 88.0, 80.0], [1.0, 92.0, 80.0],
                       [1.0, 88.0, 100.0], [1.0, 92.0, 100.0]], dtype=float)
@@ -251,9 +241,8 @@ def write_mantid_processed_file(path):
 
 
 def write_synchrotron_scan(dirpath, scan_id, start, end, count_time=None):
-    """GDA-style scan .nxs (entry1 start/end times; an NXdetector named after
-    the device, pixium_hdf, carrying count_time when given) plus its
-    integrated .xy, grouped by the trailing numeric ID."""
+    """Write a GDA-style i11 scan .nxs and its integrated .xy, grouped by trailing scan ID.
+    entry1 has start/end times and a device-named NXdetector, pixium_hdf (count_time if given)."""
     with h5py.File(os.path.join(dirpath, f"i11-1-{scan_id}.nxs"), "w") as f:
         f["/entry1/start_time"] = start.encode()
         f["/entry1/end_time"] = end.encode()

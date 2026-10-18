@@ -1,4 +1,4 @@
-"""Schema v4 on-disk structure: monopd and tofnpd group layout, units, and attrs."""
+"""Schema v4 layout: monopd and tofnpd groups, member order, units and attributes."""
 import os
 
 import h5py
@@ -8,12 +8,11 @@ import pytest
 import core
 
 import _builders
-from _helpers import s, wall, tz_aware, assert_pynxtools_valid
+from _helpers import s, wall, tz_aware, assert_pynxtools_valid, needs_fabio
 
 
 def test_monopd_root_and_entry(inhouse_nxs):
-    """@default chains to the operando echem plot, provenance lives on
-    definition and process, and start_time is tz-aware."""
+    """@default chains to the echem plot, provenance sits on definition, start_time is tz-aware."""
     with h5py.File(inhouse_nxs) as f:
         assert f.attrs.get("default") == "entry"
         e = f["entry"]
@@ -29,8 +28,7 @@ def test_monopd_root_and_entry(inhouse_nxs):
 
 
 def test_monopd_process(inhouse_nxs):
-    """Process group is the single provenance record: program, version,
-    data source, correlation method and scan count; no tolerance field."""
+    """NXprocess holds program, version, source, method and scan count; no tolerance or twod_*."""
     with h5py.File(inhouse_nxs) as f:
         p = f["entry/process"]
         assert p.attrs.get("NX_class") == "NXprocess"
@@ -44,10 +42,7 @@ def test_monopd_process(inhouse_nxs):
 
 
 def test_monopd_scan_group(inhouse_nxs):
-    """Each scan is a bare NXsubentry: a soft link to the shared instrument,
-    environment (whose end_time is start + exposure), the EDF beam-monitor
-    record when the header carries one, and data; nothing that repeats
-    entry-level facts."""
+    """Scans are NXsubentries linking the instrument, end_time is start + exposure, no repeats."""
     with h5py.File(inhouse_nxs) as f:
         s1 = f["entry/scan_000001"]
         assert s1.attrs.get("NX_class") == "NXsubentry"
@@ -62,8 +57,7 @@ def test_monopd_scan_group(inhouse_nxs):
 
 
 def test_monopd_environment(inhouse_nxs):
-    """Per-scan NXenvironment holds the window, the correlated values with
-    units, the window extrema and the timestamps; no index pointers or logs."""
+    """NXenvironment has values with units, extrema, timestamps and exposure; no indices or logs."""
     with h5py.File(inhouse_nxs) as f:
         env = f["entry/scan_000001/environment"]
         assert env.attrs.get("NX_class") == "NXenvironment"
@@ -87,8 +81,7 @@ def test_monopd_environment(inhouse_nxs):
 
 
 def test_monopd_data(inhouse_nxs):
-    """The 1D NXdata keeps signal/axes attrs with the Sigma column stored
-    as data_errors."""
+    """The 1D NXdata has signal, polar_angle in degrees and the Sigma column as data_errors."""
     with h5py.File(inhouse_nxs) as f:
         d = f["entry/scan_000001/data"]
         assert d["polar_angle"].attrs.get("units") == "degrees"
@@ -100,7 +93,7 @@ def test_monopd_data(inhouse_nxs):
 
 
 def test_monopd_operando_electrochemistry(inhouse_nxs):
-    """Operando echem group follows the NXlog time convention with NXdata attrs."""
+    """Operando echem follows NXlog time with NXdata attrs and alone holds the time tolerance."""
     with h5py.File(inhouse_nxs) as f:
         oe = f["entry/operando_electrochemistry"]
         assert "timestamps" not in oe and "time" in oe
@@ -114,6 +107,11 @@ def test_monopd_operando_electrochemistry(inhouse_nxs):
         assert oe.attrs.get("axes") == "time"
         assert "time_indices" not in oe.attrs, "redundant NXdata attribute written"
         assert list(oe.attrs.get("auxiliary_signals")) == ["current"]
+        tolerance = oe["echem_time_tolerance"]
+        assert tolerance.shape == () and tolerance[()] == core.ECHEM_TIME_TOLERANCE
+        assert tolerance.attrs.get("units") == "s"
+        assert "echem_time_tolerance" not in f["entry/standard_electrochemistry/file_001"], \
+            "the tolerance belongs to the correlated record only"
 
 
 def test_monopd_standard_electrochemistry(inhouse_nxs):
@@ -128,12 +126,9 @@ def test_monopd_standard_electrochemistry(inhouse_nxs):
         assert wall(f1["time"].attrs.get("start")) == "2024-02-05T10:00:00"
 
 
-@pytest.mark.skipif(not core.FABIO_AVAILABLE, reason="fabio not installed")
+@needs_fabio
 def test_monopd_edf_provenance(inhouse_nxs):
-    """EDF headers feed the instrument (wavelength in angstrom), the
-    entry-level monitor (timer mode, the shared 120 s preset, no integral:
-    the header's Monitor counter is 0) and the image_source NXnote; data
-    carries no twod_* attrs."""
+    """EDF headers feed wavelength, entry monitor and image_source; zero counts add no integral."""
     with h5py.File(inhouse_nxs) as f:
         e = f["entry"]
         assert abs(e["instrument/crystal/wavelength"][()] - 1.541891) < 1e-6, \
@@ -156,7 +151,7 @@ def test_monopd_edf_provenance(inhouse_nxs):
             "v3 twod_* attrs left on data"
 
 
-@pytest.mark.skipif(not core.FABIO_AVAILABLE, reason="fabio not installed")
+@needs_fabio
 def test_monopd_image_only_scans(tmp_path):
     """A dataset of only EDF images yields image_source scans with no data group."""
     src = str(tmp_path / "images_only")
@@ -185,8 +180,7 @@ def test_monopd_image_only_scans(tmp_path):
 
 
 def test_tofnpd_entry_and_scan(neutron_nxs):
-    """The entry declares NXoperando_tofnpd; each scan's acquisition window
-    in environment comes from the logbook, and nothing else is repeated."""
+    """The entry declares NXoperando_tofnpd, scan windows come from the logbook, nothing repeats."""
     with h5py.File(neutron_nxs) as f:
         e = f["entry"]
         assert s(e["definition"]) == "NXoperando_tofnpd"
@@ -200,8 +194,7 @@ def test_tofnpd_entry_and_scan(neutron_nxs):
 
 
 def test_tofnpd_environment(neutron_nxs):
-    """Neutron scans carry the correlated voltage, the logbook window and
-    the raw logbook entry; no derived window summary or log slices."""
+    """Neutron environment has the voltage, its extrema, the logbook window and entry; no logs."""
     with h5py.File(neutron_nxs) as f:
         env = f["entry/scan_000001/environment"]
         assert abs(env["voltage"][()] - 3.85) < 1e-9
@@ -234,11 +227,7 @@ def test_tofnpd_banks(neutron_nxs):
 
 
 def test_tofnpd_banks_without_mantid_header(tmp_path):
-    """Bank axes carry units even when the source .dat has no Mantid header.
-
-    The shared builders (and real reduced data) often omit the
-    "X-axis unit is:" line; NXoperando_tofnpd types these axes, so a missing
-    units attribute makes the whole file invalid."""
+    """Header-less banks get required units; no profile means no monitor and no empty detector."""
     src = str(tmp_path / "plain_neutron")
     _builders.write_neutron_dir(src)
     with open(os.path.join(src, "123456-1-0.dat")) as fh:
@@ -265,9 +254,11 @@ def test_entry_window_spans_all_scans(request, fixture):
         assert scans, "no scan subentries"
         for name in scans:
             sub = entry[name]
-            assert wall(sub["environment/start_time"]) >= e_start,                 f"{name} starts before the entry window"
+            assert wall(sub["environment/start_time"]) >= e_start, \
+                f"{name} starts before the entry window"
             if "end_time" in sub["environment"]:
-                assert wall(sub["environment/end_time"]) <= e_end,                     f"{name} ends after the entry window"
+                assert wall(sub["environment/end_time"]) <= e_end, \
+                    f"{name} ends after the entry window"
 
 
 @pytest.mark.parametrize("nxs_fixture", ["inhouse_nxs", "neutron_nxs"])
@@ -280,7 +271,9 @@ def test_scan_timestamp_always_written(request, nxs_fixture):
             assert "scan_timestamp" in f["entry"][name]["environment"], name
 
 
-# --- member order: creation-order tracking, parent definition sequence ---
+# ============================================================================
+# Member order (creation-order tracking, parent definition sequence)
+# ============================================================================
 
 # Expected on-disk order per group: the NXmonopd / NXtofnpd sequence with
 # OperaXN's additions directly after the item they extend. Names absent from
@@ -300,6 +293,7 @@ ENVIRONMENT_ORDER = ["start_time", "end_time", "voltage", "current",
                      "voltage_min", "voltage_max", "current_min", "current_max",
                      "scan_timestamp", "midpoint_adjusted_timestamp",
                      "voltage_timestamp", "exposure_time", "logbook_entry"]
+ECHEM_ORDER = ["time", "voltage", "current", "echem_time_tolerance"]
 ENTRY_MONITOR_ORDER = ["mode", "preset"]
 MONITOR_ORDER = ["integral"]
 PROTOCOL_ORDER = ["technique", "voltage_window_lower", "voltage_window_upper",
@@ -309,7 +303,7 @@ IMAGE_SOURCE_ORDER = ["file_name", "type", "description", "embedded",
 
 
 def _members(group):
-    """Member names as h5py lists them: creation order for tracked groups."""
+    """Return member names as h5py lists them: creation order for tracked groups."""
     return list(group.keys())
 
 
@@ -320,7 +314,7 @@ def _tracks_order(group):
 
 
 def _assert_order(group, expected, tag):
-    """The members of group named in expected appear in that order."""
+    """Assert the members of group named in expected appear in that order."""
     present = [n for n in expected if n in group]
     listed = [n for n in _members(group) if n in expected]
     assert listed == present, f"{tag}: on disk {listed}, expected {present}"
@@ -328,8 +322,7 @@ def _assert_order(group, expected, tag):
 
 @pytest.mark.parametrize("fixture", ["inhouse_nxs", "neutron_nxs", "protocol_nxs"])
 def test_creation_order_tracked_everywhere(request, fixture):
-    """The root and every group record creation order, so readers see the
-    written sequence instead of HDF5's alphabetical index."""
+    """Every group, root included, tracks creation order rather than HDF5's alphabetical index."""
     with h5py.File(request.getfixturevalue(fixture)) as f:
         assert _tracks_order(f["/"]), "root group"
         untracked = []
@@ -342,9 +335,7 @@ def test_creation_order_tracked_everywhere(request, fixture):
 
 
 def test_monopd_member_order(inhouse_nxs):
-    """NXmonopd sequence (title, start_time, definition, instrument, sample)
-    with additions after the item they extend, source fields type/name/probe,
-    and the scans last in order."""
+    """Monopd members follow NXmonopd order, additions after the item they extend, scans last."""
     with h5py.File(inhouse_nxs) as f:
         e = f["entry"]
         _assert_order(e, ENTRY_ORDER, "entry")
@@ -359,14 +350,14 @@ def test_monopd_member_order(inhouse_nxs):
         assert _members(s1["environment"])[:2] == ["start_time", "end_time"]
         _assert_order(s1["environment"], ENVIRONMENT_ORDER, "environment")
         assert _members(e["monitor"]) == ENTRY_MONITOR_ORDER
+        assert _members(e["operando_electrochemistry"]) == ECHEM_ORDER
         if "monitor" in s1:
             assert _members(s1["monitor"]) == MONITOR_ORDER
         assert _members(s1["data"]) == ["polar_angle", "data", "data_errors"]
 
 
 def test_monopd_protocol_member_order(protocol_nxs):
-    """cycling_protocol follows sample and lists its fields in definition
-    order; sample keeps name before preparation_date."""
+    """cycling_protocol follows sample in definition order; sample lists name, preparation_date."""
     with h5py.File(protocol_nxs) as f:
         e = f["entry"]
         _assert_order(e, ENTRY_ORDER, "entry")
@@ -377,10 +368,7 @@ def test_monopd_protocol_member_order(protocol_nxs):
 
 
 def test_tofnpd_member_order(neutron_nxs):
-    """NXtofnpd sequence: pre_sample_flightpath and user before instrument,
-    monitor after the sample block, detector_number leading the bank
-    geometry, data before the bank axis, banks in numeric order with TOF
-    before d-spacing."""
+    """Tofnpd members follow NXtofnpd order: monitor after sample, banks numeric, TOF before d."""
     with h5py.File(neutron_nxs) as f:
         e = f["entry"]
         assert _members(e) == [
@@ -390,6 +378,7 @@ def test_tofnpd_member_order(neutron_nxs):
             "monitor", "operando_electrochemistry", "scan_000001"]
         assert _members(e["monitor"]) == [
             "mode", "detector_number", "distance", "polar_angle", "azimuthal_angle"]
+        assert _members(e["operando_electrochemistry"]) == ECHEM_ORDER
         inst = e["instrument"]
         assert _members(inst) == ["name", "source", "detector"]
         assert _members(inst["source"]) == SOURCE_ORDER
@@ -404,10 +393,9 @@ def test_tofnpd_member_order(neutron_nxs):
         assert _members(s1["bank_1_d"]) == ["data", "data_errors", "d_spacing"]
 
 
-@pytest.mark.skipif(not core.FABIO_AVAILABLE, reason="fabio not installed")
+@needs_fabio
 def test_monopd_image_member_order(tmp_path):
-    """image_source precedes image_data and lists its fields in definition
-    order, with original_shape present only once the image was embedded."""
+    """image_source precedes image_data in definition order, original_shape only when embedded."""
     src = str(tmp_path / "twod")
     _builders.write_twod_dir(src)
     for embed in (False, True):
@@ -429,8 +417,7 @@ def test_monopd_image_member_order(tmp_path):
 
 
 def test_tofnpd_unreadable_bank_leaves_no_shell(tmp_path):
-    """A bank file that fails to read yields no NXdata group for it (the
-    definition requires data in every bank group); the other banks are intact."""
+    """An unreadable bank file leaves no data-less NXdata shell, and the other banks are intact."""
     src = str(tmp_path / "neutron_bad_bank")
     _builders.write_neutron_dir(src)
     with open(os.path.join(src, "123456-2-0.dat"), "w") as f:
@@ -446,10 +433,9 @@ def test_tofnpd_unreadable_bank_leaves_no_shell(tmp_path):
     assert_pynxtools_valid(nxs, "unreadable bank")
 
 
-@pytest.mark.skipif(not core.FABIO_AVAILABLE, reason="fabio not installed")
+@needs_fabio
 def test_image_source_path_normalised(tmp_path):
-    """Collected paths are normalised, so a source folder given with forward
-    slashes (the file dialog's form on Windows) records one separator style."""
+    """A forward-slash source folder (the Windows file dialog's form) records a normalised path."""
     src = str(tmp_path / "twod_slash")
     _builders.write_twod_dir(src)
     nxs = str(tmp_path / "twod_slash.nxs")
@@ -461,11 +447,9 @@ def test_image_source_path_normalised(tmp_path):
         assert name == os.path.normpath(name), name
 
 
-@pytest.mark.skipif(not core.FABIO_AVAILABLE, reason="fabio not installed")
+@needs_fabio
 def test_monopd_monitor_integral_from_positive_counter(tmp_path):
-    """A positive Monitor counter in an EDF header yields that scan's
-    monitor/integral; a zero counter yields no per-scan group; the counting
-    mode and shared preset sit once at entry level."""
+    """Positive EDF Monitor counts write scan monitor/integral; mode and preset sit once at entry."""
     src = str(tmp_path / "monitored")
     os.makedirs(src)
     _builders.write_edf_image(os.path.join(src, "image_001.edf"),
@@ -488,9 +472,7 @@ def test_monopd_monitor_integral_from_positive_counter(tmp_path):
 
 
 def test_monopd_monitor_mode_only_for_mixed_exposures(tmp_path):
-    """In-house acquisitions with differing exposures share no preset: the
-    entry-level monitor holds mode timer alone, each acquisition keeps its
-    own exposure_time, and the file validates."""
+    """Mixed exposures write a mode-only entry monitor and per-scan exposure_time, and validate."""
     src = str(tmp_path / "mixed")
     os.makedirs(src)
     for i, (ts, exposure) in enumerate(zip(_builders.SCAN_TIMES, ("120.0", "60.0", "120.0")),

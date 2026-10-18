@@ -1,6 +1,5 @@
 """
-OperaXN application entry point: CLI parsing, logging setup, dependency
-checks, splash screen, and window lifecycle management.
+OperaXN entry point: CLI parsing, logging, dependency checks, splash screen and window lifecycle.
 """
 
 import argparse
@@ -22,7 +21,8 @@ from .config import (
     APP_COPYRIGHT,
     OPERAXNTheme,
     LOG_FORMAT,
-    LOG_FILE
+    LOG_FILE,
+    log_config_summary
 )
 from .gui import OPERAXN
 from core import format_profile_block, profile_from_mantid_nexus
@@ -56,10 +56,9 @@ OPTIONAL_DEPENDENCIES = {
 # ============================================================================
 
 def setup_logging(debug: bool = False) -> logging.Logger:
-    """Configure and return the application logger."""
+    """Configure root logging and return this module's logger."""
     level = logging.DEBUG if (debug or DEBUG_MODE) else logging.INFO
 
-    # Configure root logger
     logging.basicConfig(
         level=level,
         format=LOG_FORMAT,
@@ -67,20 +66,19 @@ def setup_logging(debug: bool = False) -> logging.Logger:
         force=True
     )
 
-    # Add file handler if configured
     if LOG_FILE and (debug or DEBUG_MODE):
         file_handler = logging.FileHandler(LOG_FILE, mode='w')
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
         logging.getLogger().addHandler(file_handler)
 
-    # Set modules to debug
+    # Application loggers follow the chosen level
     logging.getLogger("operaxn").setLevel(level)
     logging.getLogger("operaxn.input").setLevel(level)
     logging.getLogger("operaxn.output").setLevel(level)
     logging.getLogger("operaxn.gui").setLevel(level)
 
-    # Suppress matplotlib debug
+    # Keep third-party debug output quiet
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
     logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
     logging.getLogger("matplotlib.ticker").setLevel(logging.WARNING)
@@ -88,6 +86,8 @@ def setup_logging(debug: bool = False) -> logging.Logger:
 
     logger = logging.getLogger(__name__)
     logger.debug("Logging configured - Debug mode ENABLED")
+    if level == logging.DEBUG:
+        log_config_summary()
     return logger
 
 
@@ -112,7 +112,7 @@ def check_dependencies() -> Tuple[List[str], List[str]]:
 
 
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
-    """Convert hex colour string to (R, G, B) tuple."""
+    """Convert a '#rrggbb' colour string to an (R, G, B) tuple."""
     hex_color = hex_color.lstrip('#')
     return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
 
@@ -126,14 +126,12 @@ class WindowManager:
 
     @staticmethod
     def center_window(window: tk.Misc, width: Optional[int] = None, height: Optional[int] = None) -> None:
-        """Centre a window on the screen."""
+        """Centre a window on the screen, also setting its size when width is given."""
         window.update_idletasks()
 
-        # Get dimensions
         w = width or window.winfo_width()
         h = height or window.winfo_height()
 
-        # Calculate position
         x = (window.winfo_screenwidth() // 2) - (w // 2)
         y = (window.winfo_screenheight() // 2) - (h // 2)
 
@@ -179,20 +177,15 @@ class EnhancedSplashScreen(WindowManager):
         self.canvas = None
         self.animation_items = []
         self.animation_running = False
-        self.animations = {}  # Store animation callbacks
-
-        # Progress tracking
         self.progress_var = tk.DoubleVar(value=0)
-        self.status_text = tk.StringVar(value="Initialising...")
 
-        # UI elements
+        # Canvas item ids plus the progress-bar geometry
         self.ui_elements = {}
 
     def show(self) -> tk.Toplevel:
         """Create, display, and return the splash Toplevel window."""
         self.splash = tk.Toplevel(self.root)
 
-        # Configure window
         self.configure_window(
             self.splash,
             title=APP_NAME,
@@ -204,22 +197,17 @@ class EnhancedSplashScreen(WindowManager):
         self.splash.geometry(f"{self.width}x{self.height}")
         self.center_window(self.splash, self.width, self.height)
 
-        # Create content
         self._create_content()
-
-        # Start animations
         self._start_animations()
 
         self.splash.update()
         return self.splash
 
     def _create_content(self) -> None:
-        """Build all splash screen visual elements on the canvas."""
-        # Main container
+        """Build the splash canvas and draw all its elements."""
         main_frame = tk.Frame(self.splash, bg=OPERAXNTheme.COLORS['bg_primary'])
         main_frame.pack(fill='both', expand=True)
 
-        # Canvas for graphics
         self.canvas = tk.Canvas(
             main_frame,
             width=self.width,
@@ -229,7 +217,6 @@ class EnhancedSplashScreen(WindowManager):
         )
         self.canvas.pack(fill='both', expand=True)
 
-        # Create all visual elements
         self._draw_gradient_background()
         self._create_logo_section()
         self._create_title_section()
@@ -238,7 +225,7 @@ class EnhancedSplashScreen(WindowManager):
         self._create_diffraction_rings()
 
     def _draw_gradient_background(self) -> None:
-        """Draw vertical gradient from primary to secondary background colour."""
+        """Draw a vertical gradient from the primary to the secondary background colour."""
         bg_rgb = hex_to_rgb(OPERAXNTheme.COLORS['bg_primary'])
         bg_light_rgb = hex_to_rgb(OPERAXNTheme.COLORS['bg_secondary'])
 
@@ -252,7 +239,7 @@ class EnhancedSplashScreen(WindowManager):
             self.canvas.create_line(0, i, self.width, i, fill=color, width=1)
 
     def _create_logo_section(self) -> None:
-        """Draw hexagonal logo with rotating inner element."""
+        """Draw the hexagonal logo and register the inner hexagon for rotation."""
         center_x = self.width // 2
         center_y = SPLASH_LOGO_CENTER_Y
 
@@ -291,7 +278,6 @@ class EnhancedSplashScreen(WindowManager):
         """Draw title, subtitle, version badge, and copyright text."""
         center_x = self.width // 2
 
-        # Title font
         title_font = (OPERAXNTheme._SANS, 36, 'bold')
         subtitle_font = (OPERAXNTheme._SANS, 11)
         version_font = (OPERAXNTheme._SANS, 9)
@@ -301,17 +287,17 @@ class EnhancedSplashScreen(WindowManager):
         xn_text = "XN"
 
         # Measure each part so placement is font-independent
-        temp = self.canvas.create_text(0, 0, text=opera_text, font=title_font)
-        opera_width = (self.canvas.bbox(temp)[2] - self.canvas.bbox(temp)[0]) if self.canvas.bbox(temp) else 120
-        self.canvas.delete(temp)
+        def text_width(text, fallback):
+            temp = self.canvas.create_text(0, 0, text=text, font=title_font)
+            bbox = self.canvas.bbox(temp)
+            self.canvas.delete(temp)
+            return bbox[2] - bbox[0] if bbox else fallback
 
-        temp = self.canvas.create_text(0, 0, text=xn_text, font=title_font)
-        xn_width = (self.canvas.bbox(temp)[2] - self.canvas.bbox(temp)[0]) if self.canvas.bbox(temp) else 60
-        self.canvas.delete(temp)
+        opera_width = text_width(opera_text, 120)
+        xn_width = text_width(xn_text, 60)
 
-        # The differently coloured title runs should read as one wordmark.
-        gap = 0
-        total_width = opera_width + gap + xn_width
+        # No gap: the differently coloured title runs should read as one wordmark.
+        total_width = opera_width + xn_width
         opera_x = center_x - total_width // 2 + opera_width // 2
         xn_x = center_x + total_width // 2 - xn_width // 2
 
@@ -340,7 +326,6 @@ class EnhancedSplashScreen(WindowManager):
             anchor='center'
         )
 
-        # Version badge
         self._create_version_badge(center_x, 221, 231, version_font)
 
         # Copyright
@@ -422,7 +407,7 @@ class EnhancedSplashScreen(WindowManager):
             anchor='center'
         )
 
-        # Store dimensions
+        # Geometry read back by _animate_progress
         self.ui_elements['bar_width'] = bar_width
         self.ui_elements['bar_center_x'] = center_x
 
@@ -470,7 +455,6 @@ class EnhancedSplashScreen(WindowManager):
         """Schedule all splash animation callbacks."""
         self.animation_running = True
 
-        # Define animation schedules
         animations = [
             (30, self._animate_progress),
             (500, self._animate_loading_dots),
@@ -493,8 +477,8 @@ class EnhancedSplashScreen(WindowManager):
 
         current = self.progress_var.get()
         if current < 100:
-            current += 3
-            self.progress_var.set(min(current, 100))
+            current = min(current + 3, 100)  # the drawn fill must not pass the track
+            self.progress_var.set(current)
 
             # Update bar
             progress_width = (current / 100) * self.ui_elements['bar_width']
@@ -530,7 +514,7 @@ class EnhancedSplashScreen(WindowManager):
         self._schedule_animation(500, self._animate_loading_dots)
 
     def _animate_rings(self) -> None:
-        """Flash diffraction ring ovals in sequence."""
+        """Flash the diffraction rings, hiding each after a staggered delay."""
         if not self.animation_running or not self.splash.winfo_exists():
             return
 
@@ -600,11 +584,11 @@ class EnhancedSplashScreen(WindowManager):
 # ============================================================================
 
 class ApplicationManager:
-    """Orchestrates startup, splash, and main-window lifecycle."""
+    """Controller for startup, the splash screen and the main-window lifecycle."""
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.logger = setup_logging(args.debug or DEBUG_MODE)
+        self.logger = setup_logging(args.debug)
         self.root = None
         self.app = None
         self.splash_manager = None
@@ -613,18 +597,15 @@ class ApplicationManager:
     def run(self) -> int:
         """Launch the GUI event loop; return 0 on success, 1 on error."""
         try:
-            # Validate environment
             if not self._validate_environment():
                 return 1
 
-            # Initialise UI
             self._initialise_ui()
 
-            # Schedule application initialization
+            # Build the GUI shortly before the splash closes
             self.root.after(SPLASH_DURATION_MS - 200, self._initialise_application)
             self.root.after(SPLASH_DURATION_MS, self._show_main_window)
 
-            # Start main loop
             self.logger.info("Starting main event loop")
             self.root.mainloop()
 
@@ -633,11 +614,11 @@ class ApplicationManager:
 
         except Exception as e:
             self.logger.exception("Fatal error occurred")
-            self._show_error(f"An unexpected error occurred:\n\n{str(e)}")
+            self._show_error(f"An unexpected error occurred:\n\n{e}")
             return 1
 
     def _validate_environment(self) -> bool:
-        """Check required dependencies; return False if any are missing."""
+        """Check dependencies and the macOS Tk version; return False when the app cannot start."""
         missing_required, missing_optional = check_dependencies()
 
         if missing_required:
@@ -667,18 +648,12 @@ class ApplicationManager:
 
     def _initialise_ui(self) -> None:
         """Create the root Tk window and show the splash screen."""
-        # Create root window
         self.root = tk.Tk()
-        self.root.withdraw()  # Hide initially
+        self.root.withdraw()  # Hidden until the splash closes
 
-        # Configure root
         self.root.title(f"{APP_NAME} v{__version__}")
-        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
-        # Set icon if available
         self._set_window_icon()
-
-        # Show splash screen
         self._show_splash()
 
     def _show_splash(self) -> None:
@@ -686,7 +661,6 @@ class ApplicationManager:
         self.splash_manager = EnhancedSplashScreen(self.root)
         self.splash_manager.show()
 
-        # Schedule status updates
         updates = [
             (100, "Checking dependencies...", 15),
             (700, "Initialising GUI components...", 50),
@@ -700,7 +674,7 @@ class ApplicationManager:
                             self.splash_manager.update_status(m, p))
 
     def _initialise_application(self) -> None:
-        """Create the OPERAXN GUI instance."""
+        """Create the OPERAXN main window unless already created."""
         if self.initialization_complete:
             return
 
@@ -715,7 +689,7 @@ class ApplicationManager:
             self.logger.info("Application initialised successfully")
         except Exception as e:
             self.logger.exception("Failed to initialise application")
-            self._show_error(f"Failed to initialise:\n\n{str(e)}")
+            self._show_error(f"Failed to initialise:\n\n{e}")
             raise
 
     def _show_main_window(self) -> None:
@@ -756,22 +730,6 @@ class ApplicationManager:
         except (tk.TclError, FileNotFoundError, OSError):
             pass  # Icon optional
 
-    def _on_closing(self) -> None:
-        """Clear caches and destroy the root window."""
-        try:
-            if self.app:
-                # Clear caches
-                from .output import clear_plot_cache
-                from .input import clear_global_cache, cleanup_session_cache
-                clear_plot_cache()
-                clear_global_cache()
-                cleanup_session_cache()
-        except Exception as e:
-            self.logger.debug("Error clearing caches on close: %s", e)
-
-        self.root.quit()
-        self.root.destroy()
-
     def _show_error(self, message: str) -> None:
         """Display a fatal-error messagebox, falling back to stderr."""
         try:
@@ -811,8 +769,7 @@ def display_dependency_check() -> int:
         print("   pip install -r requirements.txt")
         print("   (from the OperaXN repository root)")
         return 1
-    else:
-        print("✓ All required dependencies installed")
+    print("✓ All required dependencies installed")
 
     if missing_optional:
         print("\n⚠ Optional dependencies not installed:")
@@ -826,8 +783,7 @@ def display_dependency_check() -> int:
 
 
 def print_instrument_profile(path: str) -> int:
-    """Print the config.INSTRUMENT_PROFILES block derived from a
-    Mantid-processed file; return 1 when the file cannot be read."""
+    """Print the INSTRUMENT_PROFILES block from a Mantid-processed .nxs; return 1 if unreadable."""
     try:
         print(format_profile_block(profile_from_mantid_nexus(path)))
     except (OSError, ValueError) as e:
@@ -842,7 +798,6 @@ def print_instrument_profile(path: str) -> int:
 
 def create_parser() -> argparse.ArgumentParser:
     """Build and return the CLI argument parser."""
-
     parser = argparse.ArgumentParser(
         description=f'{APP_NAME} - OPERAndo X-ray and Neutron data visualisation tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -898,7 +853,6 @@ def main(args: Optional[List[str]] = None) -> int:
     if parsed_args.check_deps:
         return display_dependency_check()
 
-    # Run application
     app_manager = ApplicationManager(parsed_args)
     return app_manager.run()
 

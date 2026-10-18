@@ -1,12 +1,9 @@
 """
 Raw data file readers for the core pipeline.
 
-Interface contracts:
-- `read_file` flags are keyword-only (`use_cache`, `is_neutron`) so a stray
-  positional boolean cannot flip meaning between the two.
-- `HDFReader` downsampling is an instance attribute (no mutable module-global).
-- The fabio import is guarded so core still imports without it (EDF reads
-  raise ImportError).
+`DataReaderFactory` maps each extension to a shared reader whose reads are cached by path,
+size and mtime; `read_file` flags are keyword-only and `HDFReader` downsampling is
+per-instance. fabio is optional: core imports without it and EDF reads raise ImportError.
 """
 
 import logging
@@ -44,8 +41,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 class FileCache:
-    """Caches file data thread-safely, evicting least-accessed entries
-    to stay within a byte-size budget."""
+    """Thread-safe file-data cache evicting least-accessed entries to fit a byte budget."""
 
     def __init__(self, max_size_mb: int = MAX_CACHE_SIZE_MB) -> None:
         self.cache: Dict[str, Any] = {}
@@ -55,7 +51,7 @@ class FileCache:
         self.access_count: Dict[str, int] = {}
 
     def get(self, key: str) -> Optional[Any]:
-        """Cached value for key (bumping its access count), or None."""
+        """Return the cached value for key (bumping its access count), or None."""
         with self.lock:
             if key in self.cache:
                 self.access_count[key] = self.access_count.get(key, 0) + 1
@@ -66,6 +62,12 @@ class FileCache:
         """Store value, evicting least-accessed entries to stay within budget."""
         with self.lock:
             size_bytes = sys.getsizeof(value)
+            # Replacing a key (two threads reading one file) must not count it twice
+            previous = self.cache.pop(key, None)
+            if previous is not None:
+                self.current_size -= sys.getsizeof(previous)
+                # Its stale count would otherwise be the eviction pick, never in the cache
+                self.access_count.pop(key, None)
 
             while self.current_size + size_bytes > self.max_size_bytes and self.cache:
                 self._evict_lfu()
@@ -112,7 +114,7 @@ class DataReader(ABC):
         """Read the file into an array; raise IOError on failure."""
 
     def read(self, path: str, *, use_cache: bool = True) -> np.ndarray:
-        """Read the file, serving from / storing to the global cache."""
+        """Read the file via the global cache unless `use_cache` or CACHE_ENABLED is off."""
         if not use_cache or not CACHE_ENABLED:
             return self._read_impl(path)
 
@@ -127,20 +129,20 @@ class DataReader(ABC):
 
     @staticmethod
     def _get_cache_key(path: str) -> str:
-        """Cache key from path, size, and mtime (edits never served stale)."""
+        """Build the cache key from path, size and mtime (edits are never served stale)."""
         stat = os.stat(path)
         return f"{path}_{stat.st_size}_{stat.st_mtime}"
 
 
 class DATReader(DataReader):
-    """Reads .dat files (XRD or neutron) as X/Y(/error) column arrays."""
+    """Reader for .dat files (XRD or neutron) as X/Y(/error) column arrays."""
 
     def __init__(self, data_type: str = "xrd") -> None:
         super().__init__()
         self.data_type = data_type
 
     def _read_impl(self, path: str) -> np.ndarray:
-        """Bulk numpy load with a tolerant line-parse fallback (keeps errors)."""
+        """Load columns via numpy, falling back to a tolerant X/Y(/E) line parse."""
         try:
             # Fast path: numpy bulk load
             try:
@@ -148,21 +150,15 @@ class DATReader(DataReader):
                 if data.ndim == 1:
                     data = data.reshape(-1, 2)
                 return data
-            except (ValueError, IOError, OSError) as e:
+            except (ValueError, OSError) as e:
                 logger.debug(f"NumPy loadtxt failed for {path}: {e}")
 
             # Slow path: line-by-line parsing
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
 
-            data_start = 0
-            for i, line in enumerate(lines):
-                if not line.strip().startswith("#") and line.strip():
-                    data_start = i
-                    break
-
             data = []
-            for line in lines[data_start:]:
+            for line in lines:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
@@ -197,7 +193,7 @@ class DATReader(DataReader):
 
 
 class EDFReader(DataReader):
-    """Reads .edf detector images as 2D arrays with floor clipping."""
+    """Reader for .edf detector images as 2D arrays with floor clipping."""
 
     def _read_impl(self, path: str) -> np.ndarray:
         """Load the image via fabio, clipping to the minimum positive value."""
@@ -214,7 +210,7 @@ class EDFReader(DataReader):
 
 
 class XYReader(DataReader):
-    """Reads .xy integrated diffraction data as X/Y(/error) column arrays."""
+    """Reader for .xy integrated diffraction data as X/Y(/error) column arrays."""
 
     def _read_impl(self, path: str) -> np.ndarray:
         """Load whitespace-delimited columns via numpy."""
@@ -228,13 +224,9 @@ class XYReader(DataReader):
 
 
 class HDFReader(DataReader):
-    """Reads HDF5 detector images with auto-discovery and optional downsampling.
-
-    `max_display_size` is per-instance: set it before reading to control
-    downsampling (0 disables it). No module-global configuration, but
-    `DataReaderFactory.READERS` holds a shared instance — construct your
-    own rather than mutating it.
-    """
+    """Reader for HDF5 detector images with auto-discovery and optional downsampling.
+    `max_display_size` is per-instance (0 disables it): construct a reader rather than
+    mutating the shared one in `DataReaderFactory.READERS`."""
 
     COMMON_DATA_PATHS = [
         '/entry/instrument/detector/data',
@@ -259,7 +251,7 @@ class HDFReader(DataReader):
         self.original_shape: Optional[Tuple[int, ...]] = None
 
     def _get_cache_key(self, path: str) -> str:
-        """Base key plus the downsampling setting (part of the result identity)."""
+        """Extend the base key with the downsampling setting (part of the result identity)."""
         return f"{super()._get_cache_key(path)}_{self.max_display_size}"
 
     def _read_impl(self, path: str) -> np.ndarray:
@@ -281,42 +273,38 @@ class HDFReader(DataReader):
             raise IOError(f"Error reading HDF file {path}: {e}")
 
     def _find_data_array(self, h5file: h5py.File) -> Optional[np.ndarray]:
-        """Try known paths first, then fall back to largest 2D/3D dataset."""
+        """Return the data at the first known path, else the largest 2D/3D dataset, or None."""
+        dataset = None
         for data_path in self.COMMON_DATA_PATHS:
             if data_path in h5file:
                 dataset = h5file[data_path]
-                if dataset.size > MAX_DATASET_ELEMENTS:
-                    return self._sample_large_dataset(dataset)
-                else:
-                    return np.array(dataset)
+                break
 
-        largest_dataset = None
-        largest_size = 0
+        if dataset is None:
+            largest_dataset = None
+            largest_size = 0
 
-        def find_largest(name: str, obj: Any) -> None:
-            nonlocal largest_dataset, largest_size
-            if isinstance(obj, h5py.Dataset):
-                if obj.size > largest_size and obj.ndim in [2, 3]:
-                    largest_size = obj.size
-                    largest_dataset = name
+            def find_largest(name: str, obj: Any) -> None:
+                nonlocal largest_dataset, largest_size
+                if isinstance(obj, h5py.Dataset):
+                    if obj.size > largest_size and obj.ndim in [2, 3]:
+                        largest_size = obj.size
+                        largest_dataset = name
 
-        h5file.visititems(find_largest)
+            h5file.visititems(find_largest)
 
-        if largest_dataset:
+            if not largest_dataset:
+                return None
             dataset = h5file[largest_dataset]
-            if dataset.size > MAX_DATASET_ELEMENTS:
-                return self._sample_large_dataset(dataset)
-            else:
-                return np.array(dataset)
 
-        return None
+        if dataset.size > MAX_DATASET_ELEMENTS:
+            return self._sample_large_dataset(dataset)
+        return np.array(dataset)
 
     @staticmethod
     def _sample_large_dataset(dataset: h5py.Dataset) -> np.ndarray:
-        """Stride-sample datasets that exceed MAX_DATASET_ELEMENTS.
-
-        Works from `.shape` alone so nothing is read until the final slice.
-        """
+        """Stride-sample a dataset over MAX_DATASET_ELEMENTS (first frame of 3D).
+        Works from `.shape` alone so nothing is read until the final slice."""
         if dataset.ndim == 3:
             slice_size = dataset.shape[1] * dataset.shape[2]
         else:
@@ -334,7 +322,7 @@ class HDFReader(DataReader):
         return np.array(dataset)
 
     def _process_data_shape(self, data: np.ndarray) -> np.ndarray:
-        """Ensure output is 2D: take first frame of 3D, reshape 1D."""
+        """Normalise to 2D: take the first frame of 3D, reshape 1D."""
         if data.ndim == 3:
             return data[0]
         elif data.ndim == 1:
@@ -345,7 +333,7 @@ class HDFReader(DataReader):
             raise ValueError(f"Unsupported data shape: {data.shape}")
 
     def _reshape_1d_data(self, data: np.ndarray) -> np.ndarray:
-        """Reshape 1D data using known detector dimensions or square root."""
+        """Reshape 1D data to a known detector size or a perfect square."""
         for height, width in self.DETECTOR_SIZES:
             if data.size == height * width:
                 return data.reshape((height, width))
@@ -358,7 +346,7 @@ class HDFReader(DataReader):
 
     @staticmethod
     def _apply_floor_clipping(data: np.ndarray) -> np.ndarray:
-        """Clip negative noise to the minimum positive value."""
+        """Raise non-positive values to the minimum positive one (unchanged if none)."""
         pos = data > 0
         if pos.any():
             floor = float(data[pos].min())
@@ -380,10 +368,7 @@ class HDFReader(DataReader):
         """Stride-downsample to fit within max_size x max_size."""
         height, width = data.shape
 
-        scale_factor = max(
-            height / max_size,
-            width / max_size
-        )
+        scale_factor = max(height / max_size, width / max_size)
 
         if scale_factor <= 1:
             return data
@@ -397,7 +382,7 @@ class HDFReader(DataReader):
 # ============================================================================
 
 class DataReaderFactory:
-    """Returns the correct reader for a given file extension."""
+    """Factory mapping file extensions to shared reader instances."""
 
     READERS: Dict[FileType, DataReader] = {
         FileType.EDF: EDFReader(),
@@ -410,7 +395,7 @@ class DataReaderFactory:
 
     @classmethod
     def get_reader(cls, file_path: str, *, is_neutron: bool = False) -> DataReader:
-        """Reader instance for the file's extension; ValueError if unsupported."""
+        """Return the shared reader for the file's extension; raise ValueError if unsupported."""
         if is_neutron and file_path.endswith('.dat'):
             return cls.NEUTRON_READER
 

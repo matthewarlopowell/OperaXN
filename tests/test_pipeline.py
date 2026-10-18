@@ -1,8 +1,10 @@
-"""End-to-end pipeline suite: raw instrument directories through echem
-correlation and generation to canonical .nxs, and back out again via load.
-"""
+"""End-to-end pipeline: echem parsing, correlation, .nxs generation and reload."""
+import glob
+import io
+import logging
 import os
-import zipfile
+import tempfile
+import uuid
 
 import h5py
 import numpy as np
@@ -12,7 +14,7 @@ import pytest
 import core
 
 import _builders
-from _helpers import assert_pynxtools_valid, need_dataset
+from _helpers import assert_pynxtools_valid, need_dataset, needs_fabio
 
 
 # ============================================================================
@@ -21,7 +23,7 @@ from _helpers import assert_pynxtools_valid, need_dataset
 
 @pytest.fixture
 def pipeline(inhouse_dir):
-    """core.process_raw output over the synthetic in-house directory."""
+    """Return core.process_raw output over the synthetic in-house directory."""
     return core.process_raw([inhouse_dir], core.DataSourceType.INHOUSE)
 
 
@@ -41,6 +43,41 @@ def test_process_raw_scan1_voltage(pipeline):
     """Scan at 10:05 with 120 s exposure correlates at its 10:06 midpoint to V = 3.76."""
     scans, _ = pipeline
     assert abs(scans[0].echem - 3.76) < 1e-9, f"got {scans[0].echem}"
+
+
+def test_tolerance_bounds_the_match_past_the_record_end(tmp_path):
+    """A midpoint 200 s past the last echem point matches at the 300 s default but not at 100 s,
+    in process_raw and generate alike; the file stores the tolerance with the echem record."""
+    src = str(tmp_path / "late_scan")
+    os.makedirs(src)
+    # Echem covers 10:00-10:39 (last point 4.09 V); the 120 s scan starting
+    # at 10:41:20 has its midpoint at 10:42:20, 200 s after that point
+    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
+    _builders.write_xrd_dat(os.path.join(src, "scan_001.dat"), "2024-02-05T10:41:20")
+
+    scans, _ = core.process_raw([src], core.DataSourceType.INHOUSE)
+    assert abs(scans[0].echem - 4.09) < 1e-9, scans[0].echem
+    scans, _ = core.process_raw([src], core.DataSourceType.INHOUSE,
+                                echem_time_tolerance=100)
+    assert scans[0].echem is None and scans[0].current is None
+
+    for tolerance, expected in ((300, 4.09), (100, None)):
+        out = str(tmp_path / f"late_{tolerance}.nxs")
+        ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE,
+                                 echem_time_tolerance=tolerance)
+        assert ok, str(msgs)
+        with h5py.File(out) as f:
+            stored = f["entry/operando_electrochemistry/echem_time_tolerance"]
+            assert stored[()] == float(tolerance) and stored.attrs.get("units") == "s"
+            env = f["entry/scan_000001/environment"]
+            if expected is None:
+                assert "voltage" not in env and "current" not in env
+            else:
+                assert abs(env["voltage"][()] - expected) < 1e-9
+        loaded = core.load(out)
+        assert loaded.global_metadata.get("echem_time_tolerance") == float(tolerance)
+        got = loaded.scans[0].echem
+        assert got is None if expected is None else abs(got - expected) < 1e-9, got
 
 
 # ============================================================================
@@ -124,9 +161,8 @@ ARBIN_FULL_HEADER = ("Data_Point\tTest_Time(s)\tDate_Time\tCurrent(A)\t"
         "arbin-full-export", "derived-column-first", "aux-and-range-after",
         "aux-and-range-before"])
 def test_detect_columns_time_slot(header, sample, expected):
-    """One matrix for the time-slot rules: Arbin's Date_Time beats the
-    elapsed-seconds column, single-time headers are untouched, and a bare
-    Date column loses the slot to a clock column."""
+    """Column detection matrix: Arbin's Date_Time beats elapsed seconds, a bare Date loses to a
+    clock column, and derived, aux and range columns never take the voltage or current slot."""
     columns = core.EchemParser()._detect_columns(header, sample)
     assert {k: columns[k] for k in expected} == expected, f"got {columns}"
 
@@ -149,8 +185,7 @@ def test_arbin_header_txt_parses(tmp_path):
 
 
 def test_arbin_full_export_parses_real_voltage(tmp_path):
-    """A full MITS-style export keeps the real Voltage(V) column: the dV/dt
-    derived column must not be silently correlated as the cell voltage."""
+    """A full MITS-style export parses its real Voltage(V) column, never the derived dV/dt."""
     rows = [ARBIN_FULL_HEADER]
     rows += [f"{m + 1}\t{m * 60.0:.1f}\t2024-02-05 10:{m:02d}:00"
              f"\t{0.1 + m * 0.001:.4f}\t{3.7 + m * 0.01:.4f}\t0.001\t0\t0.004"
@@ -169,7 +204,7 @@ _TS = [f"2024-02-05 10:{m:02d}:00" for m in range(5)]
 
 
 def _arbin_rows(ts_list):
-    """Arbin-shaped data rows for the given (possibly blank) timestamps."""
+    """Return Arbin-shaped data rows for the given (possibly blank) timestamps."""
     return [f"{i + 1}\t{ts}\t{i * 60.0:.1f}\t0.1\t{3.7 + i * 0.01:.4f}"
             for i, ts in enumerate(ts_list)]
 
@@ -189,10 +224,9 @@ def _arbin_rows(ts_list):
 ], ids=["blank-line-after-header", "blank-timestamp-cell", "slash-year-first",
         "constant-metadata-datetime", "malformed-first-cell"])
 def test_parse_timestamp_edge_cases(tmp_path, rows, n, first_ts):
-    """Timestamp-edge matrix: blank lines and blank cells drop cleanly, slash
-    year-first dates are not day/month-swapped, a constant metadata datetime
-    loses to the varying per-row column, and a malformed first cell recovers
-    via later rows. Every surviving timestamp is real, unique, and ordered."""
+    """Blank lines and cells drop, slash year-first dates are not day/month-swapped, a constant
+    metadata datetime loses to the per-row column, and a malformed first cell recovers;
+    every surviving timestamp is real and unique."""
     path = tmp_path / "echem.txt"
     path.write_text("\n".join(rows) + "\n")
     df = core.EchemParser().parse(str(path))
@@ -213,10 +247,8 @@ def test_parse_timestamp_edge_cases(tmp_path, rows, n, first_ts):
      lambda m: f"2024-02-05\t{m * 60.0:.1f}\t{3.7 + m * 0.01:.4f}\t0.1"),
 ], ids=["vacated-index-default", "bare-date-last-match", "bare-date-first-match"])
 def test_unusable_headers_fail_safe(tmp_path, header, make_row):
-    """Headers with no usable timestamp column parse to None (safe reject)
-    rather than silently mis-correlating: a vacated index must not feed the
-    positional defaults, and a bare date column never wins the slot from
-    either side of the last-match-wins ordering."""
+    """Unusable headers parse to None rather than mis-correlate: a vacated index never feeds the
+    positional defaults and a bare date never wins in either match order."""
     rows = [header] + [make_row(m) for m in range(5)]
     path = tmp_path / "unusable.txt"
     path.write_text("\n".join(rows) + "\n")
@@ -241,9 +273,7 @@ def test_arbin_xlsx_pipeline_correlation(tmp_path):
     """An Arbin .xlsx correlates end to end like the .txt echem it mirrors."""
     data_dir = tmp_path / "data"
     os.makedirs(data_dir)
-    for i, ts in enumerate(_builders.SCAN_TIMES, start=1):
-        _builders.write_xrd_dat(str(data_dir / f"scan_{i:03d}.dat"), ts,
-                                y=_builders.inhouse_scan_y(i))
+    _builders.write_inhouse_scans(str(data_dir))
     _builders.write_arbin_xlsx(str(data_dir / "cellA.xlsx"))
     scans, echem = core.process_raw([str(data_dir)], core.DataSourceType.INHOUSE)
     assert len(scans) == 3 and len(echem) == 40, f"got {len(scans)} scans, {len(echem)} rows"
@@ -264,20 +294,10 @@ def test_convert_tabular_dest_dir(tmp_path):
     assert df is not None and len(df) == 40
 
 
-needs_fabio = pytest.mark.skipif(not core.FABIO_AVAILABLE,
-                                 reason="fabio not installed")
-
-
 @needs_fabio
 def test_zip_twod_references_survive(tmp_path):
-    """ZIP-extracted 2D sources are persisted beside the .nxs; references
-    into the deleted extraction tempdir would never be viewable."""
-    src = str(tmp_path / "src")
-    _builders.write_twod_dir(src)
-    zpath = str(tmp_path / "cell.zip")
-    with zipfile.ZipFile(zpath, "w") as z:
-        for name in os.listdir(src):
-            z.write(os.path.join(src, name), name)
+    """ZIP-extracted 2D sources persist beside the .nxs, not in the deleted extraction tempdir."""
+    zpath = _builders.write_twod_zip(str(tmp_path / "cell.zip"), tmp_path)
     out = str(tmp_path / "zipped.nxs")
     ok, msgs = core.generate([zpath], out, core.DataSourceType.INHOUSE)
     assert ok, str(msgs)
@@ -286,6 +306,20 @@ def test_zip_twod_references_survive(tmp_path):
     assert os.path.isfile(source), f"2D reference is a dead path: {source}"
     assert source.startswith(str(tmp_path / "zipped_images")), source
     assert any("2D images copied" in msg for msg in msgs), msgs
+
+
+def test_missing_echem_warning_is_logged(tmp_path, caplog):
+    """A run without echem still generates and logs the no-echem warning to the terminal."""
+    src = tmp_path / "xrd_only"
+    src.mkdir()
+    _builders.write_inhouse_scans(str(src))
+    out = str(tmp_path / "xrd_only.nxs")
+    with caplog.at_level(logging.WARNING, logger="core"):
+        ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE)
+    assert ok, str(msgs)
+    assert "Warning: No echem data available" in msgs
+    assert any(r.levelno == logging.WARNING and r.getMessage() == "No echem data available"
+               for r in caplog.records), [r.getMessage() for r in caplog.records]
 
 
 @needs_fabio
@@ -304,9 +338,6 @@ def test_folder_twod_references_untouched(tmp_path):
 
 def test_xlsx_conversion_leaves_no_temp_files(tmp_path):
     """The pipeline's converted copies live in the session tempdir, not %TEMP%."""
-    import glob
-    import tempfile
-    import uuid
     stem = f"oxleak_{uuid.uuid4().hex}"  # per-run stem: immune to old residue
     data_dir = tmp_path / "data"
     os.makedirs(data_dir)
@@ -323,7 +354,7 @@ def test_xlsx_conversion_leaves_no_temp_files(tmp_path):
 
 @pytest.fixture
 def inhouse_rt(inhouse_dir, tmp_path):
-    """Pipeline scans/echem plus the generated-and-reloaded in-house model."""
+    """Return pipeline scans/echem plus the generated-and-reloaded in-house .nxs and model."""
     scans, echem = core.process_raw([inhouse_dir], core.DataSourceType.INHOUSE)
     nxs = str(tmp_path / "inhouse.nxs")
     ok, msgs = core.generate([inhouse_dir], nxs, core.DataSourceType.INHOUSE)
@@ -333,7 +364,7 @@ def inhouse_rt(inhouse_dir, tmp_path):
 
 @pytest.fixture
 def neutron_rt(neutron_dir, tmp_path):
-    """Generated-and-reloaded neutron model."""
+    """Return the generated-and-reloaded neutron model."""
     nxs = str(tmp_path / "neutron.nxs")
     ok, msgs = core.generate([neutron_dir], nxs, core.DataSourceType.NEUTRON)
     assert ok, f"generate neutron nxs failed: {msgs}"
@@ -348,7 +379,7 @@ def test_inhouse_nxs_is_canonical(inhouse_rt):
 
 
 def test_inhouse_scan_fields_roundtrip(inhouse_rt):
-    """Voltage, current, timestamp, and exposure survive write -> load per scan."""
+    """Voltage, current, timestamp and exposure survive write -> load per scan."""
     scans, _, _, model = inhouse_rt
     assert len(model.scans) == 3, f"got {len(model.scans)}"
     for pipeline_scan, loaded in zip(scans, model.scans):
@@ -371,7 +402,7 @@ def test_inhouse_oned_data_exact(inhouse_rt):
 
 
 def test_inhouse_echem_df_roundtrip(inhouse_rt):
-    """Operando echem rows, voltages, and absolute timestamps survive reload."""
+    """Operando echem rows, voltages and absolute timestamps survive reload."""
     _, echem, _, model = inhouse_rt
     assert model.echem_df is not None and len(model.echem_df) == 40
     assert np.allclose(model.echem_df["echem_data"].values, echem["echem_data"].values)
@@ -422,13 +453,10 @@ def test_default_cache_path_outside_data_dir(inhouse_dir):
 
 
 def test_no_undefined_names_in_packages():
-    """Pyflakes undefined-name sweep over core and operaxn: a definition
-    removed as unused while later code still references it must fail loudly
-    (the dialog.py logger regression class)."""
+    """Pyflakes finds no undefined names in core or operaxn, so a definition removed while still
+    referenced fails loudly (the dialog.py logger regression)."""
     pyflakes_api = pytest.importorskip("pyflakes.api")
     from pyflakes.reporter import Reporter
-    import glob
-    import io
     root = os.path.dirname(os.path.dirname(os.path.abspath(core.__file__)))
     issues = []
     for pkg in ("core", "operaxn"):
@@ -462,8 +490,8 @@ def test_no_undefined_names_in_packages():
 
 @pytest.mark.realdata
 def test_neutron_zip(tmp_path):
-    """The neutron zip yields >50 scans and >1000 echem rows; every
-    scan carries error-bearing banks and some correlate to echem."""
+    """The neutron zip yields >50 scans and >1000 echem rows; every scan carries error-bearing
+    banks, some correlate to echem, and the file validates."""
     src = need_dataset("neutron_tof.zip")
     nxs = str(tmp_path / "neutron_real.nxs")
     ok, msgs = core.generate([src], nxs, core.DataSourceType.NEUTRON)
@@ -486,8 +514,7 @@ def test_neutron_zip(tmp_path):
 
 @pytest.mark.realdata
 def test_synchrotron_folder(tmp_path):
-    """The synchrotron folder generates loadable scans and harvests
-    the instrument name as i11-1."""
+    """The synchrotron folder generates loadable scans and harvests the instrument name i11-1."""
     src = need_dataset("synchrotron_i11")
     nxs = str(tmp_path / "synchrotron_real.nxs")
     ok, msgs = core.generate([src], nxs, core.DataSourceType.SYNCHROTRON)
@@ -501,8 +528,7 @@ def test_synchrotron_folder(tmp_path):
 
 @pytest.mark.realdata
 def test_lab_full_folder(tmp_path):
-    """The lab XRD folder yields >400 scans with 1D patterns and >400
-    with correlated echem."""
+    """The lab XRD folder yields >400 scans with 1D patterns and >400 with correlated echem."""
     src = need_dataset("lab_xrd_full")
     nxs = str(tmp_path / "lab_full_real.nxs")
     ok, msgs = core.generate([src], nxs, core.DataSourceType.INHOUSE)
@@ -534,9 +560,8 @@ def test_polaris_profile_matches_mantid_file():
 
 
 def test_neutron_midpoint_not_floored(tmp_path):
-    """A run of odd length correlates at its exact half-second midpoint,
-    not at the midpoint floored to the second (which picked the wrong
-    electrochemistry point for 75 of 108 POLARIS runs)."""
+    """An odd-length run correlates at its exact half-second midpoint, not the floored one
+    (flooring picked the wrong echem point for 75 of 108 POLARIS runs)."""
     src = str(tmp_path / "odd_run")
     os.makedirs(src)
     # 7 s run: exact midpoint 10:00:03.5, floored 10:00:03
@@ -568,10 +593,8 @@ def test_neutron_midpoint_not_floored(tmp_path):
 
 
 def test_window_extrema_span_the_window(pipeline):
-    """voltage/current min and max cover every electrochemistry point inside
-    the acquisition window, both bounds inclusive: scan 1 (10:05, 120 s)
-    sees the 10:05, 10:06 and 10:07 points, and the matched value lies
-    within the range."""
+    """Voltage/current extrema cover every echem point in the window, both bounds inclusive:
+    scan 1 (10:05, 120 s) sees 10:05 to 10:07 and its matched value lies within the range."""
     scans, _ = pipeline
     s1 = scans[0]
     assert (s1.voltage_min, s1.voltage_max) == (3.75, 3.77)
@@ -580,8 +603,7 @@ def test_window_extrema_span_the_window(pipeline):
 
 
 def test_window_extrema_absent_without_exposure(tmp_path):
-    """A scan whose header carries no exposure has no acquisition window, so
-    no extrema are recorded, while the nearest-point voltage still is."""
+    """A scan with no header exposure has no extrema but keeps its nearest-point voltage."""
     src = str(tmp_path / "no_exposure")
     os.makedirs(src)
     lines = ["# Date 2024-02-05T10:05:00", "# tth Intensity"]
@@ -597,9 +619,8 @@ def test_window_extrema_absent_without_exposure(tmp_path):
 
 
 def test_window_extrema_follow_relative_alignment(tmp_path, inhouse_dir):
-    """In relative mode the extrema use the same clock shift as the
-    correlation: the earliest scan midpoint maps onto the first echem point,
-    so scan 1 matches 3.70 V and its shifted window holds 3.70 to 3.71 V."""
+    """Relative-mode extrema use the correlation's clock shift: the earliest midpoint maps onto
+    the first echem point, so scan 1 matches 3.70 V inside a 3.70 to 3.71 V window."""
     out = str(tmp_path / "relative.nxs")
     ok, msgs = core.generate([inhouse_dir], out, core.DataSourceType.INHOUSE,
                              time_method=core.TimeMethod.RELATIVE)
@@ -611,10 +632,9 @@ def test_window_extrema_follow_relative_alignment(tmp_path, inhouse_dir):
 
 
 def test_synchrotron_exposure_is_the_scan_window(tmp_path):
-    """A synchrotron scan's exposure is its recorded window, end minus start
-    (readout and processing included): the detector's own count_time under a
-    device-named NXdetector (i11-1: pixium_hdf) is deliberately not used, so
-    the correlation midpoint stays at the centre of the recorded window."""
+    """A synchrotron scan's exposure is its recorded end minus start (readout and processing
+    included), never a device-named NXdetector's count_time (i11-1: pixium_hdf), so the
+    correlation midpoint stays centred on the recorded window."""
     src = str(tmp_path / "synchrotron")
     os.makedirs(src)
     _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00",
@@ -625,3 +645,67 @@ def test_synchrotron_exposure_is_the_scan_window(tmp_path):
     scans, _ = core.process_raw([src], core.DataSourceType.SYNCHROTRON)
     assert [sc.exposure_time for sc in scans] == [39.0, 39.0], \
         [sc.exposure_time for sc in scans]
+
+
+def test_file_cache_replacing_a_key_counts_it_once():
+    """Re-putting a key (two threads reading one file) keeps the byte count to what is held."""
+    import sys
+    import threading
+    from core.readers import FileCache
+    cache = FileCache(max_size_mb=1)
+    for _ in range(3):
+        cache.put("same", np.zeros(50_000))
+    assert cache.current_size == sys.getsizeof(cache.cache["same"])
+    cache.put("other", np.zeros(80_000))
+    assert sorted(cache.cache) == ["other", "same"], "phantom bytes must not force an eviction"
+    # A larger replacement evicts by count; the replaced key's stale count must not stall it
+    cache.get("other")
+    cache.get("other")
+    worker = threading.Thread(target=cache.put, args=("same", np.zeros(100_000)), daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "put must not spin on a stale access count"
+    assert sorted(cache.cache) == ["same"], "the least-accessed entry gives way"
+
+
+def test_generate_rejects_an_unusable_tolerance(tmp_path, caplog):
+    """Direct API callers get a clear error, not a logged traceback, for a tolerance the
+    correlator cannot use."""
+    src = str(tmp_path / "inhouse")
+    _builders.write_inhouse_dir(src)
+    for bad in (None, "300", 0, -5, float("nan"), float("inf"), True, 300j, 1e10, 10**400):
+        caplog.clear()
+        ok, msgs = core.generate([src], str(tmp_path / "bad.nxs"),
+                                 core.DataSourceType.INHOUSE, echem_time_tolerance=bad)
+        assert not ok and "echem_time_tolerance" in msgs[0], (bad, msgs)
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], bad
+        with pytest.raises(ValueError, match="echem_time_tolerance"):
+            core.process_raw([src], core.DataSourceType.INHOUSE, echem_time_tolerance=bad)
+    assert not os.path.exists(tmp_path / "bad.nxs")
+    ok, msgs = core.generate([src], str(tmp_path / "over.nxs"), core.DataSourceType.INHOUSE,
+                             echem_time_tolerance=1e10)
+    assert "up to 1,000,000,000" in msgs[0], "the message names the limit"
+    ok, msgs = core.generate([src], str(tmp_path / "limit.nxs"), core.DataSourceType.INHOUSE,
+                             echem_time_tolerance=1e9)
+    assert ok, "the limit itself is usable"
+
+
+def test_regenerating_keeps_the_embedded_image_shape(tmp_path):
+    """A second generate of one synchrotron image in a session still records original_shape
+    (a cached read skips the step that measures it)."""
+    src = str(tmp_path / "synchrotron")
+    os.makedirs(src)
+    _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00",
+                                     "2024-02-05T10:05:39")
+    with h5py.File(os.path.join(src, "pixium-000001.hdf"), "w") as f:
+        f["entry/instrument/detector/data"] = np.ones((16, 16), dtype=np.float32)
+    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
+    for run in range(2):
+        out = str(tmp_path / f"run{run}.nxs")
+        ok, msgs = core.generate([src], out, core.DataSourceType.SYNCHROTRON,
+                                 include_2d_images=True)
+        assert ok, str(msgs)
+        with h5py.File(out) as f:
+            note = f["entry/scan_000001/image_source"]
+            assert "original_shape" in note, f"run {run} lost original_shape"
+            assert list(note["original_shape"][()]) == [16, 16]

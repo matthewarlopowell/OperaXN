@@ -19,8 +19,6 @@ dist/
 .ruff_cache/
 .mypy_cache/
 
-# Local pynxtools reader plugin
-/pynxtools-operaxn/
 .coverage
 htmlcov/
 
