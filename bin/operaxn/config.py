@@ -107,7 +107,8 @@ INTERPOLATION_METHOD = "bilinear"
 
 # Data Processing (pipeline constants live in core.config; these are GUI-side)
 LARGE_IMAGE_THRESHOLD = 2_000_000
-INTENSITY_SAMPLE_SIZE = 20_000
+INTENSITY_SAMPLE_SIZE = 1_000_000  # pixels sampled for a large image's auto range
+INTENSITY_LOG_STEP = 0.01  # 2D intensity slider step, in decades (images are log-scaled)
 LRU_CACHE_MAXSIZE = 128
 SECONDS_PER_HOUR = 3600.0
 
@@ -149,11 +150,11 @@ DEFAULT_GIF_LOOP = 0
 
 # Initial dialog sizes only; BaseDialog.shrink_to_fit resizes to content
 WINDOW_SIZES = {
-    'export_neutron': "400x375",
-    'export_xrd': "400x425",
-    'gif': "400x425",
     'progress': "300x100"
 }
+# Width (inches, so it holds at any display scaling) shared by the Image, GIF and
+# Plot Settings dialogs; each height fits its content
+SETTINGS_DIALOG_WIDTH_IN = 5.1
 
 # ============================================================================
 # Scientific Constants

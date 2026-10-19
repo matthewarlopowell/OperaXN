@@ -16,7 +16,7 @@ import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox
 from typing import Optional, List, Tuple, Callable, Dict, Any
 
 import matplotlib.pyplot as plt
@@ -24,7 +24,6 @@ import numpy as np
 import pandas as pd
 import psutil
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
 
 from .config import (
     APP_VERSION,
@@ -38,27 +37,23 @@ from .config import (
     DEFAULT_TWOD_YMIN_PERCENT,
     EXCEL_ENGINE,
     FIGURE_DPI,
-    INTENSITY_SAMPLE_SIZE,
-    LARGE_IMAGE_THRESHOLD,
+    INTENSITY_LOG_STEP,
     OPERAXNTheme,
     PLOT_UPDATE_DELAY_MS,
     SYNCHROTRON_MAX_DISPLAY_SIZE,
+    SYNCHROTRON_WAVELENGTH,
+    VMIN_FLOOR,
+    XRAY_WAVELENGTH,
 )
 
-from .capacity import (
-    assign_cycles, compute_capacity,
-    plot_capacity_vs_voltage, plot_time_vs_voltage
-)
+from .capacity import CapacityWindow
 from .dialog import (
     PlotSettingsDialog, ExportOptionsDialog, ExportOptions,
-    GIFSettingsDialog, GIFSettings, ProgressDialog,
-    UploadOptionsDialog, UploadOptions, parse_scan_range
+    GIFSettingsDialog, GIFSettings,
+    UploadOptionsDialog, UploadOptions
 )
 from .heatmap import HeatmapWindow
-from .ici import (
-    ICIWindow, echem_source_button, embed_figure, maximise_window,
-    watch_figure_sync
-)
+from .ici import ICIWindow, maximise_window
 from .input import (
     process_paths, make_oned_arrays, make_twod_arrays,
     make_echem_arrays, get_correlated_data, make_neutron_arrays,
@@ -70,7 +65,8 @@ from .output import (
     plot_oned_data, plot_twod_data, plot_echem_data,
     create_figure_layout, export_single_scan,
     get_scan_time_positions, plot_neutron_data,
-    clear_plot_cache, clear_plot_axes, FigureLayoutManager
+    clear_plot_cache, clear_plot_axes, FigureLayoutManager,
+    auto_intensity_limits, intensity_bounds
 )
 
 try:
@@ -594,7 +590,7 @@ class PlotControls(BaseUIComponent):
                  font=OPERAXNTheme.FONTS['body']).pack(side="left", padx=2)
 
         self._create_intensity_control(frame, "Min:", 'intensity_min_var',
-                                       'min_entry', 'min_slider', 0)
+                                       'min_entry', 'min_slider', 1)
         self._create_intensity_control(frame, "Max:", 'intensity_max_var',
                                        'max_entry', 'max_slider', 100)
 
@@ -611,8 +607,9 @@ class PlotControls(BaseUIComponent):
         )
         self.apply_all_btn.pack(side="left", padx=(7, 0), pady=(0, 3))
 
-    def _create_intensity_control(self, parent: tk.Frame, label: str, var_name: str, entry_name: str, slider_name: str, default: float) -> None:
-        """Create a labelled entry + slider pair for intensity bounds."""
+    def _create_intensity_control(self, parent: tk.Frame, label: str, var_name: str,
+                                  entry_name: str, slider_name: str, default: float) -> None:
+        """Create a labelled entry + log-scale slider pair for one intensity bound."""
         tk.Label(
             parent,
             text=label,
@@ -621,8 +618,8 @@ class PlotControls(BaseUIComponent):
             font=OPERAXNTheme.FONTS['body']
         ).pack(side="left", padx=4)
 
-        var = tk.DoubleVar(value=default)
-        setattr(self, var_name, var)
+        setattr(self, var_name, tk.DoubleVar(value=default))
+        is_min = var_name == 'intensity_min_var'
 
         entry = tk.Entry(
             parent,
@@ -634,27 +631,22 @@ class PlotControls(BaseUIComponent):
             relief=tk.FLAT
         )
         entry.pack(side="left")
-        entry.insert(0, str(default))
-
-        def update_from_entry(event=None):
-            try:
-                value = float(entry.get())
-                var.set(value)
-                self.on_intensity_update()
-            except ValueError:
-                pass  # Ignore invalid input
-
-        entry.bind("<Return>", update_from_entry)
-        entry.bind("<FocusOut>", update_from_entry)
+        entry.insert(0, f"{default:g}")
+        entry.bind("<Return>", lambda _e: self._commit_entry(is_min))
+        entry.bind("<FocusOut>", lambda _e: self._commit_entry(is_min))
         setattr(self, entry_name, entry)
 
+        # The image is drawn on a log scale, so the slider moves in decades
+        log_var = tk.DoubleVar(value=np.log10(default))
+        setattr(self, f"_{slider_name}_log", log_var)
         slider = tk.Scale(
             parent,
             from_=0,
-            to=0,
+            to=2,
+            resolution=INTENSITY_LOG_STEP,
             orient="horizontal",
-            variable=var,
-            command=lambda v: self.intensity_debouncer.schedule(self._update_entry_from_slider),
+            variable=log_var,
+            command=lambda _v: self._on_slider(is_min),
             length=100,
             showvalue=False,
             bg=OPERAXNTheme.COLORS['bg_primary'],
@@ -666,13 +658,68 @@ class PlotControls(BaseUIComponent):
         slider.pack(side="left", padx=4)
         setattr(self, slider_name, slider)
 
-    def _update_entry_from_slider(self) -> None:
-        """Mirror slider values into the entries, then fire the update."""
-        if hasattr(self, 'min_entry'):
-            self.min_entry.delete(0, tk.END)
-            self.min_entry.insert(0, f"{self.intensity_min_var.get():.2f}")
-            self.max_entry.delete(0, tk.END)
-            self.max_entry.insert(0, f"{self.intensity_max_var.get():.2f}")
+    def _show_limits(self, vmin: float, vmax: float) -> None:
+        """Set the applied limits and mirror them into both sliders and entries."""
+        self.intensity_min_var.set(vmin)
+        self.intensity_max_var.set(vmax)
+        self._min_slider_log.set(np.log10(vmin))
+        self._max_slider_log.set(np.log10(vmax))
+        for entry, value in ((self.min_entry, vmin), (self.max_entry, vmax)):
+            state = entry.cget("state")
+            entry.config(state="normal")
+            entry.delete(0, tk.END)
+            entry.insert(0, f"{value:.4g}")
+            entry.config(state=state)
+
+    def _set_span(self, low: float, high: float) -> None:
+        """Let both sliders cover low..high (positive), in whole slider steps."""
+        step = INTENSITY_LOG_STEP
+        lo_log = np.floor(np.log10(low) / step) * step
+        hi_log = max(np.ceil(np.log10(high) / step) * step, lo_log + step)
+        for slider in (self.min_slider, self.max_slider):
+            slider.config(from_=lo_log, to=hi_log)
+
+    def _on_slider(self, is_min: bool) -> None:
+        """Apply one slider's move as 10**position, leaving the other bound exact.
+        Min stays below Max; a position that only echoes the applied limit changes nothing."""
+        step = INTENSITY_LOG_STEP
+        tolerance = step / 2 + 1e-9  # Tk rounds the slider to whole steps
+        vmin, vmax = self.get_intensity_limits()
+        if is_min:
+            lo_log = self._min_slider_log.get()
+            if abs(lo_log - np.log10(vmin)) <= tolerance:
+                return
+            new = (float(f"{10 ** min(lo_log, np.log10(vmax) - step):.4g}"), vmax)
+        else:
+            hi_log = self._max_slider_log.get()
+            if abs(hi_log - np.log10(vmax)) <= tolerance:
+                return
+            new = (vmin, float(f"{10 ** max(hi_log, np.log10(vmin) + step):.4g}"))
+        self._show_limits(*new)
+        self.intensity_debouncer.schedule(self.on_intensity_update)
+
+    def _commit_entry(self, is_min: bool) -> None:
+        """Apply a typed bound, widening the sliders to reach it.
+        Values that are not positive numbers, or would cross the other bound, are put back."""
+        entry = self.min_entry if is_min else self.max_entry
+        vmin, vmax = self.get_intensity_limits()
+        # Leaving an untouched box keeps the exact limit, not its 4-figure display
+        if entry.get().strip() == f"{(vmin if is_min else vmax):.4g}":
+            return
+        try:
+            value = float(entry.get())
+        except ValueError:
+            value = float("nan")
+        crosses = value >= vmax if is_min else value <= vmin
+        if not np.isfinite(value) or value <= 0 or crosses:
+            self._show_limits(vmin, vmax)
+            return
+        new = (value, vmax) if is_min else (vmin, value)
+        if new == (vmin, vmax):
+            return
+        lo_log, hi_log = float(self.min_slider.cget("from")), float(self.min_slider.cget("to"))
+        self._set_span(min(10 ** lo_log, new[0]), max(10 ** hi_log, new[1]))
+        self._show_limits(*new)
         self.on_intensity_update()
 
     def _on_echem_change(self) -> None:
@@ -688,7 +735,7 @@ class PlotControls(BaseUIComponent):
         current_max = self.intensity_max_var.get()
 
         if messagebox.askyesno("Confirm",
-                               f"Apply intensity range {current_min:.2f} - {current_max:.2f} to all scans?",
+                               f"Apply intensity range {current_min:.4g} - {current_max:.4g} to all scans?",
                                parent=self.master):
             self.on_intensity_apply(current_min, current_max)
 
@@ -712,12 +759,14 @@ class PlotControls(BaseUIComponent):
                     side="right", padx=OPERAXNTheme.PADDING['medium'] + 2)
 
     def update_intensity_range(self, vmin: float, vmax: float, current_min: float, current_max: float) -> None:
-        """Rescale both sliders to [vmin, vmax] and set current values."""
+        """Span the sliders over [vmin, vmax], widened to the current limits, and show those."""
         if hasattr(self, 'min_slider'):
-            self.min_slider.config(from_=vmin, to=vmax, resolution=1)
-            self.max_slider.config(from_=vmin, to=vmax, resolution=1)
-            self.intensity_min_var.set(current_min)
-            self.intensity_max_var.set(current_max)
+            # The sliders are logarithmic, so every limit they show must be positive
+            low = vmin if vmin > 0 else VMIN_FLOOR
+            current_min = current_min if current_min > 0 else low
+            current_max = current_max if current_max > current_min else current_min * 10
+            self._set_span(min(low, current_min), max(vmax, current_max))
+            self._show_limits(current_min, current_max)
 
     def get_intensity_limits(self) -> Tuple[float, float]:
         """Return the current (min, max) limits, or (0, 100) before the widgets exist."""
@@ -737,6 +786,14 @@ class PlotControls(BaseUIComponent):
                            self.max_entry, self.max_slider,
                            self.apply_all_btn]:
                 widget.config(state=state)
+
+
+def _experiment_stem() -> str:
+    """Return the loaded experiment's file stem: NeXus and Excel exports default to it,
+    every other export to <stem>_<method>."""
+    loaded_path = get_loaded_nxs_path()
+    return (os.path.splitext(os.path.basename(loaded_path))[0] if loaded_path
+            else "experiment")
 
 
 # ============================================================================
@@ -1471,7 +1528,8 @@ class OPERAXN(tk.Frame):
                     cmin, cmax = vmin, vmax
                     self.state.intensity_limits[self.state.current_scan_idx] = (cmin, cmax)
 
-                self.controls.update_intensity_range(vmin, vmax, cmin, cmax)
+                self.controls.update_intensity_range(
+                    *intensity_bounds(data["image"]), cmin, cmax)
 
                 self.twod_image = plot_twod_data(
                     self.axes["twod"], data["image"], scan_num,
@@ -1557,27 +1615,8 @@ class OPERAXN(tk.Frame):
             )
 
     def _calculate_intensity_limits(self, image: np.ndarray) -> Tuple[float, float]:
-        """Derive display (vmin, vmax): sampled percentiles when large."""
-        if image.size > LARGE_IMAGE_THRESHOLD:
-            # Sample for large images
-            sample_size = min(INTENSITY_SAMPLE_SIZE, image.size // 100)
-            flat = image.ravel()
-            valid_mask = ~np.isnan(flat)
-            valid_indices = np.where(valid_mask)[0]
-
-            if len(valid_indices) > sample_size:
-                sample_indices = np.random.choice(valid_indices, sample_size, replace=False)
-                sample = flat[sample_indices]
-            else:
-                sample = flat[valid_indices]
-
-            if len(sample) > 0:
-                return np.percentile(sample, [1, 99])
-
-        valid_data = image[~np.isnan(image)]
-        if len(valid_data) == 0:
-            return 0, 1
-        return np.nanmin(image), np.nanmax(image)
+        """Return the default display (vmin, vmax) for an image (output.auto_intensity_limits)."""
+        return auto_intensity_limits(image)
 
     def _update_echem_display(self) -> None:
         """Copy checkbox states into config and redraw all plots."""
@@ -1615,7 +1654,7 @@ class OPERAXN(tk.Frame):
 
         self._update_plots()
         self._show_message("Success",
-                           f"Applied intensity range {current_min:.2f} - {current_max:.2f} to all scans",
+                           f"Applied intensity range {current_min:.4g} - {current_max:.4g} to all scans",
                            "info")
 
     def _lift_existing_dialog(self, attr: str) -> bool:
@@ -1689,20 +1728,27 @@ class OPERAXN(tk.Frame):
                 "warning")
             return
 
-        neutron_options = {}
+        # The main window's axis seeds the map, and for neutron its x range too
+        # (X-ray limits default to the data's edges, which would crop the edge cells)
         if is_neutron:
-            # The main window's neutron axis and x range seed the map
-            neutron_options = dict(
+            options = dict(
                 neutron_arrays=self.state.neutron_arrays,
-                neutron_dspacing=self.config.show_neutron_dspacing,
+                dspacing=self.config.show_neutron_dspacing,
                 x_range=(self.config.neutron_xmin, self.config.neutron_xmax))
+        else:
+            options = dict(
+                dspacing=self.config.show_dspacing,
+                wavelength=(SYNCHROTRON_WAVELENGTH
+                            if self.config.data_source == DataSourceType.SYNCHROTRON
+                            else XRAY_WAVELENGTH))
         win = HeatmapWindow(
             self.master,
             scans=self.state.scans,
             oned_arrays=self.state.oned_arrays,
             echem_arrays=self.state.echem_arrays,
             time_method=self.state.time_method,
-            **neutron_options)
+            export_stem=_experiment_stem(),
+            **options)
         self._heatmap_window = win
         self.state.dialog_windows.append(win)
         win.protocol("WM_DELETE_WINDOW", lambda: self._close_dialog(win))
@@ -1721,7 +1767,8 @@ class OPERAXN(tk.Frame):
 
         win = ICIWindow(
             self.master, echem_sources=sources,
-            on_add_source=self._choose_additional_echem)
+            on_add_source=self._choose_additional_echem,
+            export_stem=_experiment_stem())
         self._ici_window = win
         self.state.dialog_windows.append(win)
         win.protocol("WM_DELETE_WINDOW", lambda: self._close_dialog(win))
@@ -1738,310 +1785,10 @@ class OPERAXN(tk.Frame):
                 "warning")
             return
 
-        # Mutable so the source dropdown can swap datasets inside the closures
-        current = {
-            "name": next(iter(sources)),
-            "df": next(iter(sources.values())),
-            "available": [],
-        }
-
-        win = tk.Toplevel(self.master)
-        win.title("OperaXN: Capacity Analysis")
-        win.configure(bg=OPERAXNTheme.COLORS['bg_primary'])
-        win.minsize(900, 500)
-        maximise_window(win)
-        win.lift()
-        win.focus_force()
-
-        # Compact single-line toolbar matching the main window.
-        controls_wrapper = tk.Frame(
-            win,
-            bg=OPERAXNTheme.COLORS['bg_secondary'],
-            highlightbackground=OPERAXNTheme.COLORS['border'],
-            highlightthickness=1
-        )
-        controls_wrapper.pack(side="top", fill="x",
-                              padx=OPERAXNTheme.PADDING['small'],
-                              pady=(OPERAXNTheme.PADDING['small'], 2))
-        controls = tk.Frame(controls_wrapper, bg=OPERAXNTheme.COLORS['bg_secondary'])
-        controls.pack(fill="x", padx=OPERAXNTheme.PADDING['small'], pady=4)
-
-        def _label(parent: tk.Widget, text: str, dim: bool = False) -> tk.Label:
-            return tk.Label(
-                parent, text=text,
-                bg=OPERAXNTheme.COLORS['bg_secondary'],
-                fg=(OPERAXNTheme.COLORS['text_dim'] if dim
-                    else OPERAXNTheme.COLORS['text_primary']),
-                font=OPERAXNTheme.FONTS['small'])
-
-        def _nav_button(parent: tk.Widget, text: str, command) -> tk.Button:
-            return tk.Button(
-                parent, text=text, command=command, width=1,
-                bg=OPERAXNTheme.COLORS['bg_tertiary'],
-                fg=OPERAXNTheme.COLORS['text_primary'],
-                activebackground=OPERAXNTheme.COLORS['bg_secondary'],
-                activeforeground=OPERAXNTheme.COLORS['text_primary'],
-                disabledforeground=OPERAXNTheme.COLORS['text_dim'],
-                font=OPERAXNTheme.FONTS['button'], relief=tk.FLAT,
-                cursor='hand2', padx=2, pady=3)
-
-        source_var = tk.StringVar(value=next(iter(sources)))
-        source_button = echem_source_button(
-            controls,
-            source_var,
-            list(sources),
-            command=lambda name: win.after_idle(_on_source_change, name),
-            on_add=self._choose_additional_echem,
-        )
-        source_button.pack(side="left", padx=(2, OPERAXNTheme.PADDING['small']))
-
-        _label(controls, "Mass (mg):").pack(side="left")
-        mass_var = tk.StringVar(value="0")
-        mass_entry = tk.Spinbox(
-            controls, textvariable=mass_var, from_=0.0, to=99999.0,
-            increment=0.1, format="%.2f", width=7,
-            command=lambda: _queue_mass_replot(),
-            bg=OPERAXNTheme.COLORS['input_bg'],
-            fg=OPERAXNTheme.COLORS['text_primary'],
-            buttonbackground=OPERAXNTheme.COLORS['bg_secondary'],
-            relief=tk.FLAT, font=OPERAXNTheme.FONTS['small'],
-            highlightbackground=OPERAXNTheme.COLORS['border'],
-            highlightthickness=1)
-        mass_entry.pack(side="left", padx=(2, OPERAXNTheme.PADDING['small']))
-
-        _label(controls, "Cycle:").pack(side="left")
-        cycle_frame = tk.Frame(controls, bg=OPERAXNTheme.COLORS['bg_secondary'])
-        cycle_frame.pack(side="left", padx=(2, OPERAXNTheme.PADDING['small']))
-        cycle_var = tk.IntVar(value=1)
-        prev_cycle = _nav_button(
-            cycle_frame, '◀', lambda: _step_cycle(-1))
-        prev_cycle.pack(side="left", padx=1)
-        cycle_spin = tk.Spinbox(
-            cycle_frame, textvariable=cycle_var, from_=1, to=1, width=4,
-            command=lambda: _replot(),
-            bg=OPERAXNTheme.COLORS['input_bg'],
-            fg=OPERAXNTheme.COLORS['text_primary'],
-            buttonbackground=OPERAXNTheme.COLORS['bg_secondary'],
-            relief=tk.FLAT, font=OPERAXNTheme.FONTS['small'],
-            highlightbackground=OPERAXNTheme.COLORS['border'],
-            highlightthickness=1)
-        cycle_spin.pack(side="left", padx=2)
-        next_cycle = _nav_button(
-            cycle_frame, '▶', lambda: _step_cycle(1))
-        next_cycle.pack(side="left", padx=1)
-
-        all_cycles_var = tk.BooleanVar(value=True)
-        all_cycles_check = tk.Checkbutton(
-            controls, text="All cycles", variable=all_cycles_var,
-            command=lambda: _toggle_all_cycles(),
-            bg=OPERAXNTheme.COLORS['bg_secondary'],
-            fg=OPERAXNTheme.COLORS['text_primary'],
-            activebackground=OPERAXNTheme.COLORS['bg_secondary'],
-            activeforeground=OPERAXNTheme.COLORS['text_primary'],
-            disabledforeground=OPERAXNTheme.COLORS['text_primary'],
-            selectcolor=OPERAXNTheme.COLORS['bg_tertiary'],
-            font=OPERAXNTheme.FONTS['small'])
-        all_cycles_check.pack(side="left", padx=(0, OPERAXNTheme.PADDING['small']))
-
-        cycles_label = _label(controls, "", dim=True)
-        cycles_label.pack(side="left", padx=(0, OPERAXNTheme.PADDING['small']))
-
-        def _refresh_available() -> None:
-            try:
-                current["available"] = sorted(
-                    c for c in assign_cycles(current["df"])["cycle"].unique() if c > 0)
-            except Exception:
-                logger.debug("Cycle detection failed: %s", traceback.format_exc())
-                current["available"] = []
-            cycles_label.config(text=f"({len(current['available'])} available)")
-            maximum = max(current["available"], default=1)
-            cycle_spin.config(to=maximum)
-            if cycle_var.get() not in current["available"]:
-                cycle_var.set(current["available"][0] if current["available"] else 1)
-
-        _refresh_available()
-
-        def _get_mass() -> float:
-            try:
-                return float(mass_var.get())
-            except (ValueError, tk.TclError):
-                return 0.0
-
-        def _get_cycles() -> List[int]:
-            if all_cycles_var.get():
-                return list(current["available"])
-            selected = cycle_var.get()
-            return [selected] if selected in current["available"] else []
-
-        # Plot area, bordered like the main-window plot container. The figure
-        # has no fixed size: fractional margins keep the layout correct at
-        # any window size, unlike a one-shot tight_layout.
-        plot_bg = '#ffffff'
-        plot_text = '#20242c'
-        plot_dim = '#4b5563'
-        plot_border = '#9ca3af'
-        plot_grid = '#d8dde6'
-        plot_frame = tk.Frame(
-            win,
-            bg=plot_bg,
-            relief=tk.FLAT,
-            highlightbackground=OPERAXNTheme.COLORS['border'],
-            highlightcolor=OPERAXNTheme.COLORS['accent_primary'],
-            highlightthickness=2
-        )
-        plot_frame.pack(fill="both", expand=True,
-                        padx=OPERAXNTheme.PADDING['small'],
-                        pady=(2, OPERAXNTheme.PADDING['small']))
-        plot_frame.pack_propagate(False)
-
-        fig = Figure(facecolor=plot_bg, dpi=FIGURE_DPI)
-        fig.subplots_adjust(left=0.08, right=0.97, top=0.93, bottom=0.12, wspace=0.24)
-        ax_time, ax_cap = fig.subplots(1, 2)
-
-        def _style_live_axes() -> None:
-            for ax in (ax_time, ax_cap):
-                ax.set_facecolor(plot_bg)
-                ax.tick_params(colors=plot_dim, labelsize=8)
-                ax.xaxis.label.set_color(plot_dim)
-                ax.yaxis.label.set_color(plot_dim)
-                ax.grid(True, color=plot_grid, alpha=0.75, linewidth=0.5)
-                for spine in ax.spines.values():
-                    spine.set_color(plot_border)
-                legend = ax.get_legend()
-                if legend is not None:
-                    legend.get_frame().set_facecolor(plot_bg)
-                    legend.get_frame().set_edgecolor(plot_border)
-                    for text in legend.get_texts():
-                        text.set_color(plot_text)
-
-        plot_time_vs_voltage(ax_time, current["df"])
-        plot_capacity_vs_voltage(ax_cap, current["df"], mass_mg=0.0)
-        _style_live_axes()
-
-        canvas = embed_figure(fig, plot_frame)
-        watch_figure_sync(win, (canvas,))
-
-        def _replot(*_args) -> None:
-            selected = _get_cycles()
-            plot_time_vs_voltage(ax_time, current["df"], cycles_to_plot=selected)
-            plot_capacity_vs_voltage(ax_cap, current["df"], mass_mg=_get_mass(),
-                                     cycles_to_plot=selected)
-            _style_live_axes()
-            canvas.draw()
-
-        mass_replot_job = {"id": None}
-
-        # Debounce typing while keeping mass changes live
-        def _queue_mass_replot(*_args) -> None:
-            if mass_replot_job["id"] is not None:
-                try:
-                    win.after_cancel(mass_replot_job["id"])
-                except tk.TclError:
-                    pass
-
-            def update() -> None:
-                mass_replot_job["id"] = None
-                _replot()
-
-            mass_replot_job["id"] = win.after(150, update)
-
-        def _step_cycle(delta: int) -> None:
-            available = current["available"]
-            if not available:
-                return
-            all_cycles_var.set(False)
-            selected = cycle_var.get()
-            try:
-                index = available.index(selected)
-            except ValueError:
-                index = 0
-            cycle_var.set(available[max(0, min(len(available) - 1, index + delta))])
-            _toggle_all_cycles(replot=False)
-            _replot()
-
-        def _toggle_all_cycles(replot: bool = True) -> None:
-            state = "disabled" if all_cycles_var.get() else "normal"
-            for widget in (prev_cycle, cycle_spin, next_cycle):
-                widget.config(state=state)
-            if replot:
-                _replot()
-
-        def _on_source_change(name: str) -> None:
-            if name == current["name"] or name not in sources:
-                return
-            win.configure(cursor="watch")
-            win.update_idletasks()
-            try:
-                current["name"] = name
-                current["df"] = sources[name]
-                cycle_var.set(1)
-                all_cycles_var.set(True)
-                _refresh_available()
-                _toggle_all_cycles(replot=False)
-                _replot()
-            finally:
-                win.configure(cursor="")
-
-        def _refresh_sources(updated_sources: Dict[str, pd.DataFrame]) -> None:
-            sources.clear()
-            sources.update(updated_sources)
-            source_button.set_values(sources)
-            if current["name"] not in sources and sources:
-                name = next(iter(sources))
-                source_var.set(name)
-                _on_source_change(name)
-
-        win.refresh_sources = _refresh_sources
-
-        def _export_csv() -> None:
-            selected = _get_cycles()
-            if not selected:
-                messagebox.showwarning("No cycles", "No cycles selected to export.",
-                                       parent=win)
-                return
-            path = filedialog.asksaveasfilename(
-                parent=win, defaultextension=".csv",
-                filetypes=[("CSV", "*.csv")], initialfile="capacity_vs_voltage.csv")
-            if not path:
-                return
-            mass = _get_mass()
-            df_full = assign_cycles(current["df"])
-            rows = []
-            for cycle_num in selected:
-                cycle_df = df_full[df_full["cycle"] == cycle_num]
-                for phase in ("charge", "discharge"):
-                    phase_df = cycle_df[cycle_df["phase"] == phase]
-                    if phase_df.empty:
-                        continue
-                    cap = compute_capacity(phase_df)
-                    spec_cap = (cap / (mass / 1000.0) if mass > 0
-                                else np.full_like(cap, np.nan))
-                    for t, v, c, sc in zip(phase_df["t_s"].values,
-                                           phase_df["echem_data"].values,
-                                           cap, spec_cap):
-                        rows.append({
-                            "Cycle": cycle_num,
-                            "Phase": phase,
-                            "Time (s)": t,
-                            "Voltage (V)": v,
-                            "Capacity (mAh)": c,
-                            "Specific Capacity (mAh/g)": sc,
-                        })
-            pd.DataFrame(rows).to_csv(path, index=False, encoding=CSV_ENCODING)
-            messagebox.showinfo("Export complete", f"Saved data to:\n{path}", parent=win)
-
-        export_button = StyledButton(controls, text="Export CSV", command=_export_csv,
-                                     style="secondary", width=11)
-        export_button.pack(side="left", padx=2)
-
-        mass_entry.bind("<Return>", _replot)
-        mass_entry.bind("<FocusOut>", _queue_mass_replot)
-        mass_var.trace_add("write", _queue_mass_replot)
-        cycle_spin.bind("<Return>", _replot)
-
-        # Opens showing every cycle, so start with the stepper disabled
-        _toggle_all_cycles(replot=False)
-
+        win = CapacityWindow(
+            self.master, echem_sources=sources,
+            on_add_source=self._choose_additional_echem,
+            export_stem=_experiment_stem())
         self._capacity_window = win
         self.state.dialog_windows.append(win)
         win.protocol("WM_DELETE_WINDOW", lambda: self._close_dialog(win))
@@ -2051,32 +1798,42 @@ class OPERAXN(tk.Frame):
     # ========================================================================
 
     def _export_data(self) -> None:
-        """Collect image-export options, then export one scan or a range."""
+        """Open the image export page; the export runs from it, with progress shown there."""
         if not self.state.scans:
             return
-
-        options = self._get_export_options()
-        if options:
-            self._perform_export(options)
-
-    def _get_export_options(self) -> Optional[ExportOptions]:
-        """Show the export dialog; None when cancelled or already open."""
         if self._lift_existing_dialog('_export_options_dialog'):
-            return None
+            return
         is_neutron = (self.state.data_source == DataSourceType.NEUTRON)
-        dialog = ExportOptionsDialog(self.master, is_neutron=is_neutron)
-        self._export_options_dialog = dialog
-        return dialog.get_result()
+        dialog = ExportOptionsDialog(
+            self.master, is_neutron=is_neutron, num_scans=len(self.state.scans),
+            on_export=self._perform_export)
+        self._track_run_dialog('_export_options_dialog', dialog)
 
-    def _perform_export(self, options: ExportOptions) -> None:
-        """Dispatch to single- or multi-scan export, reporting failures."""
+    def _perform_export(self, options: ExportOptions, dialog: ExportOptionsDialog) -> None:
+        """Run the export chosen on the dialog, reporting failures."""
         try:
             if options.export_type == "current":
-                self._export_current_scan(options.dpi, options.plot_types)
+                self._export_current_scan(options.dpi, options.plot_types, dialog)
             else:
-                self._export_multiple_scans(options.dpi, options.plot_types)
+                self._export_multiple_scans(options.dpi, options.plot_types,
+                                            options.scan_list, dialog)
         except Exception as e:
+            self._close_dialog(dialog)
             self._show_message("Error", f"Export failed: {e}", "error")
+
+    def _track_run_dialog(self, attr: str, dialog: tk.Toplevel) -> None:
+        """Track an export dialog like the other windows, so Clear All and new loads close it."""
+        setattr(self, attr, dialog)
+        self.state.dialog_windows.append(dialog)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: self._close_dialog(dialog))
+
+    @staticmethod
+    def _dialog_open(dialog: tk.Toplevel) -> bool:
+        """True while the dialog exists; Clear All, a new load or quitting closes it."""
+        try:
+            return bool(dialog.winfo_exists())
+        except tk.TclError:
+            return False
 
     def _export_nxs(self) -> None:
         """Save the canonical NeXus file for the loaded experiment on a worker thread.
@@ -2085,15 +1842,12 @@ class OPERAXN(tk.Frame):
             self._show_message("Error", "No data loaded", "error")
             return
 
-        loaded_path = get_loaded_nxs_path()
-        initial_name = os.path.basename(loaded_path) if loaded_path else "experiment.nxs"
-
         filename = filedialog.asksaveasfilename(
             parent=self.master,
             title="Export NeXus File",
             defaultextension=".nxs",
             filetypes=[("NeXus files", "*.nxs"), ("All files", "*.*")],
-            initialfile=initial_name
+            initialfile=f"{_experiment_stem()}.nxs"
         )
         if not filename:
             return
@@ -2116,8 +1870,10 @@ class OPERAXN(tk.Frame):
 
         threading.Thread(target=export_task, daemon=True).start()
 
-    def _export_current_scan(self, dpi: int, plot_types: Dict[str, bool]) -> None:
-        """Save the selected scan as PNG/PDF/SVG with cropped 2D extent."""
+    def _export_current_scan(self, dpi: int, plot_types: Dict[str, bool],
+                             dialog: ExportOptionsDialog) -> None:
+        """Save the selected scan as PNG/PDF/SVG with cropped 2D extent.
+        Cancelling the file prompt leaves the dialog open."""
         scan_num = self.scan_selector.get_value()
         scan_data = get_correlated_data(self.state.scans, self.state.echem_df, scan_num, self.state)
 
@@ -2126,7 +1882,7 @@ class OPERAXN(tk.Frame):
             return
 
         filename = filedialog.asksaveasfilename(
-            parent=self.master,
+            parent=dialog,
             defaultextension=".png",
             filetypes=[
                 ("PNG files", "*.png"),
@@ -2134,10 +1890,10 @@ class OPERAXN(tk.Frame):
                 ("SVG files", "*.svg"),
                 ("All files", "*.*")
             ],
-            initialfile=f"scan_{scan_num:03d}.png"
+            initialfile=f"{_experiment_stem()}_image_scan_{scan_num:03d}.png"
         )
 
-        if filename:
+        if filename and self._dialog_open(dialog):
             intensity_limits = self.state.intensity_limits.get(self.state.current_scan_idx)
             extent = self._calculate_cropped_extent() if scan_data.get("twod") is not None else None
 
@@ -2147,39 +1903,32 @@ class OPERAXN(tk.Frame):
                 plot_config=self.config.to_dict(),
                 extent=extent
             )
-            self._show_message("Success", f"Exported to {filename}", "info")
+            self._close_dialog(dialog)
+            self._show_message("Success", f"Image exported to:\n{filename}", "info")
 
-    def _export_multiple_scans(self, dpi: int, plot_types: Dict[str, bool]) -> None:
-        """Batch-export a typed scan range as PNGs behind a progress bar."""
-        scan_range = simpledialog.askstring(
-            "Scan Range",
-            f"Enter scan range (e.g. 1-5 or 1,3,5):\nAvailable: 1-{len(self.state.scans)}",
-            parent=self.master
-        )
-
-        if not scan_range:
-            return
-
-        scan_list = parse_scan_range(scan_range, len(self.state.scans))
-        if not scan_list:
-            self._show_message("Error", "No valid scans in range", "error")
-            return
-
+    def _export_multiple_scans(self, dpi: int, plot_types: Dict[str, bool],
+                               scan_list: List[int], dialog: ExportOptionsDialog) -> None:
+        """Export each scan in the range as a PNG, with progress shown on the dialog.
+        Cancelling the folder prompt leaves the dialog open; Stop ends the run early."""
         base_dir = filedialog.askdirectory(
-            parent=self.master,
+            parent=dialog,
             title="Select Directory for Multiple Exports"
         )
-        if not base_dir:
+        if not base_dir or not self._dialog_open(dialog):
             return
 
         success_count = 0
         failed_scans = []
+        stopped = False
         extent = self._calculate_cropped_extent()
 
-        progress = ProgressDialog(self.master, "Exporting Scans", len(scan_list))
+        stem = _experiment_stem()
+        dialog.begin_progress(len(scan_list), "Exporting scans...")
 
         for idx, scan_num in enumerate(scan_list):
-            progress.update_progress(idx, f"Exporting scan {scan_num}...")
+            if not dialog.update_progress(idx, f"Exporting scan {scan_num}..."):
+                stopped = True
+                break
 
             try:
                 scan_data = get_correlated_data(self.state.scans, self.state.echem_df, scan_num, self.state)
@@ -2189,7 +1938,7 @@ class OPERAXN(tk.Frame):
                     continue
 
                 intensity_limits = self.state.intensity_limits.get(scan_num - 1)
-                filename = os.path.join(base_dir, f"scan_{scan_num:03d}.png")
+                filename = os.path.join(base_dir, f"{stem}_image_scan_{scan_num:03d}.png")
 
                 logger.debug("Exporting scan %d to %s", scan_num, filename)
                 logger.debug("  Has oned: %s", scan_data.get('oned') is not None)
@@ -2214,9 +1963,13 @@ class OPERAXN(tk.Frame):
                 failed_scans.append((scan_num, str(e)))
                 logger.debug("Failed to export scan %d:\n%s", scan_num, traceback.format_exc())
 
-        progress.destroy()
+        self._close_dialog(dialog)
 
-        message = f"Successfully exported {success_count} scans to:\n{base_dir}"
+        if stopped:
+            message = (f"Stopped: exported {success_count} of {len(scan_list)} images to:\n"
+                       f"{base_dir}")
+        else:
+            message = f"Exported {success_count} images to:\n{base_dir}"
 
         if failed_scans:
             message += f"\n\nFailed to export {len(failed_scans)} scans:"
@@ -2247,7 +2000,7 @@ class OPERAXN(tk.Frame):
         return x_min, x_max, y_min, y_max
 
     def _create_gif(self) -> None:
-        """Collect GIF settings and an output path, then render frames."""
+        """Open the GIF page; the GIF builds from it, with progress shown there."""
         if not self.state.scans:
             self._show_message("Warning", "No scans available to create GIF", "warning")
             return
@@ -2261,43 +2014,46 @@ class OPERAXN(tk.Frame):
 
         if self._lift_existing_dialog('_gif_dialog'):
             return
-        gif_dialog = GIFSettingsDialog(self.master, len(self.state.scans))
-        self._gif_dialog = gif_dialog
-        gif_settings = gif_dialog.get_result()
+        dialog = GIFSettingsDialog(self.master, len(self.state.scans),
+                                   on_create=self._run_gif)
+        self._track_run_dialog('_gif_dialog', dialog)
 
-        if not gif_settings:
-            return
-
+    def _run_gif(self, settings: GIFSettings, dialog: GIFSettingsDialog) -> None:
+        """Ask for the output file, then build the GIF; cancelling leaves the dialog open."""
         output_file = filedialog.asksaveasfilename(
-            parent=self.master,
+            parent=dialog,
             defaultextension=".gif",
             filetypes=[("GIF files", "*.gif"), ("All files", "*.*")],
-            initialfile="xrd_scans_animation.gif"
+            initialfile=f"{_experiment_stem()}_gif.gif"
         )
 
-        if output_file:
-            self._generate_gif(output_file, gif_settings)
+        if output_file and self._dialog_open(dialog):
+            self._generate_gif(output_file, settings, dialog)
 
-    def _generate_gif(self, output_file: str, settings: GIFSettings) -> None:
-        """Render frames into a temp dir and assemble them with imageio."""
+    def _generate_gif(self, output_file: str, settings: GIFSettings,
+                      dialog: GIFSettingsDialog) -> None:
+        """Render frames into a temp dir and assemble them with imageio, with progress on dialog.
+        Stop or closing the dialog abandons the GIF."""
         selected_scans = [self.state.scans[i - 1] for i in settings.scan_list
                           if 1 <= i <= len(self.state.scans)]
 
-        progress = None
         with tempfile.TemporaryDirectory() as temp_dir:
             try:
-                progress = ProgressDialog(self.master, "Creating GIF", len(selected_scans))
+                dialog.begin_progress(len(selected_scans), "Rendering scans...")
 
                 frame_files = []
                 for idx, scan in enumerate(selected_scans):
-                    if not progress.update_progress(idx, f"Processing scan {scan['scan_num']}"):
+                    if not dialog.update_progress(idx, f"Rendering scan {scan['scan_num']}..."):
+                        self._close_dialog(dialog)
                         return
 
                     frame_file = self._create_gif_frame(temp_dir, idx, scan, settings.dpi)
                     if frame_file:
                         frame_files.append(frame_file)
 
-                progress.update_progress(len(selected_scans), "Creating animated GIF...")
+                if not dialog.update_progress(len(selected_scans), "Writing GIF..."):
+                    self._close_dialog(dialog)
+                    return
 
                 writer = imageio.get_writer(output_file, mode='I',
                                             fps=settings.fps,
@@ -2308,18 +2064,17 @@ class OPERAXN(tk.Frame):
                     writer.append_data(frame)
 
                 writer.close()
-                progress.destroy()
+                self._close_dialog(dialog)
 
                 self._show_message("Success",
-                                   f"Animated GIF created successfully!\n{output_file}\n\n"
-                                   f"Total frames: {len(frame_files)}\n"
+                                   f"GIF exported to:\n{output_file}\n\n"
+                                   f"Frames: {len(frame_files)}\n"
                                    f"FPS: {settings.fps}\n"
-                                   f"Duration: {len(frame_files) / settings.fps:.1f} seconds",
+                                   f"Duration: {len(frame_files) / settings.fps:.1f} s",
                                    "info")
 
             except Exception as e:
-                if progress is not None:
-                    progress.destroy()
+                self._close_dialog(dialog)
                 self._show_message("Error", f"Failed to create GIF: {e}", "error")
 
     def _create_gif_frame(self, temp_dir: str, index: int, scan: Dict[str, Any], dpi: int) -> Optional[str]:
@@ -2398,26 +2153,23 @@ class OPERAXN(tk.Frame):
                 plt.close(fig)
 
     def _export_to_excel(self) -> None:
-        """Build the summary workbook on a worker thread and save it."""
+        """Build the summary workbook on a worker thread and save it.
+        Prompted and reported like _export_nxs, defaulting to the loaded experiment's name."""
         if not self.state.scans:
+            self._show_message("Error", "No data loaded", "error")
             return
-
-        default_filename = {
-            DataSourceType.NEUTRON: "Neutron_Diffraction_Data.xlsx",
-            DataSourceType.SYNCHROTRON: "Synchrotron_XRD_Data.xlsx",
-            DataSourceType.INHOUSE: "Laboratory_XRD_Data.xlsx"
-        }.get(self.state.data_source, "XRD_Data.xlsx")
 
         # Ask on the main thread, as _export_nxs does; Tk dialogs belong there
         filename = filedialog.asksaveasfilename(
             parent=self.master,
+            title="Export Excel File",
             defaultextension=".xlsx",
             filetypes=[
                 ("Excel files", "*.xlsx"),
                 ("CSV files", "*.csv"),
                 ("All files", "*.*")
             ],
-            initialfile=default_filename
+            initialfile=f"{_experiment_stem()}.xlsx"
         )
         if not filename:
             return
@@ -2432,17 +2184,9 @@ class OPERAXN(tk.Frame):
                     else:
                         self._save_to_excel(summary_df, filename)
 
-                    data_type = {
-                        DataSourceType.NEUTRON: "neutron diffraction",
-                        DataSourceType.SYNCHROTRON: "synchrotron XRD",
-                        DataSourceType.INHOUSE: "laboratory XRD"
-                    }.get(self.state.data_source, "")
-
+                    kind = "CSV" if filename.endswith(".csv") else "Excel"
                     self.after(0, lambda: self._show_message(
-                        "Success",
-                        f"Successfully exported {len(summary_df)} {data_type} scans to:\n{filename}",
-                        "info"
-                    ))
+                        "Success", f"{kind} file exported to:\n{filename}", "info"))
 
             except Exception as e:
                 logger.debug("Excel export error: %s", traceback.format_exc())

@@ -1,8 +1,9 @@
 """
 Themed Tkinter dialogs for upload options, plot settings, exports, GIFs and progress.
 
-BaseDialog provides the house style: non-modal, shrink-to-fit sizing and
-surface-matched widget helpers.
+BaseDialog provides the house style: non-modal, shrink-to-fit sizing, surface-matched
+widget helpers, Upload Data style sections, one shared width for the Image, GIF and Plot
+Settings pages, and in-dialog progress for the runs started from them.
 """
 
 import ctypes
@@ -33,6 +34,7 @@ from .config import (
     DEFAULT_TWOD_XMIN_PERCENT,
     EXPORT_DPI,
     OPERAXNTheme,
+    SETTINGS_DIALOG_WIDTH_IN,
     SYNCHROTRON_MAX_DISPLAY_SIZE,
     SYNCHROTRON_WAVELENGTH,
     WINDOW_SIZES,
@@ -52,6 +54,7 @@ class ExportOptions:
     export_type: str
     dpi: int
     plot_types: Dict[str, bool]
+    scan_list: Optional[List[int]] = None  # range exports only
 
 
 @dataclass
@@ -80,6 +83,19 @@ class UploadOptions:
     echem_time_tolerance: float = None  # seconds; None = core default
 
 
+def _style_progressbar() -> None:
+    """Theme the app-global ttk progress bar in the accent colour."""
+    style = ttk.Style()
+    style.theme_use('clam')
+    style.configure("TProgressbar",
+                    background=OPERAXNTheme.COLORS['accent_primary'],
+                    troughcolor=OPERAXNTheme.COLORS['bg_tertiary'],
+                    borderwidth=0,
+                    bordercolor=OPERAXNTheme.COLORS['border'],
+                    lightcolor=OPERAXNTheme.COLORS['accent_primary'],
+                    darkcolor=OPERAXNTheme.COLORS['accent_primary'])
+
+
 # ============================================================================
 # Base Dialog Class
 # ============================================================================
@@ -87,14 +103,15 @@ class UploadOptions:
 class BaseDialog(tk.Toplevel):
     """Themed non-modal Toplevel, centred on its parent, with surface-matched widget helpers."""
 
-    def __init__(self, master: tk.Misc, title: str, geometry: str) -> None:
+    def __init__(self, master: tk.Misc, title: str, geometry: Optional[str] = None) -> None:
         super().__init__(master)
         self.master = master
         self.result = None
         self.configure(bg=OPERAXNTheme.COLORS['bg_primary'])
 
         self.title(title)
-        self.geometry(geometry)
+        if geometry:
+            self.geometry(geometry)
         self.transient(master)
 
         self._center_window()
@@ -296,32 +313,15 @@ class BaseDialog(tk.Toplevel):
         side='bottom', packed before any expanding content, keeps the row visible on overflow."""
         frame = tk.Frame(self, bg=OPERAXNTheme.COLORS['bg_primary'])
         frame.pack(pady=pady, side=side)
+        self._button_frame = frame
+        self._buttons = []
 
         for text, command, style in buttons:
             btn = self.create_themed_button(frame, text, command, style)
             btn.pack(side="left", padx=5)
+            self._buttons.append(btn)
 
         return frame
-
-    def create_themed_labelframe(self, parent: tk.Widget = None, text: str = "", **kwargs) -> tk.LabelFrame:
-        """Create a surface-matched LabelFrame; kwargs override defaults."""
-        parent = parent or self
-        bg_color = self._surface_bg(parent)
-
-        defaults = {
-            'text': text,
-            'bg': bg_color,
-            'fg': OPERAXNTheme.COLORS['text_primary'],
-            'font': OPERAXNTheme.FONTS['heading'],
-            'relief': tk.FLAT,
-            'borderwidth': 1,
-            'highlightbackground': OPERAXNTheme.COLORS['border'],
-            'padx': 10,
-            'pady': 10
-        }
-        defaults.update(kwargs)
-
-        return tk.LabelFrame(parent, **defaults)
 
     def create_themed_entry(self, parent: tk.Widget = None, textvariable: tk.Variable = None,
                             width: int = 12, **kwargs) -> tk.Entry:
@@ -399,116 +399,171 @@ class BaseDialog(tk.Toplevel):
 
         return rb
 
+    def fit_height_in_place(self) -> None:
+        """Refit the height to the content, within the work area, without moving the window."""
+        self.update_idletasks()
+        _, max_height = self._fit_client(
+            self._work_area(), self._frame_overhead(), self.wm_maxsize())
+        height = min(self.winfo_reqheight() + 14, max_height)
+        self.geometry(f"{self.winfo_width()}x{height}")
+
+    def fit_standard_size(self) -> None:
+        """Size to the shared Image, GIF and Plot Settings width, the height fitted to the content.
+        The width is in inches, so it holds at any display scaling."""
+        self.shrink_to_fit(
+            min_width=round(SETTINGS_DIALOG_WIDTH_IN * self.winfo_fpixels('1i')))
+
+    # ========================================================================
+    # Upload Data Layout Blocks
+    # ========================================================================
+
+    def create_section(self, parent: tk.Widget, title: str) -> tk.Frame:
+        """Pack a section heading and return the centred block beneath it, as in Upload Data.
+        The heading label is kept on the block as `heading`."""
+        heading = self.create_themed_label(parent, title, font_type="heading", pady=(14, 4))
+        block = tk.Frame(parent, bg=self._surface_bg(parent))
+        block.pack()
+        block.heading = heading
+        return block
+
+    def create_body(self) -> tk.Frame:
+        """Pack and return the frame the sections go in, above the pinned button row."""
+        body = tk.Frame(self, bg=OPERAXNTheme.COLORS['bg_primary'])
+        body.pack(side="top", fill="both", expand=True)
+        return body
+
+    def create_themed_checkbutton(self, parent: tk.Widget, text: str, variable: tk.Variable,
+                                  command: Callable = None) -> tk.Checkbutton:
+        """Create a surface-matched check box with accent active text."""
+        bg = self._surface_bg(parent)
+        return tk.Checkbutton(
+            parent, text=text, variable=variable, command=command,
+            font=OPERAXNTheme.FONTS['body'],
+            bg=bg,
+            fg=OPERAXNTheme.COLORS['text_primary'],
+            activebackground=bg,
+            activeforeground=OPERAXNTheme.COLORS['accent_primary'],
+            selectcolor=OPERAXNTheme.COLORS['bg_tertiary'],
+            disabledforeground=OPERAXNTheme.COLORS['text_dim'],
+            highlightthickness=0)
+
+    def create_scale_row(self, parent: tk.Widget, row: int, label: str, variable: tk.Variable,
+                         from_: float, to: float, resolution: float = 1, unit: str = "",
+                         command: Callable = None) -> tk.Scale:
+        """Grid a labelled slider and its live value on one row; command runs after each move."""
+        self.create_themed_label(parent, label).grid(
+            row=row, column=0, sticky="e", padx=(0, 8), pady=2)
+        value_label = self.create_themed_label(parent, "")
+        value_label.config(width=5, anchor="w")
+
+        def show_value() -> None:
+            value_label.config(text=f"{float(variable.get()):g}{unit}")
+
+        def moved(_value: str) -> None:
+            show_value()
+            if command:
+                command()
+
+        scale = self.create_themed_scale(parent, variable, from_, to, showvalue=False)
+        if resolution != 1:
+            scale.config(resolution=resolution)
+        scale.config(command=moved)
+        scale.grid(row=row, column=1, sticky="w", pady=2)
+        value_label.grid(row=row, column=2, sticky="w", padx=(8, 0), pady=2)
+        show_value()
+        return scale
+
+    # ========================================================================
+    # In-dialog Progress
+    # ========================================================================
+
+    def begin_progress(self, maximum: int, text: str = "Processing...") -> None:
+        """Show a progress bar above the buttons for a run started from this dialog.
+        The first button locks and the last becomes Stop; update_progress then reports progress."""
+        bg = OPERAXNTheme.COLORS['bg_primary']
+        self._stopped = False
+        if getattr(self, "_progress_frame", None) is None:
+            self._progress_frame = tk.Frame(self, bg=bg)
+            self._progress_label = tk.Label(
+                self._progress_frame, font=OPERAXNTheme.FONTS['small'], bg=bg,
+                fg=OPERAXNTheme.COLORS['text_secondary'])
+            self._progress_label.pack()
+            _style_progressbar()
+            self._progress_bar = ttk.Progressbar(
+                self._progress_frame, mode='determinate', style="TProgressbar")
+            self._progress_bar.pack(fill="x", padx=40, pady=(4, 0))
+        self._progress_bar.config(maximum=max(1, maximum), value=0)
+        self._progress_label.config(text=text)
+        self._progress_frame.pack(side="bottom", fill="x", after=self._button_frame)
+        first, last = self._buttons[0], self._buttons[-1]
+        first.config(state="disabled")
+        last.config(text="Stop", command=self._stop_run)
+        # The height is fitted to the content, so grow it in place for the bar
+        self.fit_height_in_place()
+        self.update()
+
+    def _stop_run(self) -> None:
+        """Ask the running export to stop after its current item."""
+        self._stopped = True
+
+    def update_progress(self, value: int, text: str) -> bool:
+        """Set the bar and status text and repaint; False once stopped or the dialog is closed."""
+        if getattr(self, "_stopped", False) or not self.winfo_exists():
+            return False
+        self._progress_label.config(text=text)
+        self._progress_bar['value'] = value
+        self.update()
+        return not self._stopped and bool(self.winfo_exists())
+
 
 # ============================================================================
 # Plot Settings Dialog
 # ============================================================================
 
 class PlotSettingsDialog(BaseDialog):
-    """Tabbed axis-range and display-mode settings, applied live to the shared config and plots."""
+    """Axis-range and display-mode settings, applied live to the shared config and plots."""
+
+    X_TWOTHETA_HEADING = "X-axis range (2θ [°]):"
+    X_DSPACING_HEADING = "X-axis range (d-spacing [Å]):"
 
     def __init__(self, master: tk.Misc, config: Any, on_update: Callable) -> None:
-        is_neutron = getattr(config, 'data_source', None) == DataSourceType.NEUTRON
-        height = "475" if is_neutron else "375"
-
-        super().__init__(master, "Plot Settings", f"400x{height}")
+        super().__init__(master, "Plot Settings")
         self.config = config
         self.on_update = on_update
 
         self._create_widgets()
-        self.shrink_to_fit()
+        self.fit_standard_size()
 
     def _create_widgets(self) -> None:
-        """Build the notebook: a neutron tab for neutron data, else 1D/2D."""
-        self._setup_notebook_style()
+        """Build the sections: neutron display mode and ranges, else 1D ranges and 2D crop."""
+        is_neutron = getattr(self.config, 'data_source', None) == DataSourceType.NEUTRON
+        apply = self._apply_neutron_settings if is_neutron else self._apply_settings
+        self.create_button_frame([
+            ("Apply", apply, "primary"),
+            ("Close", self.destroy, "secondary")
+        ], pady=14, side="bottom")
+        self.create_themed_label(self, "Leave a field blank for automatic scaling.",
+                                 font_type="small",
+                                 fg_color=OPERAXNTheme.COLORS['text_secondary'],
+                                 side="bottom", pady=(10, 0))
 
-        notebook = ttk.Notebook(self)
-        notebook.pack(fill="both", expand=True, padx=10, pady=10)
-
-        if getattr(self.config, 'data_source', None) == DataSourceType.NEUTRON:
-            self._create_neutron_tab(notebook)
+        body = self.create_body()
+        if is_neutron:
+            self._create_neutron_sections(body)
         else:
-            self._create_oned_tab(notebook)
-            self._create_twod_tab(notebook)
+            self._create_oned_sections(body)
+            self._create_twod_section(body)
 
-        close_btn = self.create_themed_button(
-            text="Close",
-            command=self.destroy,
-            style="secondary"
-        )
-        close_btn.pack(pady=(0, 10))
-
-    def _setup_notebook_style(self) -> None:
-        """Restyle the app-global ttk notebook/tab elements (clam theme)."""
-        C = OPERAXNTheme.COLORS
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure('TNotebook', background=C['bg_primary'],
-                        bordercolor=C['border'],
-                        lightcolor=C['bg_primary'], darkcolor=C['bg_primary'])
-        # clam tabs draw their face from light/dark edge colours too: set all
-        # of them or unselected tabs keep the default light face
-        style.configure('TNotebook.Tab',
-                        background=C['bg_secondary'],
-                        foreground=C['text_secondary'],
-                        bordercolor=C['border'],
-                        lightcolor=C['bg_secondary'], darkcolor=C['bg_secondary'],
-                        padding=[12, 6], font=OPERAXNTheme.FONTS['body'])
-        style.map('TNotebook.Tab',
-                  background=[('selected', C['bg_tertiary']),
-                              ('!selected', C['bg_secondary'])],
-                  foreground=[('selected', C['accent_primary']),
-                              ('!selected', C['text_secondary'])],
-                  lightcolor=[('selected', C['bg_tertiary']),
-                              ('!selected', C['bg_secondary'])])
-
-    def _create_range_entry_row(self, parent: tk.Widget, label: str, var: tk.StringVar, row: int,
-                                col: int, key: str, on_change: Callable = None) -> tk.Entry:
-        """Create a labelled limit entry; Enter applies, FocusOut validates."""
-        self.create_themed_label(parent, label, font_type="body").grid(
-            row=row, column=col, padx=5, pady=5
-        )
-
-        entry = self.create_themed_entry(parent, var, width=12)
-        entry.grid(row=row, column=col + 1, padx=5, pady=5)
-
-        on_change = on_change or self._apply_settings
-        entry.bind("<Return>", lambda e: on_change())
-        entry.bind("<FocusOut>", lambda e: self._validate_entry(key, var))
-
-        return entry
-
-    def _create_scale_with_label(self, parent: tk.Widget, label: str, var_name: str,
-                                 value: float, row: int) -> None:
-        """Create a 0-100 scale with a live "NN%" label; dragging applies the settings.
-        The variable and label are stored on self as var_name and var_name_label."""
-        self.create_themed_label(parent, label, font_type="body").grid(
-            row=row, column=0, padx=5, pady=5, sticky='w'
-        )
-
-        var = tk.DoubleVar(value=value)
-        setattr(self, var_name, var)
-
-        scale = self.create_themed_scale(parent, var, 0, 100, showvalue=False)
-        scale.grid(row=row, column=1, padx=5, pady=5)
-
-        value_label = self.create_themed_label(
-            parent, f"{value:.0f}%", font_type="body"
-        )
-        value_label.grid(row=row, column=2, padx=5, pady=5)
-        setattr(self, f"{var_name}_label", value_label)
-
-        scale.config(command=lambda v: [
-            self._update_scale_label(var_name, v),
-            self._apply_settings()
-        ])
-
-    def _update_scale_label(self, var_name: str, value: str) -> None:
-        """Refresh a scale's companion label with its percentage value."""
-        label_var_name = f"{var_name}_label"
-        if hasattr(self, label_var_name):
-            label = getattr(self, label_var_name)
-            label.config(text=f"{float(value):.0f}%")
+    def _range_row(self, block: tk.Frame, min_var: tk.StringVar, max_var: tk.StringVar,
+                   keys: Tuple[str, str], on_change: Callable) -> None:
+        """Grid Min and Max entries side by side: Return applies, leaving a field stores it."""
+        for col, (label, var, key) in enumerate(zip(("Min:", "Max:"), (min_var, max_var), keys)):
+            self.create_themed_label(block, label).grid(
+                row=0, column=2 * col, sticky="e", padx=(16 if col else 0, 6), pady=2)
+            entry = self.create_themed_entry(block, var, width=10)
+            entry.grid(row=0, column=2 * col + 1, pady=2)
+            entry.bind("<Return>", lambda _e: on_change())
+            entry.bind("<FocusOut>", lambda _e, k=key, v=var: self._validate_entry(k, v))
 
     def _validate_entry(self, key: str, var: tk.StringVar) -> None:
         """Store an entry's limit in config; blank or 'auto' means None (auto-scale).
@@ -538,69 +593,33 @@ class PlotSettingsDialog(BaseDialog):
         if hasattr(self.config, config_key):
             setattr(self.config, config_key, value)
 
-    def _create_neutron_tab(self, notebook: ttk.Notebook) -> None:
-        """Build the neutron tab: TOF/d-spacing mode and axis ranges."""
-        tab = tk.Frame(notebook, bg=OPERAXNTheme.COLORS['bg_secondary'])
-        notebook.add(tab, text="Neutron Settings")
+    @staticmethod
+    def _format_value(value: Any) -> str:
+        """Format a limit for its entry field in full; None becomes blank (auto)."""
+        return "" if value is None else str(value)
 
-        # Display mode
-        mode_frame = self.create_themed_labelframe(tab, "Display Mode")
-        mode_frame.pack(fill="x", padx=10, pady=10)
+    # --- neutron ---
 
+    def _create_neutron_sections(self, body: tk.Frame) -> None:
+        """Build the display-mode choice and the X and intensity ranges."""
+        mode = self.create_section(body, "Display mode:")
         self.neutron_display_var = tk.BooleanVar(value=self.config.show_neutron_dspacing)
-
-        self.create_themed_radiobutton(
-            mode_frame, TOF_LABEL,
-            self.neutron_display_var, False,
-            self._on_neutron_mode_change
-        ).pack(anchor="w", pady=5)
-
-        self.create_themed_radiobutton(
-            mode_frame, DSPACING_LABEL,
-            self.neutron_display_var, True,
-            self._on_neutron_mode_change
-        ).pack(anchor="w", pady=5)
-
-        # X-axis range
-        x_frame = self.create_themed_labelframe(tab, "X-Axis Range")
-        x_frame.pack(fill="x", padx=10, pady=10)
+        for text, value in ((TOF_LABEL, False), (DSPACING_LABEL, True)):
+            self.create_themed_radiobutton(
+                mode, text, self.neutron_display_var, value,
+                self._on_neutron_mode_change).pack(anchor="w", pady=1)
 
         self.neutron_xmin_var = tk.StringVar(value=self._format_value(self.config.neutron_xmin))
         self.neutron_xmax_var = tk.StringVar(value=self._format_value(self.config.neutron_xmax))
+        self._range_row(self.create_section(body, "X-axis range:"),
+                        self.neutron_xmin_var, self.neutron_xmax_var,
+                        ('neutron_xmin', 'neutron_xmax'), self._apply_neutron_settings)
 
-        self._create_range_entry_row(x_frame, "Min:", self.neutron_xmin_var,
-                                     0, 0, 'neutron_xmin', self._apply_neutron_settings)
-        self._create_range_entry_row(x_frame, "Max:", self.neutron_xmax_var,
-                                     0, 2, 'neutron_xmax', self._apply_neutron_settings)
-
-        # Y-axis range
-        y_frame = self.create_themed_labelframe(tab, "Y-Axis Range (Intensity)")
-        y_frame.pack(fill="x", padx=10, pady=10)
-
-        self.neutron_ymin_var = tk.StringVar(value=self._format_value(self.config.neutron_ymin, True))
-        self.neutron_ymax_var = tk.StringVar(value=self._format_value(self.config.neutron_ymax, True))
-
-        self._create_range_entry_row(y_frame, "Min:", self.neutron_ymin_var,
-                                     0, 0, 'neutron_ymin', self._apply_neutron_settings)
-        self._create_range_entry_row(y_frame, "Max:", self.neutron_ymax_var,
-                                     0, 2, 'neutron_ymax', self._apply_neutron_settings)
-
-        # Info label
-        self.create_themed_label(
-            tab,
-            "Note: X-axis units change based on display mode.\nLeave fields blank for automatic scaling.",
-            font_type="small",
-            fg_color=OPERAXNTheme.COLORS['text_secondary'],
-            pady=10
-        )
-
-    def _format_value(self, value: Any, scientific: bool = False) -> str:
-        """Format a limit for its entry field; None becomes blank (auto)."""
-        if value is None:
-            return ""
-        if scientific:
-            return f"{value:.1e}"
-        return str(value)
+        self.neutron_ymin_var = tk.StringVar(value=self._format_value(self.config.neutron_ymin))
+        self.neutron_ymax_var = tk.StringVar(value=self._format_value(self.config.neutron_ymax))
+        self._range_row(self.create_section(body, "Y-axis range (intensity):"),
+                        self.neutron_ymin_var, self.neutron_ymax_var,
+                        ('neutron_ymin', 'neutron_ymax'), self._apply_neutron_settings)
 
     def _on_neutron_mode_change(self) -> None:
         """Clear the X limits (TOF and d-spacing units differ) and apply."""
@@ -626,53 +645,47 @@ class PlotSettingsDialog(BaseDialog):
             if self.on_update:
                 self.on_update()
 
-    def _create_oned_tab(self, notebook: ttk.Notebook) -> None:
-        """Build the 1D tab: X/Y ranges and the d-spacing toggle."""
-        tab = tk.Frame(notebook, bg=OPERAXNTheme.COLORS['bg_secondary'])
-        notebook.add(tab, text="1D Settings")
+    # --- X-ray 1D and 2D ---
 
-        # X-axis range
-        self.x_frame_label = self.create_themed_labelframe(
-            tab, "X-Axis Range (2θ [°])", pady=5
-        )
-        self.x_frame_label.pack(fill="x", padx=10, pady=10)
-
+    def _create_oned_sections(self, body: tk.Frame) -> None:
+        """Build the 1D X range with its d-spacing toggle, and the intensity range."""
+        x_block = self.create_section(body, self.X_TWOTHETA_HEADING)
+        self.x_frame_label = x_block.heading
+        # Stored limits are in the units shown when they were applied, so opening
+        # in d-spacing mode only relabels them
+        if self.config.show_dspacing:
+            self.x_frame_label.config(text=self.X_DSPACING_HEADING)
         self.xmin_var = tk.StringVar(value=self._format_value(self.config.oned_xmin))
         self.xmax_var = tk.StringVar(value=self._format_value(self.config.oned_xmax))
-
-        self._create_range_entry_row(self.x_frame_label, "Min:", self.xmin_var, 0, 0, 'xmin')
-        self._create_range_entry_row(self.x_frame_label, "Max:", self.xmax_var, 0, 2, 'xmax')
-
-        # Y-axis range
-        y_frame = self.create_themed_labelframe(tab, "Y-Axis Range (Intensity)", pady=5)
-        y_frame.pack(fill="x", padx=10, pady=10)
-
-        self.ymin_var = tk.StringVar(value=self._format_value(self.config.oned_ymin, True))
-        self.ymax_var = tk.StringVar(value=self._format_value(self.config.oned_ymax, True))
-
-        self._create_range_entry_row(y_frame, "Min:", self.ymin_var, 0, 0, 'ymin')
-        self._create_range_entry_row(y_frame, "Max:", self.ymax_var, 0, 2, 'ymax')
-
-        # D-spacing option
+        self._range_row(x_block, self.xmin_var, self.xmax_var, ('xmin', 'xmax'),
+                        self._apply_settings)
         self.dspacing_var = tk.BooleanVar(value=self.config.show_dspacing)
-        dspacing_check = tk.Checkbutton(
-            tab,
-            text="Show d-spacing instead of 2θ",
-            variable=self.dspacing_var,
-            command=self._on_dspacing_toggle,
-            bg=OPERAXNTheme.COLORS['bg_secondary'],
-            fg=OPERAXNTheme.COLORS['text_primary'],
-            activebackground=OPERAXNTheme.COLORS['bg_secondary'],
-            activeforeground=OPERAXNTheme.COLORS['accent_primary'],
-            selectcolor=OPERAXNTheme.COLORS['bg_tertiary'],
-            font=OPERAXNTheme.FONTS['body']
-        )
-        dspacing_check.pack(pady=10)
+        self.create_themed_checkbutton(
+            x_block, "Show d-spacing instead of 2θ", self.dspacing_var,
+            command=self._on_dspacing_toggle).grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
-        # Update label if in d-spacing mode
-        if self.config.show_dspacing:
-            self.x_frame_label.config(text="X-Axis Range (d-spacing [Å])")
-            self._convert_xaxis_to_dspacing()
+        self.ymin_var = tk.StringVar(value=self._format_value(self.config.oned_ymin))
+        self.ymax_var = tk.StringVar(value=self._format_value(self.config.oned_ymax))
+        self._range_row(self.create_section(body, "Y-axis range (intensity):"),
+                        self.ymin_var, self.ymax_var, ('ymin', 'ymax'), self._apply_settings)
+
+    def _create_twod_section(self, body: tk.Frame) -> None:
+        """Build the 2D crop sliders, applied as they move."""
+        crop = self.create_section(body, "2D image crop (%):")
+        rows = [
+            ("Y min:", 'ymin_2d_var', self.config.twod_ymin_percent),
+            ("Y max:", 'ymax_2d_var', self.config.twod_ymax_percent),
+            ("X min:", 'xmin_2d_var',
+             getattr(self.config, 'twod_xmin_percent', DEFAULT_TWOD_XMIN_PERCENT)),
+            ("X max:", 'xmax_2d_var',
+             getattr(self.config, 'twod_xmax_percent', DEFAULT_TWOD_XMAX_PERCENT)),
+        ]
+        for row, (label, var_name, value) in enumerate(rows):
+            var = tk.DoubleVar(value=value)
+            setattr(self, var_name, var)
+            self.create_scale_row(crop, row, label, var, 0, 100, unit="%",
+                                  command=self._apply_settings)
 
     def _on_dspacing_toggle(self) -> None:
         """Convert entered X limits between 2-theta and d-spacing, then apply."""
@@ -680,10 +693,10 @@ class PlotSettingsDialog(BaseDialog):
 
         if new_dspacing != self.config.show_dspacing:
             if new_dspacing:
-                self.x_frame_label.config(text="X-Axis Range (d-spacing [Å])")
+                self.x_frame_label.config(text=self.X_DSPACING_HEADING)
                 self._convert_xaxis_to_dspacing()
             else:
-                self.x_frame_label.config(text="X-Axis Range (2θ [°])")
+                self.x_frame_label.config(text=self.X_TWOTHETA_HEADING)
                 self._convert_xaxis_to_twotheta()
 
         self._apply_settings()
@@ -762,132 +775,30 @@ class PlotSettingsDialog(BaseDialog):
         except ValueError as e:
             messagebox.showerror("Invalid Input", str(e), parent=self)
 
-    def _create_twod_tab(self, notebook: ttk.Notebook) -> None:
-        """Build the 2D tab: X/Y crop-percentage sliders."""
-        tab = tk.Frame(notebook, bg=OPERAXNTheme.COLORS['bg_secondary'])
-        notebook.add(tab, text="2D Settings")
-
-        # Y-axis cropping
-        y_frame = self.create_themed_labelframe(tab, "Y-Axis Range (%)")
-        y_frame.pack(fill="x", padx=10, pady=10)
-
-        self._create_scale_with_label(y_frame, "Y Min:", 'ymin_2d_var',
-                                      self.config.twod_ymin_percent, 0)
-        self._create_scale_with_label(y_frame, "Y Max:", 'ymax_2d_var',
-                                      self.config.twod_ymax_percent, 1)
-
-        # X-axis cropping
-        x_frame = self.create_themed_labelframe(tab, "X-Axis Range (%)")
-        x_frame.pack(fill="x", padx=10, pady=10)
-
-        xmin_default = getattr(self.config, 'twod_xmin_percent', DEFAULT_TWOD_XMIN_PERCENT)
-        xmax_default = getattr(self.config, 'twod_xmax_percent', DEFAULT_TWOD_XMAX_PERCENT)
-
-        self._create_scale_with_label(x_frame, "X Min:", 'xmin_2d_var', xmin_default, 0)
-        self._create_scale_with_label(x_frame, "X Max:", 'xmax_2d_var', xmax_default, 1)
-
 
 # ============================================================================
-# Export Options Dialog
+# Scan Ranges
 # ============================================================================
 
-class ExportOptionsDialog(BaseDialog):
-    """Export scope, plot-type and DPI selection dialog."""
-
-    def __init__(self, master: tk.Misc, is_neutron: bool = False) -> None:
-        self.is_neutron = is_neutron
-        window_size = WINDOW_SIZES['export_neutron' if is_neutron else 'export_xrd']
-        super().__init__(master, "Export Options", window_size)
-        self._create_widgets()
-        self.shrink_to_fit()
-
-    def _create_widgets(self) -> None:
-        """Build type/plot/DPI controls; neutron mode offers echem only."""
-        # Export type
-        self.create_themed_label(text="Select export type:", font_type="heading", pady=10)
-
-        self.export_var = tk.StringVar(value="current")
-        options = [
-            ("current", "Current scan only"),
-            ("multiple", "Multiple scans (individual files)")
-        ]
-
-        for value, text in options:
-            self.create_themed_radiobutton(
-                text=text, variable=self.export_var, value=value
-            ).pack(anchor="w", padx=20)
-
-        # Plot types
-        self.create_themed_label(
-            text="Select plots to export:",
-            font_type="heading",
-            pady=(20, 10)
-        )
-
-        plot_frame = tk.Frame(self, bg=OPERAXNTheme.COLORS['bg_primary'])
-        plot_frame.pack(pady=5)
-
-        self.plot_vars = {}
-        if self.is_neutron:
-            plot_types = [("echem", "Echem Values")]
-        else:
-            plot_types = [
-                ("oned", "1D XRD Data"),
-                ("twod", "2D XRD Data"),
-                ("echem", "Echem Values")
-            ]
-
-        for key, text in plot_types:
-            self.plot_vars[key] = tk.BooleanVar(value=True)
-            cb = tk.Checkbutton(
-                plot_frame,
-                text=text,
-                variable=self.plot_vars[key],
-                bg=OPERAXNTheme.COLORS['bg_primary'],
-                fg=OPERAXNTheme.COLORS['text_primary'],
-                activebackground=OPERAXNTheme.COLORS['bg_primary'],
-                activeforeground=OPERAXNTheme.COLORS['accent_primary'],
-                selectcolor=OPERAXNTheme.COLORS['bg_tertiary'],
-                font=OPERAXNTheme.FONTS['body']
-            )
-            cb.pack(anchor="w")
-
-        # DPI setting
-        self.create_themed_label(text="Export DPI:", font_type="heading", pady=(20, 5))
-
-        self.dpi_var = tk.IntVar(value=EXPORT_DPI)
-        dpi_scale = self.create_themed_scale(
-            variable=self.dpi_var,
-            from_=100, to=600,
-            showvalue=True
-        )
-        dpi_scale.pack()
-
-        # Buttons
-        self.create_button_frame([
-            ("Export", self._do_export, "primary"),
-            ("Cancel", self.cancel, "secondary")
-        ])
-
-    def _do_export(self) -> None:
-        """Store the selections as the result and close; X-ray needs a plot type ticked."""
-        if not any(var.get() for var in self.plot_vars.values()) and not self.is_neutron:
-            messagebox.showwarning("No Selection",
-                                   "Please select at least one plot type to export",
-                                   parent=self)
-            return
-
-        self.result = ExportOptions(
-            export_type=self.export_var.get(),
-            dpi=self.dpi_var.get(),
-            plot_types={k: v.get() for k, v in self.plot_vars.items()},
-        )
-        self.destroy()
+# Scan-range grammar shared by the Image and GIF pages (see parse_scan_range)
+SCAN_RANGE_HINT = "e.g. 1-5, 1,3,5 or 1-5,10-15"
 
 
-# ============================================================================
-# GIF Settings Dialog
-# ============================================================================
+def _scan_range_row(dialog: BaseDialog, parent: tk.Widget, var: tk.StringVar,
+                    indent: int = 0) -> tk.Entry:
+    """Pack a scan-range entry with its grammar hint into parent and return the entry."""
+    row = tk.Frame(parent, bg=dialog._surface_bg(parent))
+    row.pack(anchor="w", pady=(6, 0))
+    entry = dialog.create_themed_entry(
+        row, var, width=16,
+        disabledbackground=OPERAXNTheme.COLORS['bg_tertiary'],
+        disabledforeground=OPERAXNTheme.COLORS['text_dim'])
+    entry.pack(side="left", padx=(indent, 8))
+    dialog.create_themed_label(row, SCAN_RANGE_HINT, font_type="small",
+                               fg_color=OPERAXNTheme.COLORS['text_secondary'],
+                               side="left")
+    return entry
+
 
 def parse_scan_range(text: str, max_scan: Optional[int] = None) -> List[int]:
     """Parse "1-5", "1,3,5" or "1-5,10-15" into sorted unique scan numbers from 1
@@ -905,71 +816,138 @@ def parse_scan_range(text: str, max_scan: Optional[int] = None) -> List[int]:
     return [s for s in sorted(scans) if s >= 1 and (max_scan is None or s <= max_scan)]
 
 
-class GIFSettingsDialog(BaseDialog):
-    """GIF creation settings dialog."""
+# ============================================================================
+# Export Options Dialog
+# ============================================================================
 
-    def __init__(self, master: tk.Misc, num_scans: int) -> None:
-        super().__init__(master, "Create GIF", WINDOW_SIZES['gif'])
+class ExportOptionsDialog(BaseDialog):
+    """Image export page: scans, plots and resolution.
+    With on_export(options, dialog) the dialog stays open and the run shows its progress here."""
+
+    def __init__(self, master: tk.Misc, is_neutron: bool = False, num_scans: int = 1,
+                 on_export: Optional[Callable] = None) -> None:
+        super().__init__(master, "Export Image")
+        self.is_neutron = is_neutron
         self.num_scans = num_scans
+        self.on_export = on_export
         self._create_widgets()
-        self.shrink_to_fit()
+        self._update_range_state()
+        self.fit_standard_size()
 
     def _create_widgets(self) -> None:
-        """Build the scan-range entry and fps/DPI/loop sliders."""
-        # Scan range
-        range_frame = self.create_themed_labelframe(self, "Scan Range:")
-        range_frame.pack(fill="x", padx=20, pady=10)
+        """Build the scan and plot sections, resolution last; neutron offers echem only."""
+        self.create_button_frame([
+            ("Export", self._do_export, "primary"),
+            ("Cancel", self.cancel, "secondary")
+        ], pady=14, side="bottom")
+        body = self.create_body()
 
-        self.create_themed_label(
-            range_frame, "Enter scan range:", font_type="body"
-        ).pack(anchor="w")
-
-        self.create_themed_label(
-            range_frame,
-            "Examples: 1-5 or 1,3,5 or 1-5,10-15",
-            font_type="small",
-            fg_color=OPERAXNTheme.COLORS['text_secondary']
-        ).pack(anchor="w")
-
+        scans = self.create_section(body, "Scans:")
+        self.export_var = tk.StringVar(value="current")
+        for value, text in (("current", "Current scan only"),
+                            ("multiple", "Scan range (one file per scan)")):
+            self.create_themed_radiobutton(
+                scans, text, self.export_var, value,
+                command=self._update_range_state).pack(anchor="w", pady=1)
         self.range_var = tk.StringVar(value=f"1-{self.num_scans}")
-        entry = self.create_themed_entry(range_frame, self.range_var, width=30)
-        entry.pack(fill="x", pady=5)
+        self.range_entry = _scan_range_row(self, scans, self.range_var, indent=24)
 
-        # GIF settings
-        settings_frame = self.create_themed_labelframe(self, "GIF Settings:")
-        settings_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        plots = self.create_section(body, "Plot:")
+        self.plot_vars = {}
+        if self.is_neutron:
+            plot_types = [("echem", "Echem values")]
+        else:
+            plot_types = [
+                ("oned", "1D XRD data"),
+                ("twod", "2D XRD data"),
+                ("echem", "Echem values")
+            ]
+        for key, text in plot_types:
+            self.plot_vars[key] = tk.BooleanVar(value=True)
+            self.create_themed_checkbutton(
+                plots, text, self.plot_vars[key]).pack(anchor="w", pady=1)
 
+        # Resolution sits under the plot choices, gridded in its own row frame
+        resolution = tk.Frame(plots, bg=self._surface_bg(plots))
+        resolution.pack(anchor="w", pady=(6, 0))
+        self.dpi_var = tk.IntVar(value=EXPORT_DPI)
+        self.create_scale_row(resolution, 0, "Resolution (DPI):", self.dpi_var, 100, 600)
+
+    def _update_range_state(self) -> None:
+        """Enable the scan range only for a range export."""
+        state = "normal" if self.export_var.get() == "multiple" else "disabled"
+        self.range_entry.config(state=state)
+
+    def _do_export(self) -> None:
+        """Validate the choices, then hand them to on_export (or store them and close)."""
+        plot_types = {k: v.get() for k, v in self.plot_vars.items()}
+        if not any(plot_types.values()) and not self.is_neutron:
+            messagebox.showwarning("No Selection",
+                                   "Please select at least one plot type to export",
+                                   parent=self)
+            return
+
+        scan_list = None
+        if self.export_var.get() == "multiple":
+            scan_list = parse_scan_range(self.range_var.get(), self.num_scans)
+            if not scan_list:
+                messagebox.showwarning("Invalid Range",
+                                       "Please enter a valid scan range",
+                                       parent=self)
+                return
+
+        self.result = ExportOptions(
+            export_type=self.export_var.get(),
+            dpi=self.dpi_var.get(),
+            plot_types=plot_types,
+            scan_list=scan_list,
+        )
+        if self.on_export is None:
+            self.destroy()
+        else:
+            self.on_export(self.result, self)
+
+
+# ============================================================================
+# GIF Settings Dialog
+# ============================================================================
+
+class GIFSettingsDialog(BaseDialog):
+    """GIF page: scan range and animation settings.
+    With on_create(settings, dialog) the dialog stays open and the build shows its progress here."""
+
+    def __init__(self, master: tk.Misc, num_scans: int,
+                 on_create: Optional[Callable] = None) -> None:
+        super().__init__(master, "Export GIF")
+        self.num_scans = num_scans
+        self.on_create = on_create
+        self._create_widgets()
+        self.fit_standard_size()
+
+    def _create_widgets(self) -> None:
+        """Build the scan-range and animation sections."""
+        self.create_button_frame([
+            ("Export", self._create, "primary"),
+            ("Cancel", self.cancel, "secondary")
+        ], pady=14, side="bottom")
+        body = self.create_body()
+
+        scans = self.create_section(body, "Scans:")
+        self.range_var = tk.StringVar(value=f"1-{self.num_scans}")
+        _scan_range_row(self, scans, self.range_var)
+
+        animation = self.create_section(body, "Animation:")
         self.fps_var = tk.IntVar(value=DEFAULT_GIF_FPS)
         self.dpi_var = tk.IntVar(value=DEFAULT_GIF_DPI)
         self.loop_var = tk.IntVar(value=DEFAULT_GIF_LOOP)
-
-        settings = [
-            ("Frames per second:", self.fps_var, 1, 20, 1),
-            ("Image quality (DPI):", self.dpi_var, 50, 300, 10),
-            ("Loop count (0 = infinite):", self.loop_var, 0, 10, 1)
-        ]
-
-        for label, var, from_, to, resolution in settings:
-            row = tk.Frame(settings_frame, bg=OPERAXNTheme.COLORS['bg_primary'])
-            row.pack(fill="x", pady=5)
-
-            self.create_themed_label(row, label, font_type="body").pack(side="left", padx=5)
-
-            scale = self.create_themed_scale(
-                row, var, from_, to, showvalue=True
-            )
-            if resolution > 1:
-                scale.config(resolution=resolution)
-            scale.pack(side="left", padx=5)
-
-        # Buttons
-        self.create_button_frame([
-            ("Create GIF", self._create, "primary"),
-            ("Cancel", self.cancel, "secondary")
-        ])
+        for row, (label, var, from_, to, resolution) in enumerate([
+                ("Frames per second:", self.fps_var, 1, 20, 1),
+                ("Resolution (DPI):", self.dpi_var, 50, 300, 10),
+                ("Loop count (0 = infinite):", self.loop_var, 0, 10, 1)]):
+            self.create_scale_row(animation, row, label, var, from_, to, resolution)
 
     def _create(self) -> None:
-        """Store the settings as the result and close; warn when the range selects no scans."""
+        """Validate the range, then hand the settings to on_create (or store them and close)."""
         scan_list = parse_scan_range(self.range_var.get(), self.num_scans)
         if not scan_list:
             messagebox.showwarning("Invalid Range",
@@ -983,7 +961,10 @@ class GIFSettingsDialog(BaseDialog):
             loop=self.loop_var.get(),
             scan_list=scan_list,
         )
-        self.destroy()
+        if self.on_create is None:
+            self.destroy()
+        else:
+            self.on_create(self.result, self)
 
 
 # ============================================================================
@@ -1003,7 +984,7 @@ class UploadOptionsDialog(BaseDialog):
     ]
 
     def __init__(self, master: tk.Misc, has_loaded_data: bool = False) -> None:
-        super().__init__(master, "Load Data", "540x700")
+        super().__init__(master, "Upload Data", "540x700")
         self._has_loaded_data = has_loaded_data
         self._paths: List[str] = []
         self._std_echem: List[str] = []
@@ -1155,17 +1136,8 @@ class UploadOptionsDialog(BaseDialog):
         self.size_menu.pack(side="left")
 
         self.include_2d_var = tk.BooleanVar(value=False)
-        self.include_2d_check = tk.Checkbutton(
-            twod_frame, text="Include 2D images in the NeXus file",
-            variable=self.include_2d_var,
-            font=OPERAXNTheme.FONTS['body'],
-            bg=OPERAXNTheme.COLORS['bg_primary'],
-            fg=OPERAXNTheme.COLORS['text_primary'],
-            activebackground=OPERAXNTheme.COLORS['bg_primary'],
-            activeforeground=OPERAXNTheme.COLORS['accent_primary'],
-            selectcolor=OPERAXNTheme.COLORS['bg_tertiary'],
-            disabledforeground=OPERAXNTheme.COLORS['text_dim'],
-            highlightthickness=0)
+        self.include_2d_check = self.create_themed_checkbutton(
+            twod_frame, "Include 2D images in the NeXus file", self.include_2d_var)
         self.include_2d_check.pack(anchor="w", pady=(6, 0))
 
         # --- Experiment metadata: collapsed by default so the essentials
@@ -1264,17 +1236,17 @@ class UploadOptionsDialog(BaseDialog):
         # The button row and note are pinned to the bottom edge and packed
         # before the scrolling content, so they always keep their space.
         self.create_button_frame([
-            ("Load", self._confirm, "primary"),
+            ("Upload", self._confirm, "primary"),
             ("Cancel", self.cancel, "secondary")
         ], pady=14, side="bottom")
 
-        # Note shown when generation options do not apply
+        # Note shown when generation options do not apply; packed above the
+        # buttons only while it has text, so no blank line is reserved for it
         self.note_var = tk.StringVar(value="")
-        tk.Label(self, textvariable=self.note_var,
-                 font=OPERAXNTheme.FONTS['small'],
-                 bg=OPERAXNTheme.COLORS['bg_primary'],
-                 fg=OPERAXNTheme.COLORS['warning']).pack(side="bottom",
-                                                         pady=(10, 0))
+        self._note_label = tk.Label(self, textvariable=self.note_var,
+                                    font=OPERAXNTheme.FONTS['small'],
+                                    bg=OPERAXNTheme.COLORS['bg_primary'],
+                                    fg=OPERAXNTheme.COLORS['warning'])
 
         self._scroll_outer.pack(side="top", fill="both", expand=True)
 
@@ -1388,9 +1360,17 @@ class UploadOptionsDialog(BaseDialog):
         for entry in self._meta_entries:
             entry.config(state=gen_state)
 
-        self.note_var.set(
-            "Opening a NeXus file: generation options are fixed in the file"
-            if direct_nxs else "")
+        note = ("Opening a NeXus file: generation options are fixed in the file"
+                if direct_nxs else "")
+        self.note_var.set(note)
+        if bool(note) != self._note_label.winfo_manager().startswith("pack"):
+            if note:
+                self._note_label.pack(side="bottom", pady=(10, 0), after=self._button_frame)
+            else:
+                self._note_label.pack_forget()
+            # The first fit happens in __init__; later changes refit where the window is
+            if self.winfo_ismapped():
+                self.fit_height_in_place()
 
     # --- result ---
 
@@ -1532,15 +1512,7 @@ class ProgressDialog(BaseDialog):
             pady=10
         )
 
-        # Style the progress bar
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure("TProgressbar",
-                        background=OPERAXNTheme.COLORS['accent_primary'],
-                        troughcolor=OPERAXNTheme.COLORS['bg_tertiary'],
-                        borderwidth=0,
-                        lightcolor=OPERAXNTheme.COLORS['accent_primary'],
-                        darkcolor=OPERAXNTheme.COLORS['accent_primary'])
+        _style_progressbar()
 
         self.bar = ttk.Progressbar(
             self,

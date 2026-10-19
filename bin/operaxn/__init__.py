@@ -38,7 +38,8 @@ from .capacity import (
     assign_cycles,
     compute_capacity,
     plot_capacity_vs_voltage,
-    plot_time_vs_voltage
+    plot_time_vs_voltage,
+    CapacityWindow
 )
 
 from .heatmap import HeatmapWindow
@@ -110,6 +111,7 @@ __all__ = [
     'compute_capacity',
     'plot_capacity_vs_voltage',
     'plot_time_vs_voltage',
+    'CapacityWindow',
     'ICIWindow',
     'HeatmapWindow',
 

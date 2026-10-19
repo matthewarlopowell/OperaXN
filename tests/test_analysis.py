@@ -19,7 +19,7 @@ import operaxn.gui as gui_module
 import operaxn.output as output_module
 from operaxn.capacity import (
     _assign_time, assign_cycles, compute_capacity,
-    plot_capacity_vs_voltage, plot_time_vs_voltage,
+    plot_capacity_vs_voltage, plot_time_vs_voltage, CapacityWindow,
 )
 from operaxn.dialog import parse_scan_range
 from operaxn.gui import ButtonPanel, FileListPanel, OPERAXN
@@ -340,7 +340,7 @@ def test_source_switches_wait_for_dropdown_close():
     """ICI and Capacity source switches defer through after_idle (pins
     the implementation source; rename-sensitive)."""
     assert "after_idle" in inspect.getsource(ICIWindow._on_source_change)
-    assert "after_idle" in inspect.getsource(OPERAXN._open_capacity_window)
+    assert "after_idle" in inspect.getsource(CapacityWindow._build_ui)
 
 
 def test_ici_fit_plot_has_no_redundant_overlays():
@@ -369,9 +369,9 @@ def test_phase_change_preserves_pulse_selection():
 def test_capacity_window_controls():
     """The capacity window auto-applies mass and steps cycles with no
     Save/Apply buttons (pins the window source; rename-sensitive)."""
-    capacity_window_source = inspect.getsource(OPERAXN._open_capacity_window)
+    capacity_window_source = inspect.getsource(CapacityWindow)
     assert "Save Plot" not in capacity_window_source
-    assert 'text="Apply"' not in capacity_window_source
+    assert "'Apply'" not in capacity_window_source
     assert "_queue_mass_replot" in capacity_window_source
     assert "_step_cycle" in capacity_window_source \
         and "All cycles" in capacity_window_source
@@ -381,14 +381,13 @@ def test_all_cycles_labels_use_primary_text_colour():
     """All-cycles selector labels use the primary text colour on both
     windows (pins the implementation source; rename-sensitive)."""
     assert "bg=BG2, fg=TEXT" in inspect.getsource(_SelectorStrip._build)
-    assert "fg=OPERAXNTheme.COLORS['text_primary']" in \
-        inspect.getsource(OPERAXN._open_capacity_window)
+    assert "bg=BG2, fg=TEXT" in inspect.getsource(CapacityWindow._build_ui)
 
 
 def test_analysis_figures_use_light_palette():
     """Capacity and Heatmap figure backgrounds stay on the light
     palette (pins the implementation source; rename-sensitive)."""
-    assert "plot_bg = '#ffffff'" in inspect.getsource(OPERAXN._open_capacity_window)
+    assert "facecolor=PLOT_BG" in inspect.getsource(CapacityWindow._build_ui)
     heatmap_build_source = inspect.getsource(HeatmapWindow._build_ui)
     assert "facecolor=PLOT_BG" in heatmap_build_source
     assert "width_ratios=(4, 0.12, 0.22, 1.1)" in heatmap_build_source, \
@@ -631,7 +630,7 @@ def test_heatmap_axis_fallback_clears_x_range(tk_root):
     for banks in arrays.values():
         banks["0"] = {"tof": banks["1"]["tof"]}
     hm = HeatmapWindow(tk_root, build_hm_scans(), neutron_arrays=arrays,
-                       neutron_dspacing=True, x_range=(1.0, 4.0))
+                       dspacing=True, x_range=(1.0, 4.0))
     try:
         hm.update()
         assert hm.bank_var.get() == "0" and hm.xaxis_var.get() == "tof"
@@ -669,7 +668,7 @@ def test_heatmap_window_neutron_banks_and_export(tk_root, tmp_path, monkeypatch)
         if volts is not None:
             scan["echem"] = volts
     hm = HeatmapWindow(tk_root, scans, neutron_arrays=build_neutron_arrays(),
-                       neutron_dspacing=True, x_range=(1.0, 4.0))
+                       dspacing=True, x_range=(1.0, 4.0))
     try:
         hm.update()
         assert hm.is_neutron and list(hm._bank_btns) == ["1", "3"]

@@ -23,7 +23,6 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 
-from .capacity import assign_cycles, compute_capacity
 from .config import (
     CSV_ENCODING, FIGURE_DPI, OPERAXNTheme, SECONDS_PER_HOUR, TIME_HOURS_LABEL,
 )
@@ -194,6 +193,8 @@ def _compute_fit(seg: pd.DataFrame, pulse: dict, r1_start: float, r1_length: flo
 
 def _compute_all_pulses(seg: pd.DataFrame, pulses: list[dict], get_r1) -> list[dict]:
     """Fit every pulse in seg; get_r1(1-based pulse_idx) -> (r1_start_s, r1_length_s)."""
+    # Imported here: capacity.py builds its window from this module's widgets
+    from .capacity import compute_capacity
     cap_arr = compute_capacity(seg) if not seg.empty else np.array([])
     results = []
     for i, p in enumerate(pulses):
@@ -745,12 +746,13 @@ def watch_figure_sync(win, canvases):
 
 class ICIWindow(tk.Toplevel):
     """ICI analysis window; opens maximised.
-    Takes one echem_df, or echem_sources {name: df} to choose between datasets."""
+    Takes echem_df or echem_sources {name: df}; CSVs are <export_stem>_ici_charge/_discharge.csv."""
 
     def __init__(self, parent: tk.Widget,
                  echem_df: Optional[pd.DataFrame] = None,
                  echem_sources: Optional[dict] = None,
-                 on_add_source=None) -> None:
+                 on_add_source=None,
+                 export_stem: str = 'experiment') -> None:
         super().__init__(parent)
         self.title('OperaXN: ICI Analysis')
         self.configure(bg=BG)
@@ -773,6 +775,7 @@ class ICIWindow(tk.Toplevel):
         self._reg_change_job = None
         self._last_max_rest = 300.0
         self._on_add_source = on_add_source
+        self._export_stem = export_stem
 
         # Regression-window overrides, resolved pulse > phase > defaults.
         # Bar edits write the pulse level; Apply All writes the phase level.
@@ -928,6 +931,7 @@ class ICIWindow(tk.Toplevel):
 
     def _load(self, echem_df: pd.DataFrame):
         """Load echem data, reset caches, and redraw everything."""
+        from .capacity import assign_cycles  # see _compute_all_pulses
         self._updating = True
         try:
             self._df = assign_cycles(echem_df)
@@ -1323,7 +1327,7 @@ class ICIWindow(tk.Toplevel):
             self._updating = False
 
     def _export_csv(self):
-        """Write ici_charge.csv and ici_discharge.csv covering every cycle."""
+        """Write <stem>_ici_charge.csv and <stem>_ici_discharge.csv covering every cycle."""
         if self._df is None:
             return
         directory = filedialog.askdirectory(title='Select export folder', parent=self)
@@ -1353,12 +1357,14 @@ class ICIWindow(tk.Toplevel):
                         'R2': r['r2'],
                     })
             out = pd.DataFrame(rows, columns=columns)
-            out.to_csv(os.path.join(directory, f'ici_{phase}.csv'), index=False,
+            out.to_csv(os.path.join(directory, f'{self._export_stem}_ici_{phase}.csv'),
+                       index=False,
                        encoding=CSV_ENCODING)
 
         messagebox.showinfo(
             'Export complete',
-            f'Saved ici_charge.csv and ici_discharge.csv to:\n{directory}',
+            f'Saved {self._export_stem}_ici_charge.csv and '
+            f'{self._export_stem}_ici_discharge.csv to:\n{directory}',
             parent=self
         )
 

@@ -178,6 +178,8 @@ class EnhancedSplashScreen(WindowManager):
         self.animation_items = []
         self.animation_running = False
         self.progress_var = tk.DoubleVar(value=0)
+        # Highest progress announced so far: the bar eases up to it and never moves back
+        self.progress_target = 0.0
 
         # Canvas item ids plus the progress-bar geometry
         self.ui_elements = {}
@@ -471,13 +473,14 @@ class EnhancedSplashScreen(WindowManager):
             self.splash.after(delay, callback)
 
     def _animate_progress(self) -> None:
-        """Advance the progress bar fill by one step."""
+        """Advance the progress bar fill one step towards the announced progress."""
         if not self.animation_running or not self.splash.winfo_exists():
             return
 
         current = self.progress_var.get()
-        if current < 100:
-            current = min(current + 3, 100)  # the drawn fill must not pass the track
+        if current < self.progress_target:
+            # Ease towards the announced progress, never past it or the track end
+            current = min(current + 3, self.progress_target, 100)
             self.progress_var.set(current)
 
             # Update bar
@@ -557,14 +560,18 @@ class EnhancedSplashScreen(WindowManager):
         self._schedule_animation(50, self._animate_rotation)
 
     def update_status(self, message: str, progress: Optional[float] = None) -> None:
-        """Set the status label text and optionally the progress value."""
+        """Set the status label text and optionally raise the progress target (never lowered)."""
         if self.splash and self.splash.winfo_exists():
             self.canvas.itemconfig(self.ui_elements['status_label'], text=message)
             if progress is not None:
-                self.progress_var.set(progress)
+                self.progress_target = max(self.progress_target, min(progress, 100))
 
     def close(self) -> None:
-        """Fade out and destroy the splash window."""
+        """Finish the progress fill, then fade out and destroy the splash window."""
+        if self.splash and self.splash.winfo_exists():
+            # A slow GUI build can leave the bar short of its last announced value
+            while self.animation_running and self.progress_var.get() < self.progress_target:
+                self._animate_progress()
         self.animation_running = False
         if self.splash and self.splash.winfo_exists():
             # Fade out effect
@@ -666,7 +673,6 @@ class ApplicationManager:
             (700, "Initialising GUI components...", 50),
             (1000, "Loading visualisation engine...", 70),
             (1300, "Preparing workspace...", 85),
-            (1600, "Ready to launch!", 100)
         ]
 
         for delay, message, progress in updates:
@@ -687,6 +693,8 @@ class ApplicationManager:
             self.app = OPERAXN(master=self.root)
             self.initialization_complete = True
             self.logger.info("Application initialised successfully")
+            if self.splash_manager:
+                self.splash_manager.update_status("Ready to launch!", 100)
         except Exception as e:
             self.logger.exception("Failed to initialise application")
             self._show_error(f"Failed to initialise:\n\n{e}")

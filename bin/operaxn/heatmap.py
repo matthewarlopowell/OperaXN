@@ -1,8 +1,8 @@
 """
 Operando heatmap window: stacked 1D patterns as an intensity map.
 
-2θ (X-ray) or time of flight / d-spacing (neutron, one map per detector
-bank) on x, scan number or elapsed time on y, with the correlated voltage
+2θ or d-spacing (X-ray) or time of flight / d-spacing (neutron, one map per
+detector bank) on x, scan number or elapsed time on y, with the correlated voltage
 track on a shared y axis so peak shifts line up with the electrochemistry.
 Patterns are interpolated onto the first usable scan's x grid when grids differ;
 the window also exports a publication figure (PNG, PDF or SVG).
@@ -23,7 +23,7 @@ from matplotlib.gridspec import GridSpec
 
 from .config import (
     COLORMAP, DSPACING_LABEL, EXPORT_DPI, FIGURE_DPI, SECONDS_PER_HOUR,
-    TIME_HOURS_LABEL, TOF_LABEL, TWOTHETA_LABEL, VMIN_FLOOR,
+    TIME_HOURS_LABEL, TOF_LABEL, TWOTHETA_LABEL, VMIN_FLOOR, XRAY_WAVELENGTH,
 )
 from .dialog import parse_scan_range
 from .ici import (
@@ -41,7 +41,9 @@ COLORMAPS = (COLORMAP, 'viridis', 'inferno', 'magma', 'plasma', 'cividis',
 
 # Neutron x axes in the order they are offered, with their plot labels
 NEUTRON_AXES = {'tof': TOF_LABEL, 'd': DSPACING_LABEL}
-XRD_XLABEL = TWOTHETA_LABEL
+# X-ray x axes; d-spacing is converted from 2θ and drawn decreasing, in 2θ's order,
+# like the main window's d-spacing view
+XRD_AXES = {'twotheta': TWOTHETA_LABEL, 'd': DSPACING_LABEL}
 INTENSITY_LABEL = 'Intensity (arb. units)'
 VOLTAGE_LABEL = 'Voltage (V)'
 
@@ -83,6 +85,18 @@ def build_xrd_matrix(oned_arrays: Dict[int, Dict[str, Any]]):
     if not rows:
         return None, None, []
     return x_grid, np.vstack(rows), used
+
+
+def dspacing_columns(x, matrix, wavelength: float):
+    """Re-express a 2θ map's columns as ascending d-spacing (Bragg's law) for wavelength (Å).
+    Columns outside 0 < 2θ < 180° have no d and are dropped."""
+    if matrix is None:
+        return x, matrix
+    two_theta = np.asarray(x, dtype=float)
+    keep = (two_theta > 0) & (two_theta < 180)
+    d = wavelength / (2 * np.sin(np.deg2rad(two_theta[keep] / 2)))
+    order = np.argsort(d)
+    return d[order], np.asarray(matrix)[:, keep][:, order]
 
 
 def neutron_banks(neutron_arrays: Dict[int, Dict[str, Any]]) -> List[str]:
@@ -257,11 +271,12 @@ def row_edges(y_vals: np.ndarray) -> Tuple[float, float]:
 def publication_figure(x, y_vals, matrix, *, x_label: str, y_label: str,
                        cmap: str, vmin: float, vmax: float, log: bool = False,
                        x_range: Tuple[Optional[float], Optional[float]] = (None, None),
+                       invert_x: bool = False,
                        voltage=None, title: str = '',
                        dpi: int = EXPORT_DPI) -> Figure:
     """Build the publication figure: voltage track (left, shared y), map, colour bar.
-    voltage is (volts, y) on the row axis or None for no track; the mesh is
-    rasterised so PDF and SVG exports keep vector axes and text."""
+    voltage is (volts, y) on the row axis or None for no track; invert_x draws x decreasing;
+    the mesh is rasterised so PDF and SVG exports keep vector axes and text."""
     fig = Figure(figsize=PUBLICATION_SIZE, dpi=dpi, facecolor='white')
     has_voltage = voltage is not None and len(voltage[0]) > 1
     widths = (1.0, 3.4, 0.1) if has_voltage else (3.4, 0.1)
@@ -279,6 +294,8 @@ def publication_figure(x, y_vals, matrix, *, x_label: str, y_label: str,
     if x_range[0] is not None or x_range[1] is not None:
         ax.set_xlim(x_range[0] if x_range[0] is not None else ax.get_xlim()[0],
                     x_range[1] if x_range[1] is not None else ax.get_xlim()[1])
+    if invert_x:
+        ax.invert_xaxis()
     if title:
         ax.set_title(title, fontsize=10, color='black')
 
@@ -346,8 +363,8 @@ def _parse_float(text: str) -> Optional[float]:
 
 class HeatmapWindow(tk.Toplevel):
     """Operando heatmap window; opens maximised.
-    Takes oned_arrays (X-ray) or neutron_arrays (bank selector, TOF / d toggle); neutron_dspacing
-    picks the starting axis and x_range seeds the x-range entries."""
+    Takes oned_arrays (X-ray, 2θ / d at wavelength Å) or neutron_arrays (per bank, TOF / d);
+    dspacing picks the start axis, x_range seeds the range, exports are <export_stem>_heatmap*."""
 
     def __init__(self, parent: tk.Widget,
                  scans: List[Dict[str, Any]],
@@ -355,8 +372,10 @@ class HeatmapWindow(tk.Toplevel):
                  echem_arrays: Optional[Dict[str, Any]] = None,
                  time_method: str = "absolute",
                  neutron_arrays: Optional[Dict[int, Dict[str, Any]]] = None,
-                 neutron_dspacing: bool = False,
-                 x_range: Optional[Tuple[Optional[float], Optional[float]]] = None) -> None:
+                 dspacing: bool = False,
+                 x_range: Optional[Tuple[Optional[float], Optional[float]]] = None,
+                 wavelength: float = XRAY_WAVELENGTH,
+                 export_stem: str = 'experiment') -> None:
         super().__init__(parent)
         self.title('OperaXN: Operando Heatmap')
         self.configure(bg=BG)
@@ -381,18 +400,22 @@ class HeatmapWindow(tk.Toplevel):
         self._excluded: set = set()
         self._x = self._matrix = None
         self._scan_nums: List[int] = []
+        self._wavelength = wavelength
+        self._file_stem = export_stem
 
         self.bank_var = tk.StringVar(value=self._banks[0] if self._banks else '')
-        first_axes = neutron_axes(self._neutron, self.bank_var.get())
-        self.xaxis_var = tk.StringVar(
-            value='d' if neutron_dspacing and 'd' in first_axes
-            else (first_axes[0] if first_axes else ''))
+        if self.is_neutron:
+            first_axes = neutron_axes(self._neutron, self.bank_var.get())
+            axis = ('d' if dspacing and 'd' in first_axes
+                    else (first_axes[0] if first_axes else ''))
+        else:
+            axis = 'd' if dspacing else 'twotheta'
+        self.xaxis_var = tk.StringVar(value=axis)
 
         self._build_ui()
         self._refresh_axis_buttons()
-        # The main window's x range is in its own neutron units; seed it only on that axis
-        if x_range is not None and (not self.is_neutron
-                                    or (self.xaxis_var.get() == 'd') == neutron_dspacing):
+        # The main window's x range is in its own axis units; seed it only on that axis
+        if x_range is not None and (self.xaxis_var.get() == 'd') == dspacing:
             self._set_entries(self.xmin_var, self.xmax_var, *x_range)
         self._load_matrix()
         self._replot()
@@ -436,15 +459,15 @@ class HeatmapWindow(tk.Toplevel):
         strip.pack(fill='x', padx=2, pady=4)
 
         self._bank_btns = {}
-        self._x_btns = {}
         if self.is_neutron:
             self._bank_btns = self._toggle_group(
                 self._group(strip), 'Bank:', [(b, b) for b in self._banks], self.bank_var)
             self._sep(strip)
-            self._x_btns = self._toggle_group(
-                self._group(strip), 'X axis:', [('tof', 'TOF'), ('d', 'd-spacing')],
-                self.xaxis_var)
-            self._sep(strip)
+        x_options = ([('tof', 'TOF'), ('d', 'd-spacing')] if self.is_neutron
+                     else [('twotheta', '2θ'), ('d', 'd-spacing')])
+        self._x_btns = self._toggle_group(self._group(strip), 'X axis:', x_options,
+                                          self.xaxis_var)
+        self._sep(strip)
 
         # Time is the default row axis whenever the scans carry positions; the buttons
         # keep one order (Time first) so they never swap places between datasets
@@ -634,9 +657,12 @@ class HeatmapWindow(tk.Toplevel):
                 self._matrices[key] = build_xrd_matrix(
                     neutron_bank_arrays(self._neutron, *key))
         else:
-            key = ('xrd', '')
+            key = ('xrd', self.xaxis_var.get())
             if key not in self._matrices:
-                self._matrices[key] = build_xrd_matrix(self._oned_arrays)
+                x, matrix, scan_nums = build_xrd_matrix(self._oned_arrays)
+                if key[1] == 'd':
+                    x, matrix = dspacing_columns(x, matrix, self._wavelength)
+                self._matrices[key] = (x, matrix, scan_nums)
         return self._matrices[key]
 
     def _rows_for(self, bank: Optional[str] = None) -> tuple:
@@ -663,9 +689,12 @@ class HeatmapWindow(tk.Toplevel):
 
     def _x_label(self) -> str:
         """Return the axis label for the selected x quantity."""
-        if self.is_neutron:
-            return NEUTRON_AXES.get(self.xaxis_var.get(), XRD_XLABEL)
-        return XRD_XLABEL
+        axes = NEUTRON_AXES if self.is_neutron else XRD_AXES
+        return axes.get(self.xaxis_var.get(), TWOTHETA_LABEL)
+
+    def _x_inverted(self) -> bool:
+        """True when x is drawn decreasing: X-ray d-spacing, kept in 2θ's order."""
+        return not self.is_neutron and self.xaxis_var.get() == 'd'
 
     def _map_title(self, bank: Optional[str] = None) -> str:
         """Return 'Bank N' for neutron maps, empty for X-ray."""
@@ -791,6 +820,8 @@ class HeatmapWindow(tk.Toplevel):
             xlim = ax.get_xlim()
             ax.set_xlim(lo if lo is not None else xlim[0],
                         hi if hi is not None else xlim[1])
+        if self._x_inverted():
+            ax.invert_xaxis()
 
         colorbar = self._fig.colorbar(mesh, cax=self.cax)
         colorbar.ax.set_facecolor(PLOT_BG)
@@ -830,7 +861,8 @@ class HeatmapWindow(tk.Toplevel):
 
     def _export_stem(self, bank: Optional[str] = None) -> str:
         """Return the default file stem for an export."""
-        return f'heatmap_bank{bank or self.bank_var.get()}' if self.is_neutron else 'heatmap'
+        name = f'{self._file_stem}_heatmap'
+        return f'{name}_bank{bank or self.bank_var.get()}' if self.is_neutron else name
 
     def render_figure(self, bank: Optional[str] = None,
                       dpi: int = EXPORT_DPI) -> Optional[Figure]:
@@ -844,7 +876,7 @@ class HeatmapWindow(tk.Toplevel):
         return publication_figure(
             x, y_vals, matrix, x_label=self._x_label(), y_label=y_label,
             cmap=self._cmap(), vmin=vmin, vmax=vmax, log=log,
-            x_range=self._x_range(),
+            x_range=self._x_range(), invert_x=self._x_inverted(),
             voltage=self._voltage_curve(scan_nums, y_vals, y_label == TIME_HOURS_LABEL),
             title=self._map_title(bank), dpi=dpi)
 
@@ -882,7 +914,7 @@ class HeatmapWindow(tk.Toplevel):
         path = filedialog.asksaveasfilename(
             parent=self, title='Export all banks (the bank number is appended)',
             defaultextension='.png', filetypes=EXPORT_FILETYPES,
-            initialfile='heatmap.png')
+            initialfile=f'{self._file_stem}_heatmap.png')
         if not path:
             return
         stem, ext = os.path.splitext(path)

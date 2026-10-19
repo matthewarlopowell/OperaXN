@@ -846,6 +846,7 @@ def test_splash_fill_stops_at_track_end():
         animation_running=True, splash=SimpleNamespace(winfo_exists=lambda: True),
         progress_var=Var(99), canvas=Canvas(), _schedule_animation=lambda *_args: None,
         _animate_progress=None,  # rescheduling target; the stub never calls it
+        progress_target=100,
         ui_elements={"bar_width": 300, "bar_center_x": 200,
                      "progress_rect": 1, "progress_glow": 2})
     EnhancedSplashScreen._animate_progress(fake)

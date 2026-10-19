@@ -254,6 +254,39 @@ class DataTransformer:
 
 
 # ============================================================================
+# Intensity Limits
+# ============================================================================
+
+def intensity_bounds(image: np.ndarray) -> Tuple[float, float]:
+    """Return the smallest positive and the largest finite value: the span the 2D sliders cover.
+    (VMIN_FLOOR, 1) when nothing is positive."""
+    # Integer frames (an all-zero HDF stays uint32) cannot hold the inf sentinels below
+    image = np.asarray(image, dtype=float)
+    valid = np.isfinite(image)
+    low = float(np.min(image, where=valid & (image > 0), initial=np.inf))
+    if not np.isfinite(low):
+        return VMIN_FLOOR, 1.0
+    high = float(np.max(image, where=valid, initial=-np.inf))
+    return low, (high if high > low else low * 10)
+
+
+def auto_intensity_limits(image: np.ndarray) -> Tuple[float, float]:
+    """Return the default 2D display (vmin, vmax), the same every time for the same image.
+    The full positive range; above LARGE_IMAGE_THRESHOLD, p1-p99 of an evenly strided sample."""
+    low, high = intensity_bounds(image)
+    if image.size > LARGE_IMAGE_THRESHOLD:
+        flat = image.ravel()
+        sample = flat[::max(1, flat.size // INTENSITY_SAMPLE_SIZE)]
+        sample = sample[np.isfinite(sample)]
+        if sample.size:
+            p1, p99 = np.percentile(sample, [1, 99])
+            low, high = max(float(p1), low), min(float(p99), high)
+            if high <= low:
+                high = low * 10
+    return low, high
+
+
+# ============================================================================
 # Base Plotter
 # ============================================================================
 
@@ -567,18 +600,7 @@ class TwoDPlotter(BasePlotter):
         if intensity_limits and intensity_limits[0] < intensity_limits[1]:
             vmin, vmax = intensity_limits
         else:
-            valid_data = image_data[~np.isnan(image_data)]
-            if len(valid_data) == 0:
-                return VMIN_FLOOR, 1
-
-            # Sample for large images
-            if valid_data.size > LARGE_IMAGE_THRESHOLD:
-                sample_size = min(INTENSITY_SAMPLE_SIZE, valid_data.size)
-                sample_indices = np.random.choice(len(valid_data), sample_size, replace=False)
-                sample = valid_data[sample_indices]
-                vmin, vmax = np.percentile(sample, [1, 99])
-            else:
-                vmin, vmax = valid_data.min(), valid_data.max()
+            vmin, vmax = auto_intensity_limits(image_data)
 
         vmin = max(vmin, VMIN_FLOOR)
         if vmax <= vmin:
