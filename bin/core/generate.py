@@ -113,6 +113,10 @@ class FileProcessor:
         if not all_files:
             return []
 
+        # On-access virus scanners (Sophos: about 60 ms per fresh .dat) delay each
+        # file's first read; scanning all files in parallel here keeps later reads cheap
+        self._warm_up([path for path, _ in all_files])
+
         # Source-specific grouping
         if self.data_source == DataSourceType.NEUTRON:
             records = self._process_neutron_files(all_files)
@@ -151,6 +155,22 @@ class FileProcessor:
 
         logger.info(f"Processed {len(records)} neutron-related files")
         return records
+
+    @staticmethod
+    def _warm_up(paths: List[str]) -> None:
+        """Open each file once across the worker pool so on-access scans overlap."""
+        if not PARALLEL_PROCESSING or len(paths) <= PARALLEL_PROCESSING_THRESHOLD:
+            return
+
+        def touch(path: str) -> None:
+            try:
+                with open(path, "rb") as f:
+                    f.read(1)
+            except OSError as e:
+                logger.debug(f"Could not warm {path}: {e}")
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            list(executor.map(touch, paths))
 
     def _collect_all_files(self, selected_paths: List[str]) -> List[Tuple[str, str]]:
         """Recursively collect files from paths/directories, extract ZIPs, convert xlsx/csv."""

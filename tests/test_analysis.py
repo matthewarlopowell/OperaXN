@@ -299,28 +299,24 @@ def test_echem_scan_curve_retains_full_resolution():
 
 
 def test_button_panel_configuration():
-    """Analysis buttons exist, precede export and use single-codepoint emoji."""
+    """Analysis and export buttons exist, analysis first, with single-codepoint emoji."""
     button_keys = [key for key, _, _, _ in ButtonPanel.BUTTON_CONFIGS]
     assert "capacity_plot" in button_keys
     assert "ici_analysis" in button_keys
     assert "heatmap" in button_keys
+    assert "export_nxs" in button_keys
     assert button_keys.index("capacity_plot") < button_keys.index("export_plots") \
         and button_keys.index("ici_analysis") < button_keys.index("export_plots")
     assert all("\ufe0f" not in text for _, text, _, _ in ButtonPanel.BUTTON_CONFIGS)
 
 
-@pytest.mark.parametrize("attr", [
-    "_open_capacity_window",
-    "_open_ici_window",
-    "_append_standard_echem_async",
-    "_echem_sources",
-    "_has_analysis_current",
-    "_open_heatmap",
-    "_choose_additional_echem",
-])
-def test_app_handler_exists(attr):
-    """OPERAXN exposes the analysis and echem handlers the buttons rely on."""
-    assert hasattr(OPERAXN, attr)
+def test_app_handlers_exist():
+    """OPERAXN exposes the analysis, echem and export handlers its buttons rely on."""
+    handlers = ("_open_capacity_window", "_open_ici_window", "_append_standard_echem_async",
+                "_echem_sources", "_has_analysis_current", "_open_heatmap",
+                "_choose_additional_echem", "_export_nxs")
+    missing = [name for name in handlers if not callable(getattr(OPERAXN, name, None))]
+    assert missing == [], missing
 
 
 def test_ici_window_api():

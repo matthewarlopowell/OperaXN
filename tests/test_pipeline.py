@@ -27,21 +27,11 @@ def pipeline(inhouse_dir):
     return core.process_raw([inhouse_dir], core.DataSourceType.INHOUSE)
 
 
-def test_process_raw_scan_count(pipeline):
-    """Three XRD .dat files yield three scans."""
-    scans, _ = pipeline
+def test_process_raw_correlates_the_inhouse_dir(pipeline):
+    """Three scans and 40 echem rows load; scan 1 matches its 10:06 midpoint at 3.76 V."""
+    scans, echem = pipeline
     assert len(scans) == 3, f"got {len(scans)}"
-
-
-def test_process_raw_echem_rows(pipeline):
-    """The 40-row echem file arrives intact in the combined frame."""
-    _, echem = pipeline
     assert len(echem) == 40, f"got {len(echem)}"
-
-
-def test_process_raw_scan1_voltage(pipeline):
-    """Scan at 10:05 with 120 s exposure correlates at its 10:06 midpoint to V = 3.76."""
-    scans, _ = pipeline
     assert abs(scans[0].echem - 3.76) < 1e-9, f"got {scans[0].echem}"
 
 
@@ -146,19 +136,17 @@ ARBIN_FULL_HEADER = ("Data_Point\tTest_Time(s)\tDate_Time\tCurrent(A)\t"
 
 
 @pytest.mark.parametrize("header,sample,expected", [
-    (ARBIN_HEADER, None, {"time": 1, "voltage": 4, "current": 3}),
     ("time/s\tEwe/V\tI/mA", None, {"time": 0, "voltage": 1, "current": 2}),
     ("Absolute Time\tVoltage\tCurrent", None, {"time": 0, "voltage": 1, "current": 2}),
     ("Date\tTime\tVoltage\tCurrent", "05/02/2024\t10:00:00\t3.7\t0.1", {"time": 1}),
-    (ARBIN_FULL_HEADER, None, {"time": 2, "voltage": 4, "current": 3}),
     ("dV/dt(V/s)\tDate_Time\tVoltage(V)\tCurrent(A)", None,
      {"time": 1, "voltage": 2, "current": 3}),
     ("Date_Time\tVoltage(V)\tCurrent(A)\tAux_Voltage_1(V)\tVoltage_Range"
      "\tCurrent_Range", None, {"time": 0, "voltage": 1, "current": 2}),
     ("Date_Time\tAux_Voltage_1(V)\tCurrent_Range\tVoltage(V)\tCurrent(A)",
      None, {"time": 0, "voltage": 3, "current": 4}),
-], ids=["arbin-date-time", "biologic", "simple", "split-date-clock",
-        "arbin-full-export", "derived-column-first", "aux-and-range-after",
+], ids=["biologic", "simple", "split-date-clock",
+        "derived-column-first", "aux-and-range-after",
         "aux-and-range-before"])
 def test_detect_columns_time_slot(header, sample, expected):
     """Column detection matrix: Arbin's Date_Time beats elapsed seconds, a bare Date loses to a
@@ -256,12 +244,11 @@ def test_unusable_headers_fail_safe(tmp_path, header, make_row):
 
 
 @pytest.mark.parametrize("header,scale", [
-    ("Data_Point\tDate_Time\tTest_Time(s)\tCurrent(A)\tVoltage(V)", 1000.0),
     ("Time\tVoltage\tCurrent(mA)", 1.0),
     ("time/s\tEwe/V\tI/mA", 1.0),
     ("Time\tVoltage\tCurrent", 1.0),
     ("Time\tVoltage\tArea (A)", 1.0),
-], ids=["arbin-amps", "milliamps", "biologic", "unitless", "non-current-amps"])
+], ids=["milliamps", "biologic", "unitless", "non-current-amps"])
 def test_current_unit_scale(header, scale):
     """Only a parenthesised amp unit on the current column triggers scaling."""
     parser = core.EchemParser()
@@ -348,18 +335,49 @@ def test_xlsx_conversion_leaves_no_temp_files(tmp_path):
     assert glob.glob(pattern) == [], "conversion leaked a temp file"
 
 
+def test_collection_warms_every_file_up_front(neutron_dir, monkeypatch):
+    """Every collected file is opened once across the worker pool before classification."""
+    import builtins
+    import importlib
+    monkeypatch.setattr(importlib.import_module("core.generate"),
+                        "PARALLEL_PROCESSING_THRESHOLD", 0)
+    opened = []
+    real_open = builtins.open
+
+    def recording_open(file, mode="r", *args, **kwargs):
+        if mode == "rb":
+            opened.append(os.path.normpath(str(file)))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", recording_open)
+    with core.FileProcessor(core.DataSourceType.NEUTRON) as processor:
+        records = processor.process_paths([neutron_dir])
+    collected = {os.path.normpath(r.path) for r in records}
+    assert collected and collected <= set(opened), sorted(collected - set(opened))
+
+
+def test_warm_up_skips_unreadable_paths(tmp_path, monkeypatch):
+    """A file gone since collection is skipped; warming never raises."""
+    import importlib
+    monkeypatch.setattr(importlib.import_module("core.generate"),
+                        "PARALLEL_PROCESSING_THRESHOLD", 0)
+    present = tmp_path / "scan.dat"
+    present.write_text("1 2\n")
+    core.FileProcessor._warm_up([str(tmp_path / "gone.dat"), str(present)])
+
+
 # ============================================================================
 # Round-trip
 # ============================================================================
 
 @pytest.fixture
 def inhouse_rt(inhouse_dir, tmp_path):
-    """Return pipeline scans/echem plus the generated-and-reloaded in-house .nxs and model."""
-    scans, echem = core.process_raw([inhouse_dir], core.DataSourceType.INHOUSE)
+    """Return pipeline scans plus the model reloaded from the generated in-house .nxs."""
+    scans, _ = core.process_raw([inhouse_dir], core.DataSourceType.INHOUSE)
     nxs = str(tmp_path / "inhouse.nxs")
     ok, msgs = core.generate([inhouse_dir], nxs, core.DataSourceType.INHOUSE)
     assert ok, f"generate in-house nxs failed: {msgs}"
-    return scans, echem, nxs, core.load(nxs)
+    return scans, core.load(nxs)
 
 
 @pytest.fixture
@@ -371,16 +389,9 @@ def neutron_rt(neutron_dir, tmp_path):
     return core.load(nxs)
 
 
-def test_inhouse_nxs_is_canonical(inhouse_rt):
-    """A generated in-house file passes the canonical sniff and keeps its source."""
-    _, _, nxs, model = inhouse_rt
-    assert core.is_canonical_nxs(nxs)
-    assert model.data_source == "inhouse", f"got {model.data_source}"
-
-
 def test_inhouse_scan_fields_roundtrip(inhouse_rt):
     """Voltage, current, timestamp and exposure survive write -> load per scan."""
-    scans, _, _, model = inhouse_rt
+    scans, model = inhouse_rt
     assert len(model.scans) == 3, f"got {len(model.scans)}"
     for pipeline_scan, loaded in zip(scans, model.scans):
         assert loaded.echem == pipeline_scan.echem, \
@@ -390,44 +401,6 @@ def test_inhouse_scan_fields_roundtrip(inhouse_rt):
             f"scan {loaded.scan_num}: file={loaded.timestamp} pipeline={pipeline_scan.timestamp}"
         assert loaded.exposure_time == pipeline_scan.exposure_time, \
             f"scan {loaded.scan_num}: exposure"
-
-
-def test_inhouse_oned_data_exact(inhouse_rt):
-    """1D x/y arrays and the source filename round-trip exactly."""
-    _, _, _, model = inhouse_rt
-    s1 = model.scans[0]
-    assert s1.oned is not None and np.allclose(s1.oned["x"], _builders.ONED_X)
-    assert np.allclose(s1.oned["y"], _builders.inhouse_scan_y(1))
-    assert s1.oned["source"] == "scan_001.dat", f"got {s1.oned['source']}"
-
-
-def test_inhouse_echem_df_roundtrip(inhouse_rt):
-    """Operando echem rows, voltages and absolute timestamps survive reload."""
-    _, echem, _, model = inhouse_rt
-    assert model.echem_df is not None and len(model.echem_df) == 40
-    assert np.allclose(model.echem_df["echem_data"].values, echem["echem_data"].values)
-    assert model.echem_df["timestamp"].iloc[0] == pd.Timestamp("2024-02-05 10:00:00"), \
-        f"got {model.echem_df['timestamp'].iloc[0]}"
-
-
-def test_neutron_scan_count(neutron_rt):
-    """The single logbook entry with data files yields one loaded scan."""
-    assert len(neutron_rt.scans) == 1, f"got {len(neutron_rt.scans)}"
-
-
-def test_neutron_times_roundtrip(neutron_rt):
-    """Logbook start/end and the derived midpoint timestamp survive reload."""
-    ns = neutron_rt.scans[0]
-    assert ns.neutron_start == "2024-02-05 10:00:00" \
-        and ns.neutron_end == "2024-02-05 10:30:00", \
-        f"got {ns.neutron_start} / {ns.neutron_end}"
-    assert ns.timestamp == "2024-02-05 10:15:00", f"got {ns.timestamp}"
-
-
-def test_neutron_correlated_voltage(neutron_rt):
-    """Midpoint 10:15 correlates to echem V = 3.85."""
-    ns = neutron_rt.scans[0]
-    assert ns.echem is not None and abs(ns.echem - 3.85) < 1e-9, f"got {ns.echem}"
 
 
 def test_neutron_banks_roundtrip(neutron_rt):

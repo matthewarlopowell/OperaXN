@@ -17,7 +17,7 @@ import core
 import operaxn
 from operaxn import input as gui_input
 from operaxn.dialog import UploadOptions, UploadOptionsDialog
-from operaxn.gui import OPERAXN, ButtonPanel
+from operaxn.gui import OPERAXN
 from operaxn.main import main as cli_main
 from operaxn.input import (
     DataSourceType,
@@ -215,22 +215,23 @@ def test_neutron_adapter(neutron_dir):
 
 
 @needs_fabio
-def test_embedded_twod_survives_source_deletion(inhouse_edf_dir, tmp_path):
-    """An embedded 2D image loads from the .nxs after the source EDF is gone."""
-    embedded_nxs = str(tmp_path / "embedded.nxs")
-    ok, _ = core.generate([inhouse_edf_dir], embedded_nxs,
-                          data_source=core.DataSourceType.INHOUSE,
-                          include_2d_images=True)
-    assert ok
-
+def test_embedded_twod_survives_export_and_source_deletion(inhouse_edf_dir, tmp_path):
+    """Images embedded at upload survive the copy export and load once the source EDF is gone."""
+    process_paths([inhouse_edf_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE, include_2d_images=True)
+    exported = str(tmp_path / "exported_embedded.nxs")
+    ok, msgs = export_nxs(exported)
+    assert ok, str(msgs)
     os.unlink(os.path.join(inhouse_edf_dir, "image_001.edf"))
 
-    scans_e, _, _ = process_paths(
-        [embedded_nxs], time_method=TimeMethod.ABSOLUTE,
-        data_source=DataSourceType.INHOUSE)
-    twod_e = make_twod_arrays(scans_e)
-    assert 1 in twod_e and "image" in twod_e[1], str(twod_e.get(1, {}).keys())
-    assert twod_e[1]["image"].shape == (8, 8)
+    model = core.load(exported)
+    assert model.scans[0].twod_embedded and model.scans[0].twod.shape == (8, 8)
+    scans, _, _ = process_paths([exported], time_method=TimeMethod.ABSOLUTE,
+                                data_source=DataSourceType.INHOUSE)
+    twod = make_twod_arrays(scans)
+    assert 1 in twod and "image" in twod[1], str(twod.get(1, {}).keys())
+    assert twod[1]["image"].shape == (8, 8)
+    _discard(core.default_cache_path([inhouse_edf_dir]))
 
 
 def test_export_copies_canonical_file(inhouse_dir, tmp_path):
@@ -258,39 +259,21 @@ def test_export_default_keeps_twod_by_reference(inhouse_edf_dir, tmp_path):
     assert exported_model.scans[0].twod is None
 
 
-@needs_fabio
-def test_export_carries_generation_embedded_twod(inhouse_edf_dir, tmp_path):
-    """Images embedded at upload land in the .nxs and survive the copy export."""
-    process_paths([inhouse_edf_dir], time_method=TimeMethod.ABSOLUTE,
-                  data_source=DataSourceType.INHOUSE, include_2d_images=True)
-    export_embedded = str(tmp_path / "exported_embedded.nxs")
-    ok, msgs = export_nxs(export_embedded)
-    assert ok, str(msgs)
-    embedded_model = core.load(export_embedded)
-    assert embedded_model.scans[0].twod_embedded
-    assert embedded_model.scans[0].twod is not None
-    assert embedded_model.scans[0].twod.shape == (8, 8)
-
-
-def test_export_after_direct_nxs_load_copies_user_file(inhouse_dir, tmp_path):
-    """Export after a direct .nxs load still copies the user's file."""
+def test_direct_nxs_load_survives_cleanup_and_exports(inhouse_dir, tmp_path):
+    """A directly opened user .nxs is never deleted by session cleanup and still exports."""
     process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.INHOUSE)
-    export_dest = str(tmp_path / "exported.nxs")
-    export_nxs(export_dest)
+    kept_export = str(tmp_path / "kept.nxs")
+    export_nxs(kept_export)
 
-    process_paths([export_dest], time_method=TimeMethod.ABSOLUTE,
+    process_paths([kept_export], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.INHOUSE)
+    cleanup_session_cache()
+    assert os.path.isfile(kept_export)
     copy2 = str(tmp_path / "copy_of_direct.nxs")
     ok, _ = export_nxs(copy2)
     assert ok and os.path.isfile(copy2)
     _discard(core.default_cache_path([inhouse_dir]))
-
-
-def test_gui_export_button_wiring():
-    """The GUI declares the Export NeXus button and its handler (headless)."""
-    assert any(k == "export_nxs" for k, *_ in ButtonPanel.BUTTON_CONFIGS)
-    assert callable(getattr(OPERAXN, "_export_nxs", None))
 
 
 def test_cache_unsaved_removed_on_exit(inhouse_dir):
@@ -356,19 +339,6 @@ def test_cache_exported_file_kept_on_exit(inhouse_dir, tmp_path):
     assert os.path.isfile(cache_file)
 
 
-def test_cache_user_nxs_never_deleted(inhouse_dir, tmp_path):
-    """Cleanup never deletes a directly opened user .nxs file."""
-    process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
-                  data_source=DataSourceType.INHOUSE)
-    kept_export = str(tmp_path / "kept.nxs")
-    export_nxs(kept_export)
-    process_paths([kept_export], time_method=TimeMethod.ABSOLUTE,
-                  data_source=DataSourceType.INHOUSE)
-    cleanup_session_cache()
-    assert os.path.isfile(kept_export)
-    _discard(core.default_cache_path([inhouse_dir]))
-
-
 # ============================================================================
 # ZIP 2D sidecar lifecycle (persist -> resolve -> export -> cleanup)
 # ============================================================================
@@ -393,23 +363,8 @@ def test_cache_zip_images_dir_cleaned(tmp_path):
 
 
 @needs_fabio
-def test_export_copies_zip_images_sidecar(tmp_path):
-    """Exporting a ZIP-loaded experiment carries its 2D images sidecar along."""
-    zpath = _write_twod_zip(tmp_path)
-    process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
-                  data_source=DataSourceType.INHOUSE)
-    dest = str(tmp_path / "kept.nxs")
-    ok, _ = export_nxs(dest)
-    assert ok
-    dest_images = str(tmp_path / "kept_images")
-    assert os.path.isdir(dest_images), "sidecar not copied on export"
-    edfs = [f for _, _, fs in os.walk(dest_images) for f in fs if f.endswith(".edf")]
-    assert edfs == ["image_001.edf"], f"got {edfs}"
-
-
-@needs_fabio
 def test_exported_zip_twod_resolves_after_cache_cleanup(tmp_path):
-    """Exported ZIP 2D resolves from the sibling images dir once the cache copy is gone."""
+    """Export copies the ZIP 2D sidecar, and 2D resolves from it once the cache copy is gone."""
     zpath = _write_twod_zip(tmp_path)
     process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.INHOUSE)
@@ -417,6 +372,9 @@ def test_exported_zip_twod_resolves_after_cache_cleanup(tmp_path):
     dest = str(tmp_path / "kept.nxs")
     ok, _ = export_nxs(dest)
     assert ok
+    edfs = [f for _, _, fs in os.walk(str(tmp_path / "kept_images"))
+            for f in fs if f.endswith(".edf")]
+    assert edfs == ["image_001.edf"], f"sidecar not copied on export: {edfs}"
     shutil.rmtree(cache_images)  # simulate the cache being cleaned later
     scans, _, _ = process_paths([dest], time_method=TimeMethod.ABSOLUTE,
                                 data_source=DataSourceType.INHOUSE)
@@ -631,7 +589,7 @@ def test_process_paths_threads_tolerance(inhouse_dir):
 @pytest.mark.display
 def test_upload_dialog_tolerance_field(tk_root, monkeypatch, inhouse_dir, tmp_path):
     """The tolerance entry starts at the core default and accepts only finite positive numbers,
-    as a float; a directly opened canonical .nxs greys it out and drops it."""
+    as a float capped silently at core's limit; a directly opened .nxs greys it out and drops it."""
     errors = []
     monkeypatch.setattr("operaxn.dialog.messagebox.showerror",
                         lambda *args, **kwargs: errors.append(args))
@@ -672,6 +630,21 @@ def test_upload_dialog_tolerance_field(tk_root, monkeypatch, inhouse_dir, tmp_pa
         if dlg.winfo_exists():
             dlg.destroy()
 
+    # Above core's limit the value quietly becomes the limit, with no error box
+    from core.config import MAX_ECHEM_TIME_TOLERANCE as limit
+    for text in ("1e12", f"{limit:g}"):
+        dlg = UploadOptionsDialog(tk_root)
+        try:
+            dlg._paths = [inhouse_dir]
+            dlg.tolerance_var.set(text)
+            dlg._confirm()
+            result = dlg.result
+            assert result is not None and result.echem_time_tolerance == limit, text
+        finally:
+            if dlg.winfo_exists():
+                dlg.destroy()
+    assert len(errors) == 5, "the fallback is silent"
+
     dlg = UploadOptionsDialog(tk_root)
     try:
         dlg._paths = [inhouse_dir]
@@ -697,26 +670,6 @@ def test_upload_dialog_tolerance_field(tk_root, monkeypatch, inhouse_dir, tmp_pa
     finally:
         if dlg.winfo_exists():
             dlg.destroy()
-
-
-@pytest.mark.display
-def test_upload_dialog_tolerance_falls_back_to_core_limit(tk_root, monkeypatch, inhouse_dir):
-    """A tolerance above core's limit quietly becomes the limit, with no error box."""
-    from core.config import MAX_ECHEM_TIME_TOLERANCE as limit
-    errors = []
-    monkeypatch.setattr("operaxn.dialog.messagebox.showerror",
-                        lambda *args, **kwargs: errors.append(args))
-    for text, expected in (("1e12", limit), (f"{limit:g}", limit), ("600", 600.0)):
-        dlg = UploadOptionsDialog(tk_root)
-        try:
-            dlg._paths = [inhouse_dir]
-            dlg.tolerance_var.set(text)
-            dlg._confirm()
-            assert dlg.result is not None and dlg.result.echem_time_tolerance == expected, text
-        finally:
-            if dlg.winfo_exists():
-                dlg.destroy()
-    assert errors == [], "the fallback is silent"
 
 
 def test_display_size_caps_stored_synchrotron_images(tmp_path):

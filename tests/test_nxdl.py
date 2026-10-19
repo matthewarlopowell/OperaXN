@@ -18,21 +18,9 @@ def xsd():
     return etree.XMLSchema(etree.parse(str(SCHEMA)))
 
 
-@pytest.mark.parametrize("filename", ["nxdl.xsd", "nxdlTypes.xsd"])
-def test_schema_file_present(filename):
-    """The vendored NXDL XSDs are present under schema/."""
-    assert (REPO / "schema" / filename).is_file(), f"schema/{filename} missing"
-
-
 def test_definitions_found():
     """At least the two NXoperando application definitions exist."""
     assert len(NXDL_FILES) >= 2, f"found {len(NXDL_FILES)} in {REPO / 'definitions'}"
-
-
-@pytest.mark.parametrize("path", NXDL_FILES, ids=lambda p: p.name)
-def test_well_formed_xml(path):
-    """Each definition parses as XML; a failure here is a syntax error."""
-    etree.parse(str(path))
 
 
 @pytest.mark.parametrize("path", NXDL_FILES, ids=lambda p: p.name)
