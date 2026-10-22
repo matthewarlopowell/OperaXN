@@ -57,9 +57,10 @@ from .ici import ICIWindow, maximise_window
 from .input import (
     process_paths, make_oned_arrays, make_twod_arrays,
     make_echem_arrays, get_correlated_data, make_neutron_arrays,
-    NeutronFileGrouper, SynchrotronFileGrouper, export_nxs, get_loaded_nxs_path,
+    NeutronFileGrouper, SynchrotronFileGrouper, export_nxs,
     add_standard_echem_files, experiment_metadata_rows, get_experiment_metadata,
-    get_standard_echem, clear_global_cache, cleanup_session_cache
+    get_standard_echem, clear_global_cache, cleanup_session_cache,
+    get_experiment_stem, get_loaded_data_source, reset_session
 )
 from .output import (
     plot_oned_data, plot_twod_data, plot_echem_data,
@@ -791,9 +792,7 @@ class PlotControls(BaseUIComponent):
 def _experiment_stem() -> str:
     """Return the loaded experiment's file stem: NeXus and Excel exports default to it,
     every other export to <stem>_<method>."""
-    loaded_path = get_loaded_nxs_path()
-    return (os.path.splitext(os.path.basename(loaded_path))[0] if loaded_path
-            else "experiment")
+    return get_experiment_stem() or "experiment"
 
 
 # ============================================================================
@@ -1017,6 +1016,8 @@ class OPERAXN(tk.Frame):
 
     def _upload_files(self) -> None:
         """Open the combined upload dialog and process the selection."""
+        if self._is_busy():
+            return
         # Non-modal: lift an already-open dialog instead of duplicating it
         if self._lift_existing_dialog('_upload_dialog'):
             return
@@ -1028,7 +1029,16 @@ class OPERAXN(tk.Frame):
         if options is None:
             return
 
+        # Non-modal dialog: a load, export or Clear may have happened while it was open
+        if self._warn_if_busy("upload"):
+            return
+
         if not options.paths and options.standard_echem_files:
+            if not self.state.scans:
+                self._show_message("No experiment loaded",
+                                   "Load experiment data before adding standard "
+                                   "electrochemistry on its own.", "warning")
+                return
             self._append_standard_echem_async(options.standard_echem_files)
             return
 
@@ -1036,11 +1046,7 @@ class OPERAXN(tk.Frame):
         if not self._clear_all():
             return
 
-        self.state.data_source = options.data_source
-        self.config.data_source = options.data_source
-        if options.data_source == DataSourceType.SYNCHROTRON:
-            self.config.synchrotron_max_size = options.display_size
-            self.state.synchrotron_max_size = options.display_size
+        self._apply_data_source(options.data_source, options.display_size)
 
         source_name = {
             DataSourceType.INHOUSE: "laboratory",
@@ -1052,19 +1058,59 @@ class OPERAXN(tk.Frame):
 
         self._process_files_async(options)
 
+    def _apply_data_source(self, source: DataSourceType, display_size: int) -> None:
+        """Set the data source on state and config; synchrotron also takes the 2D display size."""
+        self.state.data_source = source
+        self.config.data_source = source
+        if source == DataSourceType.SYNCHROTRON:
+            self.config.synchrotron_max_size = display_size
+            self.state.synchrotron_max_size = display_size
+
+    def _is_busy(self) -> bool:
+        """True while a load, an echem append or a NeXus/Excel export runs on a worker thread."""
+        return self.state.ui_state in (UIState.LOADING, UIState.EXPORTING)
+
+    def _set_busy(self, busy: Optional[UIState]) -> None:
+        """Mark a worker task as running (LOADING or EXPORTING) or finished (None); Upload and
+        Clear are disabled meanwhile, as both reset the state and session files it is using."""
+        self.state.ui_state = busy or UIState.IDLE
+        button_state = "disabled" if busy else "normal"
+        self.button_panel.update_states({"upload_files": button_state,
+                                         "clear_all": button_state})
+
+    def _warn_if_busy(self, action: str) -> bool:
+        """When a worker task runs, tell the user to retry `action` once it ends and return True."""
+        if not self._is_busy():
+            return False
+        self._show_message("Busy", "Wait for the current load or export to finish, "
+                                   f"then {action} again.", "warning")
+        return True
+
+    def _finish_busy(self, outcome: Optional[Callable[[], None]]) -> None:
+        """Run a worker's result handler on the Tk thread, then end the busy state."""
+        try:
+            if outcome is not None:
+                outcome()
+        finally:
+            self._set_busy(None)
+
     def _append_standard_echem_async(self, paths: List[str]) -> None:
         """Add analysis-only echem to the session without reloading it."""
-        self.state.ui_state = UIState.LOADING
+        # Also after the file picker: an export may have started while it was open
+        if self._warn_if_busy("add electrochemistry"):
+            return
+        self._set_busy(UIState.LOADING)
         self.file_list.show_progress("Adding electrochemistry data...")
 
         def process() -> None:
+            outcome = None
             try:
                 added = add_standard_echem_files(paths)
                 if not added:
-                    self.after(0, lambda: self._show_message(
+                    outcome = lambda: self._show_message(
                         "No echem data",
                         "No valid electrochemistry data was found in the selected files.",
-                        "warning"))
+                        "warning")
                     return
 
                 def complete() -> None:
@@ -1099,18 +1145,20 @@ class OPERAXN(tk.Frame):
                             f"Added {len(usable)} analysis source(s) to the current experiment.",
                             "info")
 
-                self.after(0, complete)
+                outcome = complete
             except Exception as exc:
                 logger.debug("Additional echem error: %s", traceback.format_exc())
-                self.after(0, lambda error=str(exc): self._show_message(
-                    "Error", f"Failed to add electrochemistry: {error}", "error"))
+                outcome = lambda error=str(exc): self._show_message(
+                    "Error", f"Failed to add electrochemistry: {error}", "error")
             finally:
-                self.state.ui_state = UIState.IDLE
+                self.after(0, lambda: self._finish_busy(outcome))
 
         threading.Thread(target=process, daemon=True).start()
 
     def _choose_additional_echem(self) -> None:
         """Choose analysis echem and append it to the active experiment."""
+        if self._warn_if_busy("add electrochemistry"):
+            return
         focused = self.master.focus_get()
         parent = focused.winfo_toplevel() if focused is not None else self.master
         paths = filedialog.askopenfilenames(
@@ -1123,7 +1171,7 @@ class OPERAXN(tk.Frame):
 
     def _process_files_async(self, options: UploadOptions) -> None:
         """Run process_paths on a worker thread; results return via after()."""
-        self.state.ui_state = UIState.LOADING
+        self._set_busy(UIState.LOADING)
 
         # Stored 2D size follows the single display-size setting
         # (synchrotron HDF only; EDF is always full resolution)
@@ -1133,6 +1181,7 @@ class OPERAXN(tk.Frame):
                          else 0)
 
         def process():
+            outcome = None
             try:
                 with self.performance.measure("file_processing"):
                     self.state.scans, self.state.echem_df, self.state.time_method = process_paths(
@@ -1152,19 +1201,27 @@ class OPERAXN(tk.Frame):
                     )
 
                 if not self.state.scans:
-                    self.after(0, lambda: self._show_message("Warning", "No valid scan data found.", "warning"))
+                    outcome = lambda: self._show_message(
+                        "Warning", "No valid scan data found.", "warning")
                     return
 
-                self.after(0, self._create_data_arrays)
+                # A directly opened .nxs is shown as the source it records
+                loaded_source = get_loaded_data_source() or options.data_source
+
+                def complete() -> None:
+                    self._apply_data_source(loaded_source, options.display_size)
+                    self._create_data_arrays()
+
+                outcome = complete
 
             except Exception as e:
                 logger.debug("Error details: %s", traceback.format_exc())
                 # bind now: `e` is unbound once the except block exits, and
                 # the lambda only runs later on the Tk main loop
                 error_message = f"Failed to process files: {e}"
-                self.after(0, lambda: self._show_message("Error", error_message, "error"))
+                outcome = lambda: self._show_message("Error", error_message, "error")
             finally:
-                self.state.ui_state = UIState.IDLE
+                self.after(0, lambda: self._finish_busy(outcome))
 
         threading.Thread(target=process, daemon=True).start()
 
@@ -1342,6 +1399,10 @@ class OPERAXN(tk.Frame):
         if not self.state.scans:
             return
 
+        # A worker task may be running: plotting must not end its busy state
+        previous_state = self.state.ui_state
+        # Plot Settings edits the config replaced below; reopen it on the new one
+        settings_position = self._close_plot_settings()
         try:
             self.state.ui_state = UIState.PLOTTING
 
@@ -1376,7 +1437,38 @@ class OPERAXN(tk.Frame):
             logger.debug("Error details: %s", traceback.format_exc())
             self._show_message("Error", f"Failed to create plots: {e}", "error")
         finally:
-            self.state.ui_state = UIState.IDLE
+            # A worker task can end inside a message box above (it runs the event
+            # loop); restoring its busy state then would lock Upload and Clear for good
+            if self.state.ui_state == UIState.PLOTTING:
+                self.state.ui_state = previous_state
+
+        # Reopened whenever a figure exists, also after a failed redraw of it
+        if settings_position is not None and self.fig is not None:
+            self._show_plot_settings()
+            dialog = self._plot_settings_dialog
+            if settings_position and dialog is not None:
+                dialog.geometry(settings_position)
+                # Again once mapped: a busy system can apply the dialog's own centring last
+                dialog.after_idle(lambda: dialog.winfo_exists()
+                                  and dialog.geometry(settings_position))
+
+    def _close_plot_settings(self) -> Optional[str]:
+        """Close an open Plot Settings dialog; return its '+x+y' position ('' if unknown),
+        or None when none was open."""
+        dialog = getattr(self, "_plot_settings_dialog", None)
+        self._plot_settings_dialog = None
+        if dialog is None:
+            return None
+        try:
+            if not dialog.winfo_exists():
+                return None
+            # geometry() gives the frame position the setter takes ("WxH+X+Y", X/Y may be -N)
+            _size, _, offsets = dialog.geometry().partition("+")
+            position = f"+{offsets}" if offsets else ""
+        except tk.TclError:
+            return None
+        self._close_dialog(dialog)
+        return position
 
     def _setup_plotting(self) -> None:
         """Reset config and clear existing plots before redraw."""
@@ -1386,7 +1478,9 @@ class OPERAXN(tk.Frame):
 
         clear_plot_cache()
 
-        # Clear existing plots
+        # Clear existing plots; pyplot keeps every figure it made until closed
+        if self.fig is not None:
+            plt.close(self.fig)
         self.fig = None
         self.axes = {}
         self.twod_image = None
@@ -1841,6 +1935,8 @@ class OPERAXN(tk.Frame):
         if not self.state.scans:
             self._show_message("Error", "No data loaded", "error")
             return
+        if self._warn_if_busy("export"):
+            return
 
         filename = filedialog.asksaveasfilename(
             parent=self.master,
@@ -1849,24 +1945,31 @@ class OPERAXN(tk.Frame):
             filetypes=[("NeXus files", "*.nxs"), ("All files", "*.*")],
             initialfile=f"{_experiment_stem()}.nxs"
         )
-        if not filename:
+        # Checked after the prompt too: a load or append may have started while it was open
+        if not filename or self._warn_if_busy("export"):
             return
 
+        # Clear and Upload would delete the session file being copied
+        self._set_busy(UIState.EXPORTING)
+
         def export_task():
+            outcome = None
             try:
                 # No listbox progress here: the scan list is populated during
                 # exports and progress messages would overwrite its entries
                 success, messages = export_nxs(filename)
                 if success:
-                    self.after(0, lambda: self._show_message(
-                        "Success", f"NeXus file exported to:\n{filename}", "info"))
+                    outcome = lambda: self._show_message(
+                        "Success", f"NeXus file exported to:\n{filename}", "info")
                 else:
-                    self.after(0, lambda: self._show_message(
-                        "Error", "NeXus export failed:\n" + "\n".join(messages), "error"))
+                    outcome = lambda: self._show_message(
+                        "Error", "NeXus export failed:\n" + "\n".join(messages), "error")
             except Exception as e:
                 logger.debug("NeXus export error: %s", traceback.format_exc())
-                self.after(0, lambda err=e: self._show_message(
-                    "Error", f"NeXus export failed: {err}", "error"))
+                outcome = lambda err=e: self._show_message(
+                    "Error", f"NeXus export failed: {err}", "error")
+            finally:
+                self.after(0, lambda: self._finish_busy(outcome))
 
         threading.Thread(target=export_task, daemon=True).start()
 
@@ -2036,6 +2139,7 @@ class OPERAXN(tk.Frame):
         Stop or closing the dialog abandons the GIF."""
         selected_scans = [self.state.scans[i - 1] for i in settings.scan_list
                           if 1 <= i <= len(self.state.scans)]
+        layout = self._gif_layout([scan["scan_num"] for scan in selected_scans])
 
         with tempfile.TemporaryDirectory() as temp_dir:
             try:
@@ -2047,7 +2151,8 @@ class OPERAXN(tk.Frame):
                         self._close_dialog(dialog)
                         return
 
-                    frame_file = self._create_gif_frame(temp_dir, idx, scan, settings.dpi)
+                    frame_file = self._create_gif_frame(temp_dir, idx, scan, settings.dpi,
+                                                        layout)
                     if frame_file:
                         frame_files.append(frame_file)
 
@@ -2061,7 +2166,8 @@ class OPERAXN(tk.Frame):
 
                 for frame_file in frame_files:
                     frame = imageio.v2.imread(frame_file)
-                    writer.append_data(frame)
+                    # Frames are opaque (white face), so dropping alpha loses nothing
+                    writer.append_data(frame[..., :3] if frame.ndim == 3 else frame)
 
                 writer.close()
                 self._close_dialog(dialog)
@@ -2077,8 +2183,27 @@ class OPERAXN(tk.Frame):
                 self._close_dialog(dialog)
                 self._show_message("Error", f"Failed to create GIF: {e}", "error")
 
-    def _create_gif_frame(self, temp_dir: str, index: int, scan: Dict[str, Any], dpi: int) -> Optional[str]:
-        """Render one scan to a PNG in temp_dir; None if it has no data."""
+    def _gif_layout(self, scan_nums: List[int]) -> Tuple[bool, bool, bool, bool]:
+        """Return (has_oned, has_twod, has_echem, has_neutron) for a GIF over scan_nums: a pane
+        is laid out when any of those scans has its data; the others show a placeholder."""
+        has_echem = len(self.state.echem_arrays.get("x", ())) > 0
+        if self.state.data_source == DataSourceType.NEUTRON:
+            return (False, False, has_echem,
+                    any(n in self.state.neutron_arrays for n in scan_nums))
+        return (any(n in self.state.oned_arrays for n in scan_nums),
+                any(n in self.state.twod_arrays for n in scan_nums),
+                has_echem, False)
+
+    @staticmethod
+    def _gif_placeholder(ax: plt.Axes, text: str, color: str = "grey") -> None:
+        """Mark a frame pane whose scan lacks that data, worded as in the main window."""
+        ax.text(0.5, 0.5, text, ha="center", va="center", transform=ax.transAxes,
+                color=color, fontsize=10)
+
+    def _create_gif_frame(self, temp_dir: str, index: int, scan: Dict[str, Any], dpi: int,
+                          layout: Optional[Tuple[bool, bool, bool, bool]] = None) -> Optional[str]:
+        """Render one scan to a PNG in temp_dir; None if it has no data. A GIF passes one
+        _gif_layout for all frames, so they share a size; without it the scan's own data decides."""
         scan_data = get_correlated_data(self.state.scans, self.state.echem_df, scan['scan_num'], self.state)
         if not scan_data:
             return None
@@ -2088,14 +2213,17 @@ class OPERAXN(tk.Frame):
 
         fig = None
         try:
-            if self.state.data_source == DataSourceType.NEUTRON:
-                has_oned, has_twod, has_neutron = False, False, scan_data.get("neutron") is not None
+            if layout is not None:
+                has_oned, has_twod, has_echem, has_neutron = layout
             else:
-                has_oned = scan_data.get("oned") is not None
-                has_twod = scan_data.get("twod") is not None
-                has_neutron = False
-
-            has_echem = self.state.echem_arrays.get("x", []).size > 0
+                if self.state.data_source == DataSourceType.NEUTRON:
+                    has_oned, has_twod = False, False
+                    has_neutron = scan_data.get("neutron") is not None
+                else:
+                    has_oned = scan_data.get("oned") is not None
+                    has_twod = scan_data.get("twod") is not None
+                    has_neutron = False
+                has_echem = len(self.state.echem_arrays.get("x", ())) > 0
 
             # Frames use throwaway figures: caching their artists would fill
             # the plot cache with entries keyed on freed axes (cf. export_single_scan)
@@ -2111,25 +2239,40 @@ class OPERAXN(tk.Frame):
             )
 
             if has_oned and "oned" in axes:
-                plot_oned_data(
-                    axes["oned"], scan_data["oned"]["x"], scan_data["oned"]["y"],
-                    scan_data["scan_num"], scan_data.get("echem_value"),
-                    scan_data.get("current_value"), plot_config=frame_config
-                )
+                if scan_data.get("oned") is not None:
+                    plot_oned_data(
+                        axes["oned"], scan_data["oned"]["x"], scan_data["oned"]["y"],
+                        scan_data["scan_num"], scan_data.get("echem_value"),
+                        scan_data.get("current_value"), plot_config=frame_config
+                    )
+                else:
+                    self._gif_placeholder(axes["oned"], "No 1D data for this scan")
 
             if has_twod and "twod" in axes:
-                plot_twod_data(
-                    axes["twod"], scan_data["twod"], scan_data["scan_num"],
-                    scan_data.get("echem_value"), scan_data.get("current_value"),
-                    intensity_limits, plot_config=frame_config
-                )
+                if scan_data.get("twod") is not None:
+                    plot_twod_data(
+                        axes["twod"], scan_data["twod"], scan_data["scan_num"],
+                        scan_data.get("echem_value"), scan_data.get("current_value"),
+                        intensity_limits, plot_config=frame_config
+                    )
+                elif self.state.twod_arrays.get(scan_data["scan_num"], {}).get("error"):
+                    self._gif_placeholder(axes["twod"],
+                                          "Error reading 2D data; try reopening dataset", "red")
+                else:
+                    self._gif_placeholder(axes["twod"], "No 2D data for this scan")
 
-            if has_neutron and "neutron" in scan_data:
-                plot_neutron_data(
-                    fig, axes, scan_data["neutron"], scan_data["scan_num"],
-                    scan_data.get("echem_value"), scan_data.get("current_value"),
-                    plot_config=frame_config
-                )
+            if has_neutron:
+                if scan_data.get("neutron") is not None:
+                    plot_neutron_data(
+                        fig, axes, scan_data["neutron"], scan_data["scan_num"],
+                        scan_data.get("echem_value"), scan_data.get("current_value"),
+                        plot_config=frame_config
+                    )
+                else:
+                    for key, ax in axes.items():
+                        if key.startswith("neutron_"):
+                            self._gif_placeholder(
+                                ax, f"No neutron data for scan {scan_data['scan_num']}")
 
             if has_echem and "echem" in axes:
                 scan_times = get_scan_time_positions(self.state.scans, self.state.echem_df,
@@ -2143,8 +2286,9 @@ class OPERAXN(tk.Frame):
                     plot_config=frame_config
                 )
 
-            fig.savefig(frame_file, dpi=dpi, bbox_inches="tight",
-                        facecolor='white', edgecolor='none')
+            # The whole figure, not a tight crop: the crop follows per-scan tick labels
+            # (neutron banks autoscale), so frames would differ in size and shift
+            fig.savefig(frame_file, dpi=dpi, facecolor='white', edgecolor='none')
 
             return frame_file
 
@@ -2157,6 +2301,8 @@ class OPERAXN(tk.Frame):
         Prompted and reported like _export_nxs, defaulting to the loaded experiment's name."""
         if not self.state.scans:
             self._show_message("Error", "No data loaded", "error")
+            return
+        if self._warn_if_busy("export"):
             return
 
         # Ask on the main thread, as _export_nxs does; Tk dialogs belong there
@@ -2171,10 +2317,14 @@ class OPERAXN(tk.Frame):
             ],
             initialfile=f"{_experiment_stem()}.xlsx"
         )
-        if not filename:
+        if not filename or self._warn_if_busy("export"):
             return
 
+        # The worker reads the scans and experiment metadata that Clear and Upload reset
+        self._set_busy(UIState.EXPORTING)
+
         def export_task():
+            outcome = None
             try:
                 with self.performance.measure("excel_export"):
                     summary_df = self._create_summary_dataframe()
@@ -2185,15 +2335,17 @@ class OPERAXN(tk.Frame):
                         self._save_to_excel(summary_df, filename)
 
                     kind = "CSV" if filename.endswith(".csv") else "Excel"
-                    self.after(0, lambda: self._show_message(
-                        "Success", f"{kind} file exported to:\n{filename}", "info"))
+                    outcome = lambda: self._show_message(
+                        "Success", f"{kind} file exported to:\n{filename}", "info")
 
             except Exception as e:
                 logger.debug("Excel export error: %s", traceback.format_exc())
                 # bind now: `e` is unbound once the except block exits, and
                 # the lambda only runs later on the Tk main loop
                 error_message = f"Excel export failed: {e}"
-                self.after(0, lambda: self._show_message("Error", error_message, "error"))
+                outcome = lambda: self._show_message("Error", error_message, "error")
+            finally:
+                self.after(0, lambda: self._finish_busy(outcome))
 
         threading.Thread(target=export_task, daemon=True).start()
 
@@ -2406,7 +2558,11 @@ class OPERAXN(tk.Frame):
 
     def _clear_all(self) -> bool:
         """Confirm, then close dialogs and reset state and UI to startup.
-        False when the user declines and nothing is cleared."""
+        False when the user declines or a worker task runs, and nothing is cleared."""
+        # A load would write its results into the cleared state; an export would
+        # lose the session file or data it is reading
+        if self._is_busy():
+            return False
         if self.state.scans:
             if not messagebox.askyesno("Confirm", "Clear all data?", parent=self.master):
                 return False
@@ -2416,6 +2572,8 @@ class OPERAXN(tk.Frame):
 
         self.state.reset()
         self.config = VisualiserConfig()
+        # Forget the experiment too, so nothing (e.g. an echem append) still targets its file
+        reset_session()
 
         # Clear UI
         for widget in self.plot_container.winfo_children():
@@ -2441,6 +2599,8 @@ class OPERAXN(tk.Frame):
 
         # Reset plot objects (evict cache entries keyed on the dying axes)
         clear_plot_cache()
+        if self.fig is not None:
+            plt.close(self.fig)
         self.fig = None
         self.axes = {}
         self.canvas = None

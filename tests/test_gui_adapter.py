@@ -28,12 +28,16 @@ from operaxn.input import (
     export_nxs,
     get_correlated_data,
     get_experiment_metadata,
+    get_experiment_stem,
+    get_loaded_data_source,
     get_loaded_nxs_path,
+    get_standard_echem,
     make_echem_arrays,
     make_neutron_arrays,
     make_oned_arrays,
     make_twod_arrays,
     process_paths,
+    reset_session,
 )
 
 import _builders
@@ -43,7 +47,8 @@ from _helpers import needs_fabio
 def _reset_session():
     """Restore operaxn.input._session to its pristine module state."""
     gui_input._session.update({"nxs_path": None, "input_paths": None,
-                               "exported": False, "standard_echem": []})
+                               "exported": False, "standard_echem": [],
+                               "stem": None, "data_source": None})
     gui_input._session.pop("global_metadata", None)
 
 
@@ -803,7 +808,8 @@ def test_excel_export_asks_for_the_file_before_its_thread(monkeypatch):
     monkeypatch.setattr(gui_module.threading, "Thread",
                         lambda *a, **k: started.append(k) or SimpleNamespace(start=lambda: None))
     fake = SimpleNamespace(master=None, state=SimpleNamespace(
-        scans=[{"scan_num": 1}], data_source=core.DataSourceType.INHOUSE))
+        scans=[{"scan_num": 1}], data_source=core.DataSourceType.INHOUSE),
+        _warn_if_busy=lambda action: False)
     OPERAXN._export_to_excel(fake)
     assert asked == [threading.current_thread()] and started == []
 
@@ -866,3 +872,346 @@ def test_plot_settings_apply_redraws_once(tk_root):
     finally:
         dlg.destroy()
     assert calls == [1]
+
+
+def test_direct_nxs_opens_as_its_recorded_source(neutron_dir, tmp_path):
+    """A directly opened .nxs is read and displayed as the source it records,
+    whatever was selected; an unreadable path gives None."""
+    process_paths([neutron_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.NEUTRON)
+    neutron_nxs = str(tmp_path / "neutron_run.nxs")
+    shutil.copy(get_loaded_nxs_path(), neutron_nxs)
+    assert core.read_data_source(neutron_nxs) == "neutron"
+    assert core.read_data_source(str(tmp_path / "missing.nxs")) is None
+
+    scans, _, _ = process_paths([neutron_nxs], time_method=TimeMethod.ABSOLUTE,
+                                data_source=DataSourceType.INHOUSE)
+    assert get_loaded_data_source() == DataSourceType.NEUTRON
+    assert make_neutron_arrays(scans), "neutron banks must load from a directly opened file"
+
+
+def test_working_copy_keeps_the_export_stem(inhouse_dir, tmp_path):
+    """Adding echem to an opened .nxs edits <stem>_working.nxs, but exports keep <stem>."""
+    from operaxn.gui import _experiment_stem
+    process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    user_nxs = str(tmp_path / "MyCell_run3.nxs")
+    export_nxs(user_nxs)
+    process_paths([user_nxs], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    assert get_experiment_stem() == "MyCell_run3"
+
+    std_echem_path = str(tmp_path / "standard_cycling.txt")
+    _std_echem_file(std_echem_path)
+    assert add_standard_echem_files([std_echem_path])
+    assert os.path.basename(get_loaded_nxs_path()) == "MyCell_run3_working.nxs"
+    assert get_experiment_stem() == "MyCell_run3" and _experiment_stem() == "MyCell_run3"
+    _discard(core.default_cache_path([inhouse_dir]))
+
+
+def test_reset_session_forgets_the_experiment(inhouse_dir, tmp_path):
+    """reset_session drops the unsaved cache file and every session field, so an echem
+    append afterwards has no experiment to target."""
+    std_echem_path = str(tmp_path / "standard_cycling.txt")
+    _std_echem_file(std_echem_path)
+    process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE,
+                  standard_echem_files=[std_echem_path])
+    cache_file = get_loaded_nxs_path()
+    assert get_standard_echem()
+    reset_session()
+    assert not os.path.exists(cache_file)
+    assert get_loaded_nxs_path() is None and get_experiment_stem() is None
+    assert get_standard_echem() == [] and get_experiment_metadata() == {}
+    assert get_loaded_data_source() is None
+    with pytest.raises(RuntimeError):
+        add_standard_echem_files([std_echem_path])
+
+
+def _gui_app(tk_root, monkeypatch):
+    """Return (window, app, messages), message boxes recorded. Workers run on the Tk thread:
+    after() from another thread needs a running mainloop, and tests pump with update()."""
+    from tkinter import Toplevel
+    import operaxn.gui as gui_module
+    win = Toplevel(tk_root)
+
+    class DeferredThread:
+        def __init__(self, target, daemon=None):
+            self._target = target
+
+        def start(self):
+            win.after(0, self._target)
+
+    monkeypatch.setattr(gui_module, "threading", SimpleNamespace(Thread=DeferredThread))
+    app = OPERAXN(master=win)
+    messages = []
+    monkeypatch.setattr(app, "_show_message", lambda *args: messages.append(args))
+    return win, app, messages
+
+
+def _wait_for_worker(win, app, timeout=120.0):
+    """Pump Tk events until the app's worker task (load, append or export) has finished."""
+    import time
+    deadline = time.monotonic() + timeout
+    while app._is_busy():
+        assert time.monotonic() < deadline, "worker task did not finish"
+        win.update()
+        time.sleep(0.01)
+    win.update()
+
+
+@pytest.mark.display
+def test_upload_and_clear_locked_while_loading(tk_root, monkeypatch, neutron_dir, tmp_path):
+    """Upload and Clear are disabled and refused while a load runs, and come back after;
+    a neutron .nxs opened under the default Laboratory source still loads as neutron."""
+    process_paths([neutron_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.NEUTRON)
+    neutron_nxs = str(tmp_path / "neutron_run.nxs")
+    shutil.copy(get_loaded_nxs_path(), neutron_nxs)
+
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    try:
+        opened = []
+        import operaxn.gui as gui_module
+        monkeypatch.setattr(gui_module, "UploadOptionsDialog",
+                            lambda *_a, **_k: opened.append(1))
+        options = UploadOptions(paths=[neutron_nxs], data_source=DataSourceType.INHOUSE,
+                                time_method=TimeMethod.ABSOLUTE, display_size=0,
+                                include_2d=False)
+        app._process_files_async(options)
+        buttons = app.button_panel.buttons
+        assert app._is_busy()
+        assert str(buttons["upload_files"].cget("state")) == "disabled"
+        assert str(buttons["clear_all"].cget("state")) == "disabled"
+        app._upload_files()
+        assert opened == [], "Upload must not open a dialog mid-load"
+        assert app._clear_all() is False, "Clear must be refused mid-load"
+
+        _wait_for_worker(win, app)
+        assert str(buttons["upload_files"].cget("state")) == "normal"
+        assert str(buttons["clear_all"].cget("state")) == "normal"
+        assert app.state.data_source == DataSourceType.NEUTRON
+        assert app.state.neutron_arrays, messages
+        assert messages and messages[-1][0] == "Success", messages
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
+def test_replot_closes_old_figure_and_rebinds_plot_settings(tk_root, monkeypatch, inhouse_dir):
+    """Each Plot frees the figure it replaces, an open Plot Settings dialog reopens on the
+    new config, and Clear frees the figure and forgets the session."""
+    import matplotlib.pyplot as plt
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    try:
+        options = UploadOptions(paths=[inhouse_dir], data_source=DataSourceType.INHOUSE,
+                                time_method=TimeMethod.ABSOLUTE, display_size=0,
+                                include_2d=False)
+        app._process_files_async(options)
+        _wait_for_worker(win, app)
+        assert app.state.scans, messages
+
+        def open_figures():
+            # Compare objects: pyplot hands a closed figure's number to the next one
+            return [manager.canvas.figure
+                    for manager in plt._pylab_helpers.Gcf.get_all_fig_managers()]
+
+        before = len(open_figures())
+        app._plot_data()
+        first = app.fig
+        app._show_plot_settings()
+        old_dialog = app._plot_settings_dialog
+        app._plot_data()
+        assert app.fig is not first, messages
+        assert all(fig is not first for fig in open_figures()), "replaced figure not closed"
+        assert len(open_figures()) == before + 1
+        new_dialog = app._plot_settings_dialog
+        assert new_dialog is not None and new_dialog is not old_dialog
+        assert not old_dialog.winfo_exists()
+        assert new_dialog.config is app.config, "Plot Settings must edit the live config"
+
+        monkeypatch.setattr("operaxn.gui.messagebox.askyesno", lambda *_a, **_k: True)
+        last = app.fig
+        assert app._clear_all()
+        assert all(fig is not last for fig in open_figures()), "Clear must close the figure"
+        assert get_loaded_nxs_path() is None and get_standard_echem() == []
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+def _load_inhouse(win, app, inhouse_dir):
+    """Run a raw in-house load through the app's worker and wait for it."""
+    app._process_files_async(UploadOptions(paths=[inhouse_dir],
+                                           data_source=DataSourceType.INHOUSE,
+                                           time_method=TimeMethod.ABSOLUTE,
+                                           display_size=0, include_2d=False))
+    _wait_for_worker(win, app)
+    assert app.state.scans
+
+
+@pytest.mark.display
+def test_failed_load_unlocks_upload_and_clear(tk_root, monkeypatch, inhouse_dir):
+    """A load whose processing raises shows the error and leaves Upload and Clear usable."""
+    import operaxn.gui as gui_module
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    try:
+        def boom(*_a, **_k):
+            raise RuntimeError("unreadable input")
+
+        monkeypatch.setattr(gui_module, "process_paths", boom)
+        app._process_files_async(UploadOptions(paths=[inhouse_dir],
+                                               data_source=DataSourceType.INHOUSE,
+                                               time_method=TimeMethod.ABSOLUTE,
+                                               display_size=0, include_2d=False))
+        _wait_for_worker(win, app)
+        assert messages and messages[-1][0] == "Error" and "unreadable input" in messages[-1][1]
+        buttons = app.button_panel.buttons
+        assert str(buttons["upload_files"].cget("state")) == "normal"
+        assert str(buttons["clear_all"].cget("state")) == "normal"
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
+def test_plot_keeps_or_ends_a_worker_busy_state_correctly(tk_root, monkeypatch, inhouse_dir):
+    """Plot during an echem append keeps the append's lock; if the append finishes inside
+    Plot's error box, the lock ends rather than coming back when the box closes."""
+    from operaxn.gui import UIState
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    try:
+        _load_inhouse(win, app, inhouse_dir)
+
+        app._set_busy(UIState.LOADING)  # an append is running
+        app._plot_data()
+        assert app._is_busy(), "a successful Plot must not end the append's lock"
+
+        # The append's completion runs while Plot's error box pumps events
+        def failing_figure(*_a, **_k):
+            raise RuntimeError("draw failed")
+
+        def message_box(*args):
+            messages.append(args)
+            app._finish_busy(None)
+
+        monkeypatch.setattr(app, "_create_figure", failing_figure)
+        monkeypatch.setattr(app, "_show_message", message_box)
+        app._plot_data()
+        assert messages[-1][0] == "Error"
+        assert not app._is_busy(), "the finished append must stay finished"
+        assert str(app.button_panel.buttons["clear_all"].cget("state")) == "normal"
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
+def test_echem_append_while_busy_is_refused_with_a_message(tk_root, monkeypatch, tmp_path):
+    """Echem picked while an export started (e.g. during ICI's file picker) is not dropped
+    silently: the user is told to add it again."""
+    from operaxn.gui import UIState
+    import operaxn.gui as gui_module
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    try:
+        started = []
+        monkeypatch.setattr(gui_module, "add_standard_echem_files", started.append)
+        app._set_busy(UIState.EXPORTING)
+        app._append_standard_echem_async([str(tmp_path / "std.txt")])
+        win.update()
+        assert started == [] and messages[-1][0] == "Busy", messages
+        assert "add electrochemistry" in messages[-1][1]
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
+def test_echem_only_upload_needs_a_loaded_experiment(tk_root, monkeypatch, tmp_path):
+    """Standard echem alone (dialog opened with data that a Clear then removed) is refused."""
+    import operaxn.gui as gui_module
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    try:
+        options = UploadOptions(paths=[], data_source=DataSourceType.INHOUSE,
+                                time_method=TimeMethod.ABSOLUTE, display_size=0,
+                                include_2d=False,
+                                standard_echem_files=[str(tmp_path / "std.txt")])
+        monkeypatch.setattr(gui_module, "UploadOptionsDialog",
+                            lambda *_a, **_k: SimpleNamespace(get_result=lambda: options))
+        appended = []
+        monkeypatch.setattr(app, "_append_standard_echem_async", appended.append)
+        app._upload_files()
+        assert appended == [] and messages[-1][0] == "No experiment loaded", messages
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
+def test_exports_lock_upload_and_clear(tk_root, monkeypatch, inhouse_dir, tmp_path):
+    """NeXus and Excel exports hold the busy lock, so Clear cannot delete the file being
+    copied or the scans being summarised."""
+    from operaxn.gui import UIState
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    try:
+        _load_inhouse(win, app, inhouse_dir)
+        cache_file = get_loaded_nxs_path()
+        target = {"path": str(tmp_path / "exported.nxs")}
+        monkeypatch.setattr("operaxn.gui.filedialog.asksaveasfilename",
+                            lambda *_a, **_k: target["path"])
+        monkeypatch.setattr("operaxn.gui.messagebox.askyesno", lambda *_a, **_k: True)
+
+        app._export_nxs()
+        assert app.state.ui_state == UIState.EXPORTING
+        assert app._clear_all() is False and os.path.isfile(cache_file)
+        app._export_nxs()
+        assert messages[-1][0] == "Busy", "a second export must wait"
+        _wait_for_worker(win, app)
+        assert messages[-1][0] == "Success", messages
+        assert os.path.isfile(target["path"])
+
+        target["path"] = str(tmp_path / "summary.csv")
+        app._export_to_excel()
+        assert app.state.ui_state == UIState.EXPORTING
+        assert app._clear_all() is False and app.state.scans
+        _wait_for_worker(win, app)
+        assert messages[-1][0] == "Success", messages
+        assert os.path.isfile(target["path"])
+
+        assert str(app.button_panel.buttons["clear_all"].cget("state")) == "normal"
+        assert app._clear_all() and os.path.isfile(str(tmp_path / "exported.nxs"))
+        _discard(cache_file)
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
+def test_upload_dialog_takes_source_from_nxs(tk_root, neutron_dir, inhouse_dir, tmp_path):
+    """Selecting a directly opened .nxs shows and locks its recorded source, with a grey note;
+    choosing raw data again restores the user's own choice."""
+    from operaxn.config import OPERAXNTheme
+    process_paths([neutron_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.NEUTRON)
+    neutron_nxs = str(tmp_path / "neutron_run.nxs")
+    shutil.copy(get_loaded_nxs_path(), neutron_nxs)
+
+    dlg = UploadOptionsDialog(tk_root)
+    try:
+        dlg.source_var.set("synchrotron")
+        dlg._paths = [neutron_nxs]
+        dlg._update_option_states()
+        assert dlg.source_var.get() == "neutron"
+        assert all(str(r.cget("state")) == "disabled" for r in dlg._source_radios)
+        assert "source and generation options" in dlg.note_var.get()
+        assert dlg._note_label.cget("fg") == OPERAXNTheme.COLORS['text_secondary']
+
+        dlg._paths = [inhouse_dir]
+        dlg._update_option_states()
+        assert dlg.source_var.get() == "synchrotron"
+        assert all(str(r.cget("state")) == "normal" for r in dlg._source_radios)
+        assert dlg.note_var.get() == ""
+    finally:
+        if dlg.winfo_exists():
+            dlg.destroy()

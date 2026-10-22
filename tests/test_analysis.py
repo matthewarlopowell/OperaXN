@@ -903,6 +903,7 @@ def test_clear_all_clears_plot_cache():
         button_panel=SimpleNamespace(update_states=lambda states: None),
         controls=SimpleNamespace(grid_remove=lambda: None),
         fig=None, axes={}, canvas=None, twod_image=None,
+        _is_busy=lambda: False,
     )
     OPERAXN._clear_all(fake)
     assert output_module._plot_cache.cache == {}, "clear-all left cache entries"
@@ -991,6 +992,121 @@ def test_gif_frame_marks_scan_position_not_frame_index(monkeypatch, tmp_path):
     assert frame is not None
     assert captured["idx"] == 4, \
         f"frame 0 of a range starting at scan 5 must mark index 4, got {captured['idx']}"
+
+
+def _gif_fake(data_source, **arrays):
+    """Return a stand-in app for the GIF frame methods: no echem, the given plot arrays."""
+    plot_arrays = {"oned_arrays": {}, "twod_arrays": {}, "neutron_arrays": {}, **arrays}
+    return SimpleNamespace(
+        state=SimpleNamespace(data_source=data_source, scans=[], echem_df=pd.DataFrame(),
+                              echem_arrays={"x": np.array([])}, intensity_limits={},
+                              time_method="absolute", **plot_arrays),
+        config=operaxn.VisualiserConfig(data_source=data_source),
+        _gif_placeholder=OPERAXN._gif_placeholder,
+    )
+
+
+def _frame_size(path):
+    """Return a PNG frame's (width, height)."""
+    from PIL import Image
+    with Image.open(path) as image:
+        return image.size
+
+
+def test_gif_frames_share_one_size_when_2d_is_missing(monkeypatch, tmp_path):
+    """A range mixing scans with and without a 2D image renders every frame at one size,
+    the scan without one showing the placeholder."""
+    x = np.linspace(10, 80, 50)
+    image = (np.arange(64.0).reshape(8, 8) + 1) * 10
+
+    def correlated(scans, echem_df, scan_num, state=None):
+        return {"scan_num": scan_num, "oned": {"x": x, "y": np.arange(50.0) * scan_num},
+                "twod": image if scan_num == 2 else None}
+
+    monkeypatch.setattr(gui_module, "get_correlated_data", correlated)
+    texts = []
+    fake = _gif_fake(gui_module.DataSourceType.INHOUSE,
+                     **{"oned_arrays": {1: {}, 2: {}}, "twod_arrays": {2: {}}})
+    fake._gif_placeholder = lambda ax, text, *_: texts.append(text)
+    layout = OPERAXN._gif_layout(fake, [1, 2])
+    assert layout == (True, True, False, False), layout
+    sizes = [_frame_size(OPERAXN._create_gif_frame(fake, str(tmp_path), i, {"scan_num": n},
+                                                   dpi=50, layout=layout))
+             for i, n in enumerate((1, 2))]
+    assert sizes[0] == sizes[1], sizes
+    assert texts == ["No 2D data for this scan"], texts
+
+
+def test_generate_gif_writes_one_frame_size_for_mixed_2d(monkeypatch, tmp_path):
+    """The real GIF writer lays every frame out alike, so a mixed-2D range has one size.
+    Frame PNGs are measured as rendered: a GIF read back always has its one canvas size."""
+    from operaxn.dialog import GIFSettings
+    x = np.linspace(10, 80, 50)
+    image = (np.arange(64.0).reshape(8, 8) + 1) * 10
+
+    def correlated(scans, echem_df, scan_num, state=None):
+        return {"scan_num": scan_num, "oned": {"x": x, "y": np.arange(50.0) * scan_num},
+                "twod": image if scan_num == 2 else None}
+
+    monkeypatch.setattr(gui_module, "get_correlated_data", correlated)
+    fake = _gif_fake(gui_module.DataSourceType.INHOUSE,
+                     **{"oned_arrays": {1: {}, 2: {}}, "twod_arrays": {2: {}}})
+    fake.state.scans = [{"scan_num": 1}, {"scan_num": 2}]
+    fake._gif_layout = lambda nums: OPERAXN._gif_layout(fake, nums)
+    sizes = []
+
+    def render(*args):
+        frame = OPERAXN._create_gif_frame(fake, *args)
+        sizes.append(_frame_size(frame))
+        return frame
+
+    fake._create_gif_frame = render
+    messages = []
+    fake._show_message = lambda *args: messages.append(args)
+    fake._close_dialog = lambda dialog: None
+    dialog = SimpleNamespace(begin_progress=lambda *a: None, update_progress=lambda *a: True)
+    out = str(tmp_path / "mixed.gif")
+    OPERAXN._generate_gif(fake, out, GIFSettings(fps=2, dpi=40, loop=0, scan_list=[1, 2]),
+                          dialog)
+    assert messages and messages[-1][0] == "Success", messages
+    assert len(sizes) == 2 and sizes[0] == sizes[1], sizes
+
+
+def test_gif_marks_an_unreadable_2d_image_as_the_main_window_does(monkeypatch, tmp_path):
+    """A scan whose 2D image failed to load gets the main window's red error text."""
+    x = np.linspace(10, 80, 50)
+    monkeypatch.setattr(gui_module, "get_correlated_data",
+                        lambda *a, **k: {"scan_num": 1,
+                                         "oned": {"x": x, "y": np.arange(50.0)},
+                                         "twod": None})
+    marks = []
+    fake = _gif_fake(gui_module.DataSourceType.INHOUSE,
+                     **{"oned_arrays": {1: {}}, "twod_arrays": {1: {"error": True}}})
+    fake._gif_placeholder = lambda ax, text, color="grey": marks.append((text, color))
+    layout = OPERAXN._gif_layout(fake, [1])
+    assert OPERAXN._create_gif_frame(fake, str(tmp_path), 0, {"scan_num": 1}, dpi=40,
+                                     layout=layout)
+    assert marks == [("Error reading 2D data; try reopening dataset", "red")], marks
+
+
+def test_gif_neutron_frames_keep_size_as_intensity_grows(monkeypatch, tmp_path):
+    """Neutron banks autoscale per scan; their frames must still all be one size."""
+    x = np.linspace(1000, 20000, 200)
+
+    def correlated(scans, echem_df, scan_num, state=None):
+        scale = 1.0 if scan_num == 1 else 30000.0
+        return {"scan_num": scan_num,
+                "neutron": {str(b): {"tof": {"x": x, "y": scale * (1 + np.sin(x / 900))}}
+                            for b in range(1, 6)}}
+
+    monkeypatch.setattr(gui_module, "get_correlated_data", correlated)
+    fake = _gif_fake(gui_module.DataSourceType.NEUTRON,
+                     **{"neutron_arrays": {1: {}, 2: {}}})
+    layout = OPERAXN._gif_layout(fake, [1, 2])
+    sizes = [_frame_size(OPERAXN._create_gif_frame(fake, str(tmp_path), i, {"scan_num": n},
+                                                   dpi=50, layout=layout))
+             for i, n in enumerate((1, 2))]
+    assert sizes[0] == sizes[1], sizes
 
 
 def test_current_only_refresh_never_spawns_empty_twin():

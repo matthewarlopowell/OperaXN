@@ -51,6 +51,8 @@ _session: Dict[str, Any] = {
     "input_paths": None,  # None = opened a .nxs directly (user's own file)
     "exported": False,
     "standard_echem": [],
+    "stem": None,  # export-name stem; kept when a working copy replaces nxs_path
+    "data_source": None,  # DataSourceType the loaded experiment is displayed as
 }
 
 
@@ -79,6 +81,13 @@ def cleanup_session_cache() -> None:
             logger.debug(f"Removed cache images dir: {images_dir}")
     except OSError as e:
         logger.debug(f"Could not remove cache file {path}: {e}")
+
+
+def reset_session() -> None:
+    """Clean up the session cache (as cleanup_session_cache), then forget the loaded experiment."""
+    cleanup_session_cache()
+    _session.update(nxs_path=None, input_paths=None, exported=False,
+                    standard_echem=[], global_metadata={}, stem=None, data_source=None)
 
 
 # ============================================================================
@@ -189,8 +198,8 @@ def process_paths(selected_paths: List[str],
                   echem_time_tolerance: Optional[float] = None
                   ) -> tuple:
     """Generate (or open) the canonical .nxs, load it and return (scan_dicts, echem_df, method).
-    time_method defaults to absolute and echem_time_tolerance (s) to the core default; options
-    after data_source only shape the generated file and are ignored for a directly opened .nxs."""
+    time_method defaults to absolute and echem_time_tolerance (s) to the core default. A directly
+    opened .nxs ignores the generation options after data_source and shows its recorded source."""
     paths = [str(p) for p in selected_paths]
     empty = ([], pd.DataFrame(columns=["timestamp", "echem_data", "current"]),
              TimeMethod.ABSOLUTE.value)
@@ -245,14 +254,25 @@ def process_paths(selected_paths: List[str],
     _session["input_paths"] = None if direct_nxs else paths
     _session["exported"] = False
 
+    _session["stem"] = os.path.splitext(os.path.basename(nxs_path))[0]
+
     model = load(nxs_path)
     _session["global_metadata"] = dict(model.global_metadata or {})
     _session["standard_echem"] = [dict(item) for item in model.standard_echem]
 
-    if model.data_source and model.data_source != data_source.value:
-        logger.warning(
-            f"Loaded file was generated as '{model.data_source}' but "
-            f"'{data_source.value}' was selected; displaying file contents as-is")
+    # A directly opened file is shown as the source it records, whatever
+    # was selected; an unknown or missing record keeps the selection
+    if direct_nxs and model.data_source and model.data_source != data_source.value:
+        try:
+            recorded = DataSourceType(model.data_source)
+        except ValueError:
+            logger.warning(f"Unknown data source '{model.data_source}' in "
+                           f"{os.path.basename(nxs_path)}; using '{data_source.value}'")
+        else:
+            logger.info(f"Opening {os.path.basename(nxs_path)} as its recorded "
+                        f"source '{recorded.value}' (selected '{data_source.value}')")
+            data_source = recorded
+    _session["data_source"] = data_source
 
     scan_dicts = [_scan_to_dict(sd) for sd in model.scans]
     echem_df = model.echem_df if model.echem_df is not None else pd.DataFrame(
@@ -274,6 +294,16 @@ def process_paths(selected_paths: List[str],
 def get_loaded_nxs_path() -> Optional[str]:
     """Return the path of the canonical .nxs backing the loaded experiment."""
     return _session["nxs_path"]
+
+
+def get_experiment_stem() -> Optional[str]:
+    """Return the export-name stem: the loaded file's, kept after an echem working copy."""
+    return _session.get("stem")
+
+
+def get_loaded_data_source() -> Optional[DataSourceType]:
+    """Return the source the loaded experiment is shown as (a direct .nxs: its recorded one)."""
+    return _session.get("data_source")
 
 
 def get_experiment_metadata() -> Dict[str, Any]:

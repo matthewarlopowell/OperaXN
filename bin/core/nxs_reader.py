@@ -75,6 +75,31 @@ def is_canonical_nxs(path: str) -> bool:
         return False
 
 
+def read_data_source(path: str) -> Optional[str]:
+    """Return the data source ('inhouse', 'synchrotron', 'neutron') a canonical .nxs records.
+    None if unrecorded or unreadable; reads only load()'s fields, in its precedence, no scans."""
+    try:
+        with h5py.File(path, 'r') as f:
+            entry = f.get('entry')
+            if _entry_is_canonical(entry):
+                process = entry.get('process')
+                value = (_dataset_scalar(process, 'data_source')
+                         if isinstance(process, h5py.Group) else None)
+                if value is None:
+                    value = entry.attrs.get('data_source')
+            else:
+                gm = f.get('global_metadata')
+                if not isinstance(gm, h5py.Group):
+                    return None
+                value = _dataset_scalar(gm, 'data_source')
+                if value is None:
+                    value = gm.attrs.get('data_source')
+            value = _decode(value)
+            return value if isinstance(value, str) and value else None
+    except Exception:
+        return None
+
+
 def load(path: str) -> ExperimentModel:
     """Load a canonical .nxs file into an ExperimentModel."""
     model = ExperimentModel(source_path=os.path.abspath(path))

@@ -19,7 +19,7 @@ from typing import Dict, List, Callable, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 
-from core import ECHEM_TIME_TOLERANCE, TimeMethod, is_canonical_nxs
+from core import ECHEM_TIME_TOLERANCE, TimeMethod, is_canonical_nxs, read_data_source
 from core.config import MAX_ECHEM_TIME_TOLERANCE
 
 from .output import clear_plot_cache
@@ -972,8 +972,8 @@ class GIFSettingsDialog(BaseDialog):
 # ============================================================================
 
 class UploadOptionsDialog(BaseDialog):
-    """Single upload window for every load and generation option.
-    Generation-only options grey out for a directly opened .nxs."""
+    """Single upload window for every load and generation option. A directly opened .nxs
+    locks the source to the one it records and greys out generation-only options."""
 
     DISPLAY_OPTIONS = ["No downsampling", "4096", "2048", "1024", "512"]
 
@@ -989,7 +989,10 @@ class UploadOptionsDialog(BaseDialog):
         self._paths: List[str] = []
         self._std_echem: List[str] = []
         self._metadata_open = False
-        self._canonical_cache: Tuple[str, bool] = ("", False)
+        # (path, is canonical, recorded data source) for the last single .nxs checked
+        self._canonical_cache: Tuple[str, bool, Optional[str]] = ("", False, None)
+        # The user's source choice, held while a .nxs's recorded source overrides it
+        self._source_before_nxs: Optional[str] = None
         self._create_widgets()
         self._update_option_states()
         self._resize_to_content()
@@ -1081,10 +1084,13 @@ class UploadOptionsDialog(BaseDialog):
                                  font_type="heading", pady=(14, 4))
         source_frame = self._block()
         self.source_var = tk.StringVar(value="inhouse")
+        self._source_radios: List[tk.Widget] = []
         for value, label in self.SOURCES:
-            self.create_themed_radiobutton(
+            radio = self.create_themed_radiobutton(
                 source_frame, label, self.source_var, value,
-                command=self._update_option_states).pack(anchor="w", pady=1)
+                command=self._update_option_states)
+            radio.pack(anchor="w", pady=1)
+            self._source_radios.append(radio)
 
         # --- Time correlation ---
         self.create_themed_label(self._body, "Time correlation:",
@@ -1246,7 +1252,7 @@ class UploadOptionsDialog(BaseDialog):
         self._note_label = tk.Label(self, textvariable=self.note_var,
                                     font=OPERAXNTheme.FONTS['small'],
                                     bg=OPERAXNTheme.COLORS['bg_primary'],
-                                    fg=OPERAXNTheme.COLORS['warning'])
+                                    fg=OPERAXNTheme.COLORS['text_secondary'])
 
         self._scroll_outer.pack(side="top", fill="both", expand=True)
 
@@ -1332,12 +1338,31 @@ class UploadOptionsDialog(BaseDialog):
             return False
         path = self._paths[0]
         if self._canonical_cache[0] != path:
-            self._canonical_cache = (path, is_canonical_nxs(path))
+            canonical = is_canonical_nxs(path)
+            self._canonical_cache = (path, canonical,
+                                     read_data_source(path) if canonical else None)
         return self._canonical_cache[1]
 
+    def _sync_source_with_file(self, direct_nxs: bool) -> bool:
+        """Show and lock a directly opened .nxs's recorded source, restoring the user's choice
+        after. True while the file sets it; an unrecorded or unknown source stays selectable."""
+        recorded = self._canonical_cache[2] if direct_nxs else None
+        from_file = recorded in {value for value, _ in self.SOURCES}
+        if from_file:
+            if self._source_before_nxs is None:
+                self._source_before_nxs = self.source_var.get()
+            self.source_var.set(recorded)
+        elif self._source_before_nxs is not None:
+            self.source_var.set(self._source_before_nxs)
+            self._source_before_nxs = None
+        for radio in self._source_radios:
+            radio.config(state="disabled" if from_file else "normal")
+        return from_file
+
     def _update_option_states(self) -> None:
-        """Enable/disable generation-only options to match the selection."""
+        """Enable/disable generation-only options and lock the source to match the selection."""
         direct_nxs = self._is_direct_nxs()
+        source_from_file = self._sync_source_with_file(direct_nxs)
         source = self.source_var.get()
 
         # Size applies to synchrotron HDF data (display, and storage if included)
@@ -1360,8 +1385,10 @@ class UploadOptionsDialog(BaseDialog):
         for entry in self._meta_entries:
             entry.config(state=gen_state)
 
-        note = ("Opening a NeXus file: generation options are fixed in the file"
-                if direct_nxs else "")
+        note = ("" if not direct_nxs
+                else "Opening a NeXus file: source and generation options are fixed in the file"
+                if source_from_file
+                else "Opening a NeXus file: generation options are fixed in the file")
         self.note_var.set(note)
         if bool(note) != self._note_label.winfo_manager().startswith("pack"):
             if note:
