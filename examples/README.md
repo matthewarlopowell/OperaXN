@@ -21,10 +21,11 @@ Then:
 
 1. Launch the GUI: `operaxn`
 2. In the upload dialog, select the data source (Laboratory X-ray diffraction
-   for `laboratory/`, neutron for `neutron/`), point it at the generated folder
-   and load with **absolute** time correlation.
+   for `laboratory/`, Time-of-flight neutron diffraction for `neutron/`), point
+   it at the generated folder and load with **absolute** time correlation.
 3. Each diffraction scan is now annotated with the electrochemical state of
-   the cell at acquisition time: the laboratory scan at 10:05 correlates to
+   the cell at acquisition time (shown in the scan list; press **Plot** to
+   draw the patterns): the laboratory scan at 10:05 correlates to
    3.76 V (its exposure midpoint 10:06), the neutron scan to 3.85 V (its
    10:15 logbook midpoint).
 4. Export the NeXus file to see the standardised `.nxs` output; it conforms
@@ -46,6 +47,7 @@ at a folder containing one or more of the following, by exact name:
 | `neutron_tof.zip` | Neutron time-of-flight: logbook + per-bank TOF/d files + echem |
 | `synchrotron_i11/` | Synchrotron (Diamond i11-1): `.nxs` + `.hdf` + integrated `.xy` files |
 | `lab_xrd_full/` | Laboratory XRD, full: 1D `.dat` + 2D `.edf` + echem |
+| `polaris/POLARIS164798-164802.nxs` | Mantid-processed POLARIS `.nxs`: instrument profile check |
 
 Public datasets in this layout are being prepared for release. Until they
 land, the tests' expected values are calibrated to the authors' local

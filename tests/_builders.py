@@ -3,12 +3,14 @@
 Defaults make correlation exact: echem runs at 60 s cadence from 10:00
 with V = 3.7 + 0.01/step, so an XRD scan at 10:05 with 120 s exposure
 correlates at its 10:06 midpoint to V = 3.76, and a neutron scan logged
-10:00-10:30 at its 10:15 midpoint to V = 3.85. The plain family
-(50/40-point grids, 3 scans, simple logbook) serves most tests; the
-DETAILED_* family (30-point grids, 2 scans, richer logbook) covers the
-Sigma column, POLARIS Mantid headers, EDF harvest and trailing-timestamp
-logbook layout, so keep the two apart. examples/make_example_data.py
-duplicates these writers standalone: keep the values in sync.
+10:00-10:30 at its 10:15 midpoint to V = 3.85. Three families share these
+values: the plain family (50/40-point grids, 3 scans, simple logbook), the
+real-file shapes (instrument export layouts; they back the
+inhouse_dir and neutron_dir fixtures) and the DETAILED_* family (30-point
+grids, 2 scans, richer logbook), which covers the Sigma column, POLARIS
+Mantid headers, EDF harvest and trailing-timestamp logbook layout, so keep
+it apart. examples/make_example_data.py duplicates the plain writers
+standalone: keep the values in sync.
 """
 import os
 import zipfile
@@ -34,8 +36,7 @@ def inhouse_scan_y(i):
 
 
 def write_xrd_dat(path, timestamp, exposure="120.0", y=None):
-    """Write an XRD .dat: '# Date <timestamp>', '# ExposureTime', a column header, x/y rows.
-    The timestamp must be the last token of the '# Date' line."""
+    """Write an XRD .dat: '# Date <timestamp>', '# ExposureTime', a column header, x/y rows."""
     if y is None:
         y = inhouse_scan_y(1)
     lines = [f"# Date {timestamp}", f"# ExposureTime {exposure}", "# tth Intensity"]
@@ -127,16 +128,25 @@ CYCLING_PROTOCOL = {
 }
 
 
-def write_edf_image(path, timestamp, offset=1.0, monitor="0"):
-    """Write an 8x8 EDF image with the harvested header fields; ``monitor`` "0" means none."""
+def write_edf_image(path, timestamp, offset=1.0, monitor="0", **header):
+    """Write an 8x8 EDF image with the harvested header fields (``header`` overrides any)."""
     import fabio
     img = fabio.edfimage.EdfImage(
         data=np.arange(64, dtype=np.float32).reshape(8, 8) + offset,
         header={"Date": timestamp, "ExposureTime": "120.0",
                 "WaveLength": "1.541891e-10", "SampleDistance": "0.177",
                 "DetectorModel": "PILATUS3 100K", "Monitor": monitor,
-                "pilct1": "155717", "Comment": "Cell_TEST"})
+                "pilct1": "155717", "Comment": "Cell_TEST", **header})
     img.write(path)
+
+
+def write_dated_pairs(dirpath, dat_dates, edf_dates, echem_date="05/02/2024"):
+    """Write scan_00i .dat/.edf pairs with the given Date texts and echem from 10:00 to 10:39."""
+    os.makedirs(dirpath, exist_ok=True)
+    for i, (dat_date, edf_date) in enumerate(zip(dat_dates, edf_dates), start=1):
+        write_xrd_dat(os.path.join(dirpath, f"scan_{i:03d}.dat"), dat_date, y=inhouse_scan_y(i))
+        write_edf_image(os.path.join(dirpath, f"scan_{i:03d}.edf"), edf_date, offset=float(i))
+    write_echem_txt(os.path.join(dirpath, "echem.txt"), date=echem_date)
 
 
 def write_twod_dir(dirpath):
@@ -157,41 +167,165 @@ def write_twod_zip(zip_path, workdir):
 
 
 def write_detailed_inhouse_dir(dirpath):
-    """Write two 30-point XRD scans with Sigma, echem, and an EDF image when fabio is present."""
+    """Write two 30-point azimAvg scans, EC-Lab echem, and an EDF image when fabio is present."""
     os.makedirs(dirpath)
     for i, ts in enumerate(DETAILED_SCAN_TIMES, start=1):
-        y = 100.0 * i + np.arange(30)
-        e = np.sqrt(y)
-        lines = [f"# Date {ts}", "# ExposureTime 120.0", "# tth Intensity Sigma"]
-        lines += [f"{x:.10f} {v:.10f} {sig:.10f}"
-                  for x, v, sig in zip(DETAILED_ONED_X, y, e)]
-        with open(os.path.join(dirpath, f"scan_{i:03d}.dat"), "w") as f:
-            f.write("\n".join(lines) + "\n")
-    write_echem_txt(os.path.join(dirpath, "echem.txt"))
+        write_lab_dat(os.path.join(dirpath, f"scan_{i:03d}.dat"), ts,
+                      y=100.0 * i + np.arange(30), x=DETAILED_ONED_X)
+    write_eclab_echem(os.path.join(dirpath, "echem.txt"))
     if core.FABIO_AVAILABLE:
         write_edf_image(os.path.join(dirpath, "image_001.edf"),
                         DETAILED_SCAN_TIMES[0])
 
 
 def write_detailed_neutron_dir(dirpath):
-    """Write a trailing-timestamp logbook, 2 Mantid POLARIS banks x (TOF, d) and 40-row echem."""
-    os.makedirs(dirpath)
-    with open(os.path.join(dirpath, "logbook.txt"), "w") as f:
-        f.write(DETAILED_LOGBOOK_LINE + "\n")
+    """Write a POLARIS-shaped run: logbook, 2 banks x (TOF, d) in dat_files/, EC-Lab echem."""
+    data = os.path.join(dirpath, "dat_files")
+    os.makedirs(data)
+    write_logbook(os.path.join(dirpath, "SC1_log_book.txt"), [DETAILED_LOGBOOK_LINE + "\t"])
+    n = len(DETAILED_TOF_X)
     for bank in (1, 2):
-        with open(os.path.join(dirpath, f"123456-{bank}-0.dat"), "w") as f:
-            f.write("XYDATA\n# File generated by Mantid, Instrument POLARIS\n"
-                    "# The X-axis unit is: Time-of-flight, The Y-axis unit is:  per microsecond\n"
-                    f"# Spectrum {bank}\n# Time-of-flight  Y  E\n")
-            f.write("\n".join(f"{x:.6f} {50.0 + bank + i:.6f} {0.3 + 0.001 * i:.6f}"
-                              for i, x in enumerate(DETAILED_TOF_X)) + "\n")
-        with open(os.path.join(dirpath, f"123456-{bank}-d-0.dat"), "w") as f:
-            f.write("XYDATA\n# File generated by Mantid, Instrument POLARIS\n"
-                    "# The X-axis unit is: d-Spacing, The Y-axis unit is:  per Angstrom\n"
-                    f"# Spectrum {bank}\n# d-Spacing  Y  E\n")
-            f.write("\n".join(f"{x:.6f} {70.0 + bank + i:.6f} {0.2:.6f}"
-                              for i, x in enumerate(DETAILED_D_X)) + "\n")
-    write_echem_txt(os.path.join(dirpath, "echem.txt"))
+        tof_name, d_name = polaris_bank_names("123456", bank)
+        write_mantid_bank(os.path.join(data, tof_name), "POLARIS", "tof", bank, DETAILED_TOF_X,
+                          50.0 + bank + np.arange(n), 0.3 + 0.001 * np.arange(n))
+        write_mantid_bank(os.path.join(data, d_name), "POLARIS", "d", bank, DETAILED_D_X,
+                          70.0 + bank + np.arange(n), np.full(n, 0.2))
+    write_eclab_echem(os.path.join(dirpath, "LDE_run1_SC1_C01_Absolute.txt"))
+
+
+# ============================================================================
+# Real-file shapes
+# ============================================================================
+# Tiny synthetic files laid out like the instrument exports in the reference
+# sets, so tests take the code paths real data takes: the in-house azimAvg .dat
+# (a '#' key block, then an uncommented column line), EC-Lab absolute-time echem
+# (header ending in a tab, CRLF, E+000 numbers), Mantid focussed banks (leading
+# XYDATA line; POLARIS CRLF, WISH LF with "Spectrum N "), POLARIS and WISH bank
+# names, and ISIS logbook lines (trailing tab, unpadded day). Values reuse the
+# grids above, so the 3.76 V / 3.85 V correlation anchors still hold.
+
+LAB_DAT_RULE = "#" * 80
+LAB_DAT_COLUMNS = ("    tth(°)                Intensity(a.u.)            "
+                   "Sigma_I(a.u.)            ")
+MANTID_AXES = {"tof": ("Time-of-flight", "per microsecond"),
+               "d": ("d-Spacing", "per Angstrom")}
+
+
+def write_lab_dat(path, timestamp, exposure="120", y=None, x=None):
+    """Write an azimAvg .dat: '#' key block, the uncommented 'tth(°) ...' line, X Y Sigma rows."""
+    x = ONED_X if x is None else x
+    y = inhouse_scan_y(1) if y is None else y
+    keys = [("EDF_DataBlockID", "0.Image.Psd"), ("Comment", "Cell_TEST -"),
+            ("Date", timestamp), ("ExposureTime", exposure), ("Humidity-xhg", "NA"),
+            ("Wavelength", "1.541891e-10"), ("DetectorModel", "PILATUS3 100K-20Hz"),
+            ("Monitor", "0"), ("Operation", "Azimuthal average I(q)"),
+            ("SampleDistance", "0.176"), ("Center_1", "122.907"), ("Center_2", "354.688")]
+    lines = [LAB_DAT_RULE] + [f"# {k:<33}{v}" for k, v in keys]
+    lines += [LAB_DAT_RULE, LAB_DAT_COLUMNS]
+    lines += [f"{a:15.6f}{b:26.4f}{np.sqrt(abs(b)):26.6f}           " for a, b in zip(x, y)]
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _eclab_number(value):
+    """Format a number as EC-Lab does: 7-decimal mantissa and a three-digit exponent."""
+    mantissa, exponent = f"{value:.7E}".split("E")
+    return f"{mantissa}E{int(exponent):+04d}"
+
+
+def write_eclab_echem(path, n_rows=40, v0=3.7, dv=0.01, i0=0.1, di=0.001,
+                      date="05/02/2024", hour=10):
+    """Write write_echem_txt's values as an EC-Lab export (trailing-tab header, E+000, CRLF)."""
+    rows = ["time/s\tEwe/V\tI/mA\t"]
+    rows += [f"{date} {hour}:{m:02d}:00.0000\t{_eclab_number(v0 + m * dv)}\t"
+             f"{_eclab_number(i0 + m * di)}" for m in range(n_rows)]
+    with open(path, "w", newline="") as f:
+        f.write("\r\n".join(rows) + "\r\n")
+
+
+def write_mantid_bank(path, instrument, axis, spectrum, x, y, e):
+    """Write a Mantid focussed bank (XYDATA, '#' header, X Y E) as POLARIS (CRLF) or WISH (LF)."""
+    label, y_unit = MANTID_AXES[axis]
+    newline = "\r\n" if instrument == "POLARIS" else "\n"
+    pad = " " if instrument == "WISH" else ""
+    lines = ["XYDATA", f"# File generated by Mantid, Instrument {instrument}",
+             f"# The X-axis unit is: {label}, The Y-axis unit is:  {y_unit}",
+             "# Data for spectra :0", f"# Spectrum {spectrum}{pad}",
+             f"# {label}              Y                 E"]
+    lines += [f"{a:15.8f}{b:18.8f}{c:18.8f}" for a, b, c in zip(x, y, e)]
+    with open(path, "w", newline="") as f:
+        f.write(newline.join(lines) + newline)
+
+
+def polaris_bank_names(run, bank):
+    """Return POLARIS's (TOF, d) names for a run and bank: POL<run>-b_<bank>-TOF.dat, -d.dat."""
+    return f"POL{run}-b_{bank}-TOF.dat", f"POL{run}-b_{bank}-d.dat"
+
+
+def wish_bank_names(run, bank):
+    """Return WISH's (TOF, d) names: <run>-<bank>_<11-bank>raw-0.dat and its -d-0 twin."""
+    return f"{run}-{bank}_{11 - bank}raw-0.dat", f"{run}-{bank}_{11 - bank}raw-d-0.dat"
+
+
+def journal_time(ts):
+    """Format a time as the ISIS logbook writes it, day unpadded: 'Mon Feb 5 10:00:00 2024'."""
+    t = pd.Timestamp(ts)
+    return f"{t:%a %b} {t.day} {t:%H:%M:%S %Y}"
+
+
+def polaris_logbook_line(run, start, end, title="Op-Run1-SC1-Diag", users="Smith,Jones",
+                         proposal="7654321", duration='"2m 6s"', charge='"5.44"'):
+    """Return a POLARIS logbook line: run, title, duration, charge, users, proposal, start, end."""
+    return "\t".join([str(run), title, duration, charge, users, proposal,
+                      journal_time(start), journal_time(end), ""])
+
+
+def wish_logbook_line(run, start, end, title="cell55 event # 1", user="Perez",
+                      proposal="2510713", duration='"30m 0s"', charge='"3.0059"'):
+    """Return a WISH logbook line: the POLARIS fields, then the '24_5' cycle and a trailing tab."""
+    return "\t".join([str(run), title, duration, charge, user, proposal,
+                      journal_time(start), journal_time(end), "24_5", ""])
+
+
+def write_logbook(path, lines, instrument="POLARIS"):
+    """Write logbook lines with the instrument's line ending (POLARIS CRLF, WISH LF)."""
+    newline = "\r\n" if instrument == "POLARIS" else "\n"
+    with open(path, "w", newline="") as f:
+        f.write(newline.join(lines) + newline)
+
+
+def zip_tree(src, zip_path, prefix=""):
+    """Zip every file under src by its forward-slash relative path under prefix; return the path."""
+    with zipfile.ZipFile(zip_path, "w") as z:
+        for root, _, files in os.walk(src):
+            for name in sorted(files):
+                full = os.path.join(root, name)
+                z.write(full, prefix + os.path.relpath(full, src).replace(os.sep, "/"))
+    return str(zip_path)
+
+
+def write_lab_dir(dirpath, times=SCAN_TIMES):
+    """Write write_inhouse_dir's scans and echem (same names and values) in the real shapes."""
+    os.makedirs(dirpath, exist_ok=True)
+    for i, ts in enumerate(times, start=1):
+        write_lab_dat(os.path.join(dirpath, f"scan_{i:03d}.dat"), ts, y=inhouse_scan_y(i))
+    write_eclab_echem(os.path.join(dirpath, "echem.txt"))
+
+
+def write_wish_dir(dirpath, run="123456", banks=(1, 2), lines=None):
+    """Write write_neutron_dir's run (same window and values) in the real WISH shapes."""
+    data = os.path.join(dirpath, "diffraction-data")
+    os.makedirs(data, exist_ok=True)
+    if lines is None:
+        lines = [wish_logbook_line(run, "2024-02-05 10:00:00", "2024-02-05 10:30:00")]
+    write_logbook(os.path.join(dirpath, "Cell_log_book.txt"), lines, "WISH")
+    for bank in banks:
+        tof_name, d_name = wish_bank_names(run, bank)
+        write_mantid_bank(os.path.join(data, tof_name), "WISH", "tof", bank, TOF_X,
+                          50.0 + bank + np.arange(40.0), np.ones(40))
+        write_mantid_bank(os.path.join(data, d_name), "WISH", "d", bank, D_X,
+                          70.0 + bank + np.arange(40.0), np.ones(40))
+    write_eclab_echem(os.path.join(dirpath, "Cell_C01_Absolute.txt"))
 
 
 # Minimal Mantid IDF: source 14 m upstream of a sample at the origin

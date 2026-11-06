@@ -9,7 +9,10 @@ serves the logbook parser, the file grouper and display (`NeutronFileGrouper.ext
 import logging
 import os
 import re
+import threading
+import warnings
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import h5py
@@ -17,23 +20,88 @@ import numpy as np
 import pandas as pd
 
 from .config import MAX_EXPOSURE_TIME, SCAN_ID_MAX_DIGITS, SCAN_ID_MIN_DIGITS
-from .model import DataSourceType, DataType, FileType, SUPPORTED_EXTENSIONS
+from .model import (DataSourceType, DataType, FileType, SUPPORTED_EXTENSIONS,
+                    check_cancelled)
 from .readers import FABIO_AVAILABLE, fabio
 
 logger = logging.getLogger(__name__)
 
-WEEKDAYS = ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"]
 # Logbook user field: comma-separated surnames ("Smith,Jones")
 USER_TOKEN_RE = re.compile(r"[A-Za-z ,.\-']+")
 # A lone surname (no comma marks it as the user field): one capitalised
 # word, hyphens and apostrophes allowed ("Perez", "O'Neil", "Smith-Jones")
 SURNAME_RE = re.compile(r"[A-Z][A-Za-z.\-']*")
 LOGBOOK_TIME_FORMAT = '%a %b %d %H:%M:%S %Y'
+# A run title that fills its column runs into the quoted duration ("2m 6s") after one space
+_TITLE_DURATION_RE = re.compile(r'\s+"(?:\d+[dhms]\s?)+"')
+# "# Date <value>" in a 1D .dat header; the label may run on ("# DateTime")
+_DAT_DATE_RE = re.compile(r"#\s*date\w*\s*[:=]?\s*(.*)$", re.IGNORECASE)
+# The ISO date-time 'T' sits between digits; the T of 'UTC', 'GMT' or 'Tue' stays
+_ISO_T_RE = re.compile(r"(?<=\d)T(?=\d)")
+# Trailing UTC offset, Z, UTC or GMT right after a clock time: 'Z', '+01', '-05:00', ' +0100'
+_UTC_OFFSET_RE = re.compile(r"(\d:\d{2}(?:[.,]\d+)?)\s?(?:[Zz]|UTC|GMT|[+-]\d{2}(?::?\d{2})?)$")
+
+
+def name_list(names: List[str], limit: int = 3) -> str:
+    """Join up to `limit` names for a warning, then 'and N more'."""
+    shown = ", ".join(names[:limit])
+    return shown if len(names) <= limit else f"{shown} and {len(names) - limit} more"
 
 
 def _valid_scan_id(scan_id: str) -> bool:
     """True when scan_id is SCAN_ID_MIN_DIGITS to SCAN_ID_MAX_DIGITS digits (the scan-ID rule)."""
     return scan_id.isdigit() and SCAN_ID_MIN_DIGITS <= len(scan_id) <= SCAN_ID_MAX_DIGITS
+
+
+# ============================================================================
+# Timestamps
+# ============================================================================
+
+def _is_logbook_time(text: str) -> bool:
+    """True when text is a whole logbook time field ('Mon Feb 05 10:00:00 2024')."""
+    try:
+        datetime.strptime(text.strip(), LOGBOOK_TIME_FORMAT)
+        return True
+    except ValueError:
+        return False
+
+
+def _year_first(text: str) -> bool:
+    """True for a year-first date (2024-02-05, 2024/02/05, 2024.02.05, 2024 02 05, 20240205T1005)."""
+    return text[:4].isdigit() and (text[4:5] in ("-", "/", ".", " ") or text[4:8].isdigit())
+
+
+def _header_timestamp(text: str) -> Optional[str]:
+    """Return a .dat or EDF header date-time as unambiguous text, or None when it does not parse.
+    Year-first text is kept as written (ISO 'T' becomes a space); other dates are read day-first."""
+    text = text.strip()
+    year_first = _year_first(text)
+    if year_first:
+        try:
+            datetime.fromisoformat(text)  # fast path for the common ISO form
+            return _ISO_T_RE.sub(" ", text)
+        except ValueError:
+            pass
+    try:
+        with warnings.catch_warnings():
+            # A value that can only be month-first (05/13) falls back silently, as for echem
+            warnings.filterwarnings("ignore", message=".*dayfirst.*")
+            ts = pd.to_datetime(text, dayfirst=not year_first)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if pd.isna(ts):
+        return None
+    return _ISO_T_RE.sub(" ", text) if year_first else str(ts)
+
+
+def strip_utc_offset(value: Any) -> Any:
+    """Drop a UTC offset or 'Z' from a timestamp string or Timestamp, keeping the wall clock.
+    The app compares naive wall-clock times; other values pass through unchanged."""
+    if isinstance(value, pd.Timestamp):
+        return value.tz_localize(None) if value.tzinfo is not None else value
+    if isinstance(value, str):
+        return _UTC_OFFSET_RE.sub(r"\1", value)
+    return value
 
 
 # ============================================================================
@@ -43,30 +111,35 @@ def _valid_scan_id(scan_id: str) -> bool:
 def parse_mantid_header(path: str) -> Dict[str, Any]:
     """Harvest instrument, axis units and spectrum number from a Mantid .dat header.
     Reads at most 10 lines, stopping at the first data line."""
-    info: Dict[str, Any] = {}
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for _ in range(10):
-                line = f.readline()
-                if not line.startswith('#') and 'XYDATA' not in line:
-                    if line.strip() and not line.lstrip().startswith('#'):
-                        break
-                    continue
-
-                m = re.search(r'Instrument\s+(\S+)', line)
-                if m:
-                    info['instrument'] = m.group(1)
-                m = re.search(r'X-axis unit is:\s*([^,]+)', line)
-                if m:
-                    info['x_unit'] = m.group(1).strip()
-                m = re.search(r'Y-axis unit is:\s*(.+)$', line)
-                if m:
-                    info['y_unit'] = m.group(1).strip()
-                m = re.search(r'#\s*Spectrum\s+(\d+)', line)
-                if m:
-                    info['spectrum'] = int(m.group(1))
+        with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+            return parse_mantid_header_lines([f.readline() for _ in range(10)])
     except Exception as e:
         logger.debug(f"Could not parse Mantid header of {path}: {e}")
+    return {}
+
+
+def parse_mantid_header_lines(lines: List[str]) -> Dict[str, Any]:
+    """Harvest the Mantid header fields from a file's lines (only the first 10 are read)."""
+    info: Dict[str, Any] = {}
+    for line in lines[:10]:
+        if not line.startswith('#') and 'XYDATA' not in line:
+            if line.strip() and not line.lstrip().startswith('#'):
+                break
+            continue
+
+        m = re.search(r'Instrument\s+(\S+)', line)
+        if m:
+            info['instrument'] = m.group(1)
+        m = re.search(r'X-axis unit is:\s*([^,]+)', line)
+        if m:
+            info['x_unit'] = m.group(1).strip()
+        m = re.search(r'Y-axis unit is:\s*(.+)$', line)
+        if m:
+            info['y_unit'] = m.group(1).strip()
+        m = re.search(r'#\s*Spectrum\s+(\d+)', line)
+        if m:
+            info['spectrum'] = int(m.group(1))
     return info
 
 
@@ -87,7 +160,6 @@ EDF_INSTRUMENT_KEYS = {
     'PSize_2': 'y_pixel_size_m',
     'Center_1': 'beam_center_x',
     'Center_2': 'beam_center_y',
-    'ExposureTime': 'count_time',
     'Comment': 'comment',
 }
 
@@ -114,6 +186,11 @@ def extract_edf_scan_fields(edf_path: str) -> Dict[str, Any]:
     for key, name in EDF_INSTRUMENT_KEYS.items():
         if key in header and name not in instrument:
             raw = header[key]
+            if name in ('detector_model', 'comment'):
+                # Free text kept verbatim: a Comment "4225" names the sample "4225"
+                if str(raw).strip():
+                    instrument[name] = str(raw).strip()
+                continue
             try:
                 instrument[name] = float(raw)
             except (ValueError, TypeError):
@@ -130,6 +207,10 @@ def extract_edf_scan_fields(edf_path: str) -> Dict[str, Any]:
 class FileClassifierBase(ABC):
     """Abstract classifier mapping a file to (data_type, timestamp, exposure_time)."""
 
+    def __init__(self) -> None:
+        # Files this classifier has already named in a skip warning
+        self.reported: Set[str] = set()
+
     @abstractmethod
     def classify(self, path: str) -> Tuple[Optional[str], Optional[str], Optional[float]]:
         """Return (data_type, timestamp, exposure_time), Nones when unrecognised."""
@@ -141,7 +222,7 @@ class DATClassifier(FileClassifierBase):
     def classify(self, path: str) -> Tuple[Optional[str], Optional[str], Optional[float]]:
         """Classify as 1D when the first 30 lines hold a '# Date' line; exposure is optional."""
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
                 lines = [f.readline() for _ in range(30)]
 
             timestamp = None
@@ -154,11 +235,21 @@ class DATClassifier(FileClassifierBase):
                 line_lower = line.lstrip().lower()
 
                 if line_lower.startswith("# date"):
-                    timestamp = line.split()[-1].replace("T", " ")
+                    # The whole value after the label ("# Date 2024-02-05 10:05:00"),
+                    # else a year-first last token ("# Date of scan 2024-02-05T10:05")
+                    value = _DAT_DATE_RE.match(line.strip()).group(1)
+                    token = line.split()[-1]
+                    timestamp = (_header_timestamp(value)
+                                 or (_header_timestamp(token) if _year_first(token) else None))
+                    if timestamp is None:
+                        logger.warning(f"Skipping {os.path.basename(path)}: "
+                                       f"unreadable '# Date' value {value!r}")
+                        self.reported.add(path)
 
                 elif "exposuretime" in line_lower.replace(" ", ""):
                     try:
-                        exposure_time = float(line.split()[-1])
+                        value = float(line.split()[-1])
+                        exposure_time = value if np.isfinite(value) and value > 0 else None
                     except (ValueError, IndexError):
                         pass
 
@@ -167,6 +258,7 @@ class DATClassifier(FileClassifierBase):
 
         except Exception as e:
             logger.error(f"Error classifying DAT file {path}: {e}")
+            self.reported.add(path)
 
         return None, None, None
 
@@ -182,14 +274,20 @@ class EDFClassifier(FileClassifierBase):
         try:
             image = fabio.open(path)
 
+            # Read like the .dat '# Date' so a 1D/2D pair keeps one timestamp text
             raw_date = image.header.get("Date")
-            timestamp = raw_date.replace("T", " ") if raw_date else None
+            timestamp = _header_timestamp(raw_date) if raw_date is not None else None
+            if raw_date is not None and timestamp is None:
+                logger.warning(f"Skipping {os.path.basename(path)}: "
+                               f"unreadable 'Date' value {raw_date!r}")
+                self.reported.add(path)
 
             exposure_time = None
             for key in ["ExposureTime", "Exposure_Time", "ExpTime", "Exposure"]:
                 if key in image.header:
                     try:
-                        exposure_time = float(image.header[key])
+                        value = float(image.header[key])
+                        exposure_time = value if np.isfinite(value) and value > 0 else None
                         break
                     except (ValueError, TypeError):
                         pass
@@ -199,6 +297,7 @@ class EDFClassifier(FileClassifierBase):
 
         except Exception as e:
             logger.error(f"Error classifying EDF file {path}: {e}")
+            self.reported.add(path)
 
         return None, None, None
 
@@ -211,7 +310,7 @@ class TXTClassifier(FileClassifierBase):
     def classify(self, path: str) -> Tuple[Optional[str], Optional[str], Optional[float]]:
         """Distinguish echem tables from neutron logbooks by header content."""
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
                 lines = []
                 for _ in range(10):
                     line = f.readline()
@@ -222,23 +321,24 @@ class TXTClassifier(FileClassifierBase):
             if not lines:
                 return None, None, None
 
-            first_line_lower = lines[0].lower()
-            if any(keyword in first_line_lower for keyword in self.ECHEM_KEYWORDS):
-                return DataType.ECHEM.value, None, None
-
-            # Neutron logbook: numeric scan ID + weekday timestamps
+            # Neutron logbook first (numeric scan ID + start and end time fields, as
+            # the parser needs): a run title such as "Li/NMC811" holds echem keywords
             for line in lines[:5]:
                 parts = line.strip().split('\t')
 
-                if (len(parts) >= 8 and _valid_scan_id(parts[0])
-                        and any(weekday in line for weekday in WEEKDAYS)):
+                if _valid_scan_id(parts[0]) and sum(map(_is_logbook_time, parts)) >= 2:
                     logger.debug(f"Identified {path} as neutron metadata")
                     return DataType.NEUTRON_META.value, None, None
+
+            first_line_lower = lines[0].lower()
+            if any(keyword in first_line_lower for keyword in self.ECHEM_KEYWORDS):
+                return DataType.ECHEM.value, None, None
 
             return None, None, None
 
         except Exception as e:
             logger.error(f"Error classifying TXT file {path}: {e}")
+            self.reported.add(path)
             return None, None, None
 
 
@@ -253,9 +353,10 @@ class FileClassificationManager:
             FileType.TXT: TXTClassifier()
         }
 
-    def classify_files(self, df: pd.DataFrame) -> pd.DataFrame:
+    def classify_files(self, df: pd.DataFrame,
+                       cancel: Optional[threading.Event] = None) -> pd.DataFrame:
         """Classify unclassified rows into the type/timestamp/exposure columns of a copy of df.
-        Neutron mode classifies .txt files only."""
+        Neutron mode classifies .txt files only; a set cancel raises Cancelled at the next row."""
         df = df.copy()
 
         # Ensure all classification columns exist
@@ -268,7 +369,9 @@ class FileClassificationManager:
             if col not in df.columns:
                 df[col] = pd.array([None] * len(df), dtype="object")
 
+        unrecognised: List[str] = []
         for idx, row in df.iterrows():
+            check_cancelled(cancel)
             # Skip already-classified rows
             if pd.notna(row["oned"]) or pd.notna(row["twod"]) or pd.notna(row["neutron_meta"]):
                 continue
@@ -290,10 +393,34 @@ class FileClassificationManager:
             if data_type:
                 df.at[idx, data_type] = file_path
                 if timestamp:
-                    df.at[idx, "timestamp"] = timestamp
+                    df.at[idx, "timestamp"] = strip_utc_offset(timestamp)
                 if exposure_time is not None:
                     df.at[idx, "exposure_time"] = exposure_time
+            elif file_path in classifier.reported:
+                continue  # its classifier's own warning already named it
+            elif file_type == FileType.TXT or self.data_source == DataSourceType.INHOUSE:
+                # Name the user's file, not a converted .csv/.xlsx temp copy; an in-house
+                # .dat or .edf lands here without a readable Date (e.g. a stripped header)
+                original = row.get("original_path")
+                unrecognised.append(os.path.basename(original if isinstance(original, str)
+                                                     else file_path))
 
+        if unrecognised:
+            n = len(unrecognised)
+            scan_files = sum(name.lower().endswith((".dat", ".edf")) for name in unrecognised)
+            noun = ("text file" if not scan_files else ".dat/.edf file" if scan_files == n
+                    else "file")
+            kinds, hints = [], []
+            if scan_files:
+                kinds.append("scan")
+                hints.append("scans need a readable Date in their header")
+            if scan_files < n:
+                kinds.append("echem or logbook")
+                hints.append("echem files need a header line naming time, voltage or current")
+            logger.warning(
+                f"{n} {noun}{'s were' if n != 1 else ' was'} not recognised as {', '.join(kinds)} "
+                f"data and {'were' if n != 1 else 'was'} ignored: {name_list(unrecognised)} "
+                f"({'; '.join(hints)})")
         return df
 
 
@@ -310,7 +437,7 @@ class NeutronMetadataParser:
         try:
             logger.debug(f"Parsing neutron metadata file: {path}")
 
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
                 lines = f.readlines()
 
             if not lines:
@@ -318,23 +445,22 @@ class NeutronMetadataParser:
                 return None
 
             data = []
+            unreadable: List[str] = []
 
             for line_num, line in enumerate(lines):
                 parts = line.strip().split('\t')
+                scan_id = parts[0].strip()
 
-                if len(parts) >= 8:
+                # By content, whatever the field count: the POLARIS export aligns its columns
+                # with tabs, so a value that fills its column ("1m 27s") is followed by a space
+                if _valid_scan_id(scan_id):
                     try:
-                        scan_id = parts[0].strip()
-
-                        if not _valid_scan_id(scan_id):
-                            continue
-
-                        # Start and end times: the first two fields naming a weekday
+                        # Start and end times: the first two logbook time fields
                         start_time = None
                         end_time = None
 
                         for part in parts:
-                            if any(day in part for day in WEEKDAYS):
+                            if _is_logbook_time(part):
                                 if not start_time:
                                     start_time = part.strip()
                                 else:
@@ -352,21 +478,31 @@ class NeutronMetadataParser:
                                 "full_line": line.strip(),
                                 **NeutronMetadataParser._harvest_extras(parts, scan_id),
                             })
+                            continue
 
                     except (ValueError, IndexError) as e:
                         if line_num < 3:
                             logger.debug(f"Error parsing line {line_num}: {e}")
-                        continue
+                    unreadable.append(scan_id)
+
+            if unreadable:
+                n = len(unreadable)
+                logger.warning(
+                    f"{n} logbook lines have no readable start and end time and were skipped: "
+                    f"{name_list(unreadable)}" if n != 1 else
+                    f"1 logbook line has no readable start and end time and was skipped: "
+                    f"{unreadable[0]}")
 
             if data:
-                logger.info(f"Successfully parsed {len(data)} logbook entries")
+                logger.info(f"Successfully parsed {len(data)} logbook "
+                            f"{'entries' if len(data) != 1 else 'entry'}")
                 return pd.DataFrame(data)
 
             logger.debug("No valid entries found")
             return None
 
         except Exception as e:
-            logger.error(f"Error parsing neutron metadata: {e}")
+            logger.error(f"Error parsing neutron metadata file {os.path.basename(path)}: {e}")
             return None
 
     @staticmethod
@@ -377,14 +513,14 @@ class NeutronMetadataParser:
 
         # Run title: second column, when it is free text
         if len(parts) > 1:
-            title = parts[1].strip().strip('"')
-            if title and not title.isdigit() and not any(d in title for d in WEEKDAYS):
+            title = _TITLE_DURATION_RE.split(parts[1])[0].strip().strip('"')
+            if title and not title.isdigit() and not _is_logbook_time(title):
                 extras["run_title"] = title
 
         proposal_idx = None
         for idx, part in enumerate(parts[2:], start=2):
             token = part.strip().strip('"')
-            if not token or any(d in token for d in WEEKDAYS):
+            if not token or _is_logbook_time(token):
                 continue
             # Users: comma-separated surnames (e.g. "Smith,Jones")
             if ("users" not in extras and "," in token
@@ -412,21 +548,24 @@ class NeutronMetadataParser:
 class NeutronFileGrouper:
     """Grouper of neutron .dat files by scan ID, measurement number and tof/d type."""
 
-    # Lookbehind stops an 8+ digit run number matching by its last digits
+    # Lookbehind stops an 8+ digit run number matching by its last digits;
+    # lookahead stops bank 10 reading as bank 1
     _ID_MEAS_PATTERN = re.compile(
-        r'(?<!\d)(\d{%d,%d})-(\d)' % (SCAN_ID_MIN_DIGITS, SCAN_ID_MAX_DIGITS))
-    _POL_PATTERN = re.compile(r'POL(\d+)-b_(\d)')
+        r'(?<!\d)(\d{%d,%d})-(\d)(?!\d)' % (SCAN_ID_MIN_DIGITS, SCAN_ID_MAX_DIGITS))
+    _POL_PATTERN = re.compile(r'POL(\d+)-b_(\d)(?!\d)')
 
     def group_neutron_files(self, file_list: List[str]) -> Dict[str, Dict[str, Dict[str, str]]]:
         """Group .dat paths as {scan_id: {measurement: {'tof'|'d': path}}}."""
         groups: Dict[str, Dict[str, Dict[str, str]]] = {}
+        skipped: List[str] = []
 
-        logger.debug(f"Processing {len(file_list)} neutron files")
+        logger.debug(f"Processing {len(file_list)} neutron "
+                     f"file{'s' if len(file_list) != 1 else ''}")
 
         for filepath in file_list:
             basename = os.path.basename(filepath)
 
-            if not basename.endswith('.dat'):
+            if not basename.lower().endswith('.dat'):
                 continue
 
             scan_info = self._extract_neutron_file_info(basename)
@@ -437,8 +576,17 @@ class NeutronFileGrouper:
                 data_type = scan_info['type']
 
                 groups.setdefault(scan_id, {}).setdefault(measurement_num, {})[data_type] = filepath
+            else:
+                skipped.append(basename)
 
-        logger.info(f"Grouped {len(groups)} scans")
+        if skipped:
+            if len(skipped) == 1:
+                logger.warning(f"1 .dat file was not recognised as a neutron bank 1-5 file "
+                               f"and was ignored ({skipped[0]})")
+            else:
+                logger.warning(f"{len(skipped)} .dat files were not recognised as neutron "
+                               f"bank 1-5 files and were ignored (e.g. {skipped[0]})")
+        logger.info(f"Grouped {len(groups)} scan{'s' if len(groups) != 1 else ''}")
         return groups
 
     @classmethod
@@ -450,33 +598,30 @@ class NeutronFileGrouper:
 
     @classmethod
     def _extract_neutron_file_info(cls, filename: str) -> Optional[Dict[str, str]]:
-        """Parse scan ID, measurement number (1-5) and tof/d type from a neutron filename."""
-        name_no_ext = filename[:-4] if filename.endswith('.dat') else filename
-        is_dspacing = ('-d-' in name_no_ext or '_d_' in name_no_ext
-                       or name_no_ext.endswith('_d') or name_no_ext.endswith('-d'))
-        kind = 'd' if is_dspacing else 'tof'
+        """Parse scan ID, measurement number (1-5) and tof/d type from a neutron filename.
+        The d-spacing marker is read after the bank number, so a name prefix cannot set it."""
+        name_no_ext = filename[:-4] if filename.lower().endswith('.dat') else filename
 
-        try:
-            # Pattern: POL123456-b_1-d.dat
+        def kind(tail: str) -> str:
+            tail = tail.lower()
+            is_d = '-d-' in tail or '_d_' in tail or tail.endswith('_d') or tail.endswith('-d')
+            return 'd' if is_d else 'tof'
+
+        # Pattern: POL123456-b_1-d.dat; a d marker before the bank also matches
+        match = cls._POL_PATTERN.search(name_no_ext)
+        tail = name_no_ext[match.end():] if match else name_no_ext
+        if not match:
             match = cls._POL_PATTERN.search(name_no_ext.replace('-d', '').replace('_d', ''))
-            if match and _valid_scan_id(match.group(1)) and 1 <= int(match.group(2)) <= 5:
-                return {'scan_id': match.group(1), 'measurement': match.group(2), 'type': kind}
+        if match and _valid_scan_id(match.group(1)) and 1 <= int(match.group(2)) <= 5:
+            return {'scan_id': match.group(1), 'measurement': match.group(2), 'type': kind(tail)}
 
-            # Pattern: 12345-1-d.dat
-            match = cls._ID_MEAS_PATTERN.search(name_no_ext)
-            if match and 1 <= int(match.group(2)) <= 5:
-                return {'scan_id': match.group(1), 'measurement': match.group(2), 'type': kind}
+        # Pattern: 12345-1-d.dat
+        match = cls._ID_MEAS_PATTERN.search(name_no_ext)
+        if match and 1 <= int(match.group(2)) <= 5:
+            return {'scan_id': match.group(1), 'measurement': match.group(2),
+                    'type': kind(name_no_ext[match.end():])}
 
-            # Fallback: split on hyphen
-            parts = name_no_ext.split('-')
-            if (len(parts) >= 2 and _valid_scan_id(parts[0]) and parts[1][:1].isdigit()
-                    and 1 <= int(parts[1][0]) <= 5):
-                return {'scan_id': parts[0], 'measurement': parts[1][0], 'type': kind}
-
-            return None
-
-        except (ValueError, IndexError):
-            return None
+        return None
 
 
 # ============================================================================
@@ -586,11 +731,15 @@ class NexusMetadataExtractor:
             return None
 
     def _extract_timestamp(self, h5file: h5py.File) -> Optional[str]:
-        """Return the normalised timestamp at the first TIMESTAMP_PATHS entry present."""
+        """Return the first TIMESTAMP_PATHS entry that reads as a date, normalised."""
         for ts_path in self.TIMESTAMP_PATHS:
             if ts_path in h5file:
-                timestamp_str = self._decode_value(h5file[ts_path][()])
-                return self._parse_nexus_timestamp(timestamp_str)
+                timestamp = self._parse_nexus_timestamp(self._decode_value(h5file[ts_path][()]))
+                try:
+                    pd.to_datetime(timestamp)
+                except (ValueError, TypeError):
+                    continue  # try the next path (end time); untimed only if none reads as a date
+                return timestamp
         return None
 
     def _extract_exposure_time(self, h5file: h5py.File) -> Optional[float]:
@@ -599,7 +748,7 @@ class NexusMetadataExtractor:
             if exp_path in h5file:
                 try:
                     exp_time = float(h5file[exp_path][()])
-                    if exp_time > 0:
+                    if np.isfinite(exp_time) and exp_time > 0:
                         return exp_time
                 except (ValueError, TypeError):
                     pass
@@ -613,9 +762,13 @@ class NexusMetadataExtractor:
                 end_time = self._parse_nexus_timestamp(end_str)
 
                 if start_time and end_time:
-                    start_dt = pd.to_datetime(start_time)
-                    end_dt = pd.to_datetime(end_time)
-                    exposure_seconds = (end_dt - start_dt).total_seconds()
+                    try:
+                        start_dt = pd.to_datetime(start_time)
+                        end_dt = pd.to_datetime(end_time)
+                        exposure_seconds = (end_dt - start_dt).total_seconds()
+                    except (ValueError, TypeError):
+                        # An unreadable end time costs the exposure, not the scan
+                        continue
 
                     if 0 < exposure_seconds < MAX_EXPOSURE_TIME:
                         return exposure_seconds
@@ -624,7 +777,9 @@ class NexusMetadataExtractor:
 
     @staticmethod
     def _decode_value(value: Any) -> str:
-        """Return an h5py scalar as str, decoding bytes."""
+        """Return an h5py scalar or 1-element array (as Mantid writes) as str, decoding bytes."""
+        if isinstance(value, np.ndarray) and value.size == 1:
+            value = value.ravel()[0]
         if isinstance(value, bytes):
             return value.decode()
         return str(value)
@@ -632,9 +787,9 @@ class NexusMetadataExtractor:
     @staticmethod
     def _parse_nexus_timestamp(timestamp_str: str) -> str:
         """Normalise an ISO/NeXus timestamp to 'YYYY-MM-DD HH:MM:SS'; others pass through."""
+        timestamp_str = strip_utc_offset(timestamp_str)
         if 'T' in timestamp_str:
-            base_time = timestamp_str.split('+')[0].split('Z')[0].split('.')[0]
-            return base_time.replace('T', ' ')
+            return timestamp_str.split('.')[0].replace('T', ' ')
         return timestamp_str
 
 
@@ -855,7 +1010,8 @@ def format_profile_block(profile: Dict[str, Any]) -> str:
         b = (info.get("banks") or {}).get(bank, {})
         lo_r, hi_r = b.get("distance_range_m", (None, None))
         lo_t, hi_t = b.get("polar_angle_range_deg", (None, None))
-        lines.append(f'    # bank {bank}: {b.get("elements")} elements, '
+        elements = b.get("elements")
+        lines.append(f'    # bank {bank}: {elements} element{"s" if elements != 1 else ""}, '
                      f'L2 {lo_r}-{hi_r} m, 2theta {lo_t}-{hi_t} deg, '
                      f'azimuthal coherence {b.get("azimuthal_coherence")}')
     lines.append('    "detector_banks": {')

@@ -7,11 +7,14 @@ then loads via nxs_reader (one read path for everything). Canonical files always
 store absolute timestamps; relative display is a GUI view transform.
 """
 
+import contextlib
 import logging
 import os
 import shutil
 import tempfile
+import threading
 import zipfile
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -19,7 +22,6 @@ import numpy as np
 import pandas as pd
 
 from .config import (
-    BATCH_SIZE,
     ECHEM_TIME_TOLERANCE,
     MAX_ECHEM_TIME_TOLERANCE,
     MAX_WORKERS,
@@ -30,15 +32,19 @@ from .classify import (
     FileClassificationManager,
     NexusMetadataExtractor,
     SynchrotronFileGrouper,
+    name_list,
 )
 from .correlate import ScanProcessor
 from .model import (
+    Cancelled,
     DataSourceType,
     FileRecord,
     FileType,
+    InputError,
     Scan,
     SUPPORTED_EXTENSIONS,
     TimeMethod,
+    check_cancelled,
 )
 from .nxs_writer import NXSWriter
 
@@ -58,7 +64,7 @@ def convert_tabular_to_txt(path: str, dest_dir: Optional[str] = None) -> str:
     if lower.endswith('.xlsx'):
         read = pd.read_excel
     elif lower.endswith('.csv'):
-        read = pd.read_csv
+        read = _read_csv
     else:
         return path
 
@@ -82,19 +88,38 @@ def convert_tabular_to_txt(path: str, dest_dir: Optional[str] = None) -> str:
         return path
 
 
+def _read_csv(path: str) -> pd.DataFrame:
+    """Read a CSV table whose separator (',', ';' or tab) is the commonest in its header.
+    A ';' or tab table uses decimal commas; a header that is not UTF-8 is read as cp1252."""
+    with open(path, "rb") as f:
+        raw = (f.readline().splitlines() or [b""])[0]
+    try:
+        header = raw.decode("utf-8")
+        encoding, errors = "utf-8", "ignore"  # a stray byte further down is dropped, as for .txt
+    except UnicodeDecodeError:
+        header = raw.decode("cp1252", errors="replace")
+        encoding, errors = "cp1252", "replace"
+    sep = max((",", ";", "\t"), key=header.count)
+    # A '.' number under decimal ',' stays text and is written back verbatim
+    decimal = "." if sep == "," else ","
+    return pd.read_csv(path, sep=sep, decimal=decimal, encoding=encoding, encoding_errors=errors)
+
+
 # ============================================================================
 # File collection
 # ============================================================================
 
 class FileProcessor:
-    """Context-managed collector turning input paths into FileRecords.
-    Its tempdir (ZIP extractions, converted tables) is removed on exit, so every read,
-    the NeXus write included, must happen inside the context."""
+    """Context-managed collector turning input paths into FileRecords; `cancel` stops it per file.
+    Exit removes its tempdir, so every read (the NeXus write too) must stay in the context."""
 
-    def __init__(self, data_source: DataSourceType = DataSourceType.INHOUSE):
+    def __init__(self, data_source: DataSourceType = DataSourceType.INHOUSE,
+                 cancel: Optional[threading.Event] = None):
         self.data_source = data_source
+        self.cancel = cancel
         self.tempdir: Optional[str] = None
         self.processed_files: set = set()
+        self._zip_count = 0
         self.synchrotron_grouper = SynchrotronFileGrouper()
         self.nexus_extractor = NexusMetadataExtractor()
 
@@ -115,7 +140,7 @@ class FileProcessor:
 
         # On-access virus scanners (Sophos: about 60 ms per fresh .dat) delay each
         # file's first read; scanning all files in parallel here keeps later reads cheap
-        self._warm_up([path for path, _ in all_files])
+        self._warm_up([path for path, _ in all_files], self.cancel)
 
         # Source-specific grouping
         if self.data_source == DataSourceType.NEUTRON:
@@ -132,16 +157,27 @@ class FileProcessor:
             if extracted not in self.processed_files
         ]
 
-        if remaining_files:
-            if PARALLEL_PROCESSING and len(remaining_files) > PARALLEL_PROCESSING_THRESHOLD:
-                chunk_size = max(BATCH_SIZE, len(remaining_files) // MAX_WORKERS)
-                chunks = [remaining_files[i:i + chunk_size]
-                          for i in range(0, len(remaining_files), chunk_size)]
-                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    for chunk_records in executor.map(self._process_remaining_chunk, chunks):
-                        records.extend(chunk_records)
-            else:
-                records.extend(self._process_remaining_chunk(remaining_files))
+        # Synchrotron scans pair nothing outside their .nxs group: laboratory .dat with .edf
+        # would become one unpaired scan per file
+        if self.data_source == DataSourceType.SYNCHROTRON:
+            kinds = {os.path.splitext(path)[1].lower() for path, _ in remaining_files}
+            if {FileType.DAT.value, FileType.EDF.value} <= kinds:
+                raise InputError("Laboratory .dat and .edf files cannot be read as synchrotron "
+                                 "scans (a scan .nxs with its .xy or .hdf); check the data source")
+
+        records.extend(self._process_remaining_files(remaining_files))
+
+        # Files no record took (e.g. .xy without its scan .nxs) are reported, not lost silently;
+        # an .xlsx/.csv left here failed conversion, which already named it
+        unused = Counter(ext for ext in (os.path.splitext(path)[1].lower()
+                                         for path, _ in all_files
+                                         if path not in self.processed_files)
+                         if ext not in (FileType.XLSX.value, FileType.CSV.value))
+        if unused:
+            kinds = ", ".join(f"{n} {ext}" for ext, n in sorted(unused.items()))
+            n = sum(unused.values())
+            logger.warning(f"{n} files did not belong to any scan and were ignored ({kinds})" if n != 1
+                           else f"1 file did not belong to any scan and was ignored ({kinds})")
 
         return records
 
@@ -153,16 +189,19 @@ class FileProcessor:
             self.processed_files.add(extracted_path)
             records.append(FileRecord(path=extracted_path, original_path=original_path))
 
-        logger.info(f"Processed {len(records)} neutron-related files")
+        logger.debug(f"Processed {len(records)} neutron-related "
+                     f"file{'s' if len(records) != 1 else ''}")
         return records
 
     @staticmethod
-    def _warm_up(paths: List[str]) -> None:
-        """Open each file once across the worker pool so on-access scans overlap."""
+    def _warm_up(paths: List[str], cancel: Optional[threading.Event] = None) -> None:
+        """Open each file once across the worker pool so on-access scans overlap.
+        A set cancel fails the queued files at once, so the pool drains without opening them."""
         if not PARALLEL_PROCESSING or len(paths) <= PARALLEL_PROCESSING_THRESHOLD:
             return
 
         def touch(path: str) -> None:
+            check_cancelled(cancel)
             try:
                 with open(path, "rb") as f:
                     f.read(1)
@@ -186,9 +225,13 @@ class FileProcessor:
             elif os.path.isdir(path):
                 all_files.extend(self._collect_directory_files(path))
 
+        # A folder plus a file in it, or a folder plus its subfolder, reaches files twice;
+        # dropped before conversion, so a table taken twice is converted once
+        all_files = self._drop_repeats(all_files)
+
         all_files = self._convert_files_to_txt(all_files)
 
-        logger.info(f"Collected {len(all_files)} total files")
+        logger.info(f"Collected {len(all_files)} total file{'s' if len(all_files) != 1 else ''}")
         return all_files
 
     def _convert_files_to_txt(self, files: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
@@ -196,34 +239,72 @@ class FileProcessor:
         return [(convert_tabular_to_txt(extracted, dest_dir=self.tempdir), original)
                 for extracted, original in files]
 
+    @staticmethod
+    def _drop_repeats(files: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        """Keep the first entry per file, however its path is spelled (case, 8.3 names, links)."""
+        seen = set()
+        repeated = set()
+        unique: List[Tuple[str, str]] = []
+        repeats: List[str] = []
+        for extracted, original in files:
+            # A ZIP member is keyed by archive and member name: an archive taken twice repeats
+            key = os.path.normcase(os.path.realpath(original))
+            if key in seen:
+                if key not in repeated:
+                    repeated.add(key)
+                    repeats.append(os.path.basename(original))
+            else:
+                seen.add(key)
+                unique.append((extracted, original))
+        if repeats:
+            n = len(repeats)
+            logger.info(f"{n} files were found more than once and are read once: "
+                        f"{name_list(repeats)}" if n != 1 else
+                        f"1 file was found more than once and is read once: {repeats[0]}")
+        return unique
+
     def _extract_zip_files(self, zip_path: str) -> List[Tuple[str, str]]:
         """Extract supported files from ZIP, skipping macOS metadata."""
         extracted: List[Tuple[str, str]] = []
+        # Each archive gets its own folder, so same-named members never overwrite
+        self._zip_count += 1
+        dest = os.path.join(self.tempdir, f"zip{self._zip_count}")
 
         try:
             with zipfile.ZipFile(zip_path, "r") as archive:
                 supported_exts = SUPPORTED_EXTENSIONS - {FileType.ZIP.value}
 
                 for member in archive.namelist():
+                    check_cancelled(self.cancel)
+                    # Hidden entries at any depth (macOS "._" forks), as in the folder walk;
+                    # a "." part is the archive root ("./x" from Windows tar -a)
+                    parts = member.replace("\\", "/").split("/")
                     if (member.endswith("/") or
-                            member.startswith("__MACOSX") or
-                            member.startswith(".")):
+                            any((p.startswith(".") and p != ".") or p == "__MACOSX"
+                                for p in parts)):
                         continue
 
                     member_ext = os.path.splitext(member)[1].lower()
 
                     if member_ext in supported_exts:
                         # Validate path to prevent ZIP Slip (path traversal)
-                        target = os.path.realpath(os.path.join(self.tempdir, member))
-                        if not target.startswith(os.path.realpath(self.tempdir) + os.sep):
-                            logger.warning(f"Skipping ZIP entry with invalid path: {member}")
+                        target = os.path.realpath(os.path.join(dest, member))
+                        if not target.startswith(os.path.realpath(dest) + os.sep):
+                            logger.warning(f"Skipping ZIP entry with invalid path: {member} "
+                                           f"in {os.path.basename(zip_path)}")
                             continue
-                        extracted_path = archive.extract(member, self.tempdir)
+                        try:
+                            extracted_path = archive.extract(member, dest)
+                        except Exception as e:
+                            # One member that cannot be written (e.g. past MAX_PATH) costs that file only
+                            logger.warning(f"Could not extract {member} from "
+                                           f"{os.path.basename(zip_path)}: {getattr(e, 'strerror', None) or e}")
+                            continue
                         original_path = os.path.join(zip_path, member)
                         extracted.append((extracted_path, original_path))
 
         except Exception as e:
-            logger.error(f"Error extracting ZIP file: {e}")
+            logger.error(f"Error extracting ZIP file {os.path.basename(zip_path)}: {e}")
 
         return extracted
 
@@ -263,7 +344,7 @@ class FileProcessor:
 
         return records
 
-    def _process_remaining_chunk(self, files: List[Tuple[str, str]]) -> List[FileRecord]:
+    def _process_remaining_files(self, files: List[Tuple[str, str]]) -> List[FileRecord]:
         """Create simple records for ungrouped .dat, .edf, .txt files."""
         records: List[FileRecord] = []
         for extracted_path, original_path in files:
@@ -298,7 +379,7 @@ class FileProcessor:
 
 def _tolerance_error(value: Any) -> Optional[str]:
     """Return why value is not a usable echem time tolerance, or None when it is.
-    The GUI only checks that its field is positive; the upper bound lives here."""
+    The GUI refuses non-finite or non-positive input and clamps; this guards API callers."""
     # Plain comparisons: np.isfinite would raise on an int too large for a float
     if (isinstance(value, bool)
             or not isinstance(value, (int, float, np.integer, np.floating))
@@ -336,14 +417,16 @@ def _run_pipeline(processor: FileProcessor,
         progress_callback("Classifying files...")
 
     classifier = FileClassificationManager(data_source)
-    classified_df = classifier.classify_files(records_df)
+    classified_df = classifier.classify_files(records_df, processor.cancel)
+    if data_source == DataSourceType.NEUTRON and not classified_df["neutron_meta"].notna().any():
+        raise InputError("No neutron logbook found in the selection: "
+                         "runs are timed from the logbook")
 
     if progress_callback:
         progress_callback("Processing scans and correlating with echem...")
 
     scan_processor = ScanProcessor(time_method, data_source,
-                                   echem_time_tolerance=echem_time_tolerance,
-                                   apply_relative_display=False)
+                                   echem_time_tolerance=echem_time_tolerance)
     return scan_processor.process_scans(classified_df)
 
 
@@ -361,18 +444,60 @@ def process_raw(input_paths: List[str],
                              echem_time_tolerance)
 
 
+def _zip_twod_scans(scans: List[Scan], tempdir: Optional[str]) -> List[Scan]:
+    """Return the scans whose 2D source was extracted from a ZIP into tempdir."""
+    if not tempdir:
+        return []
+    temp_root = os.path.realpath(tempdir)
+    return [s for s in scans if s.twod and
+            os.path.realpath(str(s.twod)).startswith(temp_root + os.sep)]
+
+
+def _move_aside(images_dir: str, suffix: str) -> Optional[str]:
+    """Rename an OperaXN-marked images dir to '<dir><suffix>' and return that path; None if it is
+    unmarked or cannot move. A marked folder already there (an interrupted run's) is replaced."""
+    moved = images_dir + suffix
+    if not os.path.isfile(os.path.join(images_dir, ".operaxn_images")):
+        return None
+    if os.path.isfile(os.path.join(moved, ".operaxn_images")):
+        shutil.rmtree(moved, ignore_errors=True)
+    if os.path.lexists(moved):
+        return None
+    try:
+        os.rename(images_dir, moved)
+    except OSError as e:
+        logger.debug(f"Could not move {images_dir} aside: {e}")
+        return None
+    return moved
+
+
+def _restore(images_dir: str, previous: Optional[str]) -> None:
+    """Swap the set-aside images dir (if any) back in for the one a failed run made there.
+    A folder that cannot move (a file in it is open) stays put; `previous` then waits as .old."""
+    discarded = _move_aside(images_dir, ".new")
+    if previous:
+        try:
+            os.rename(previous, images_dir)
+        except OSError as e:
+            logger.warning(f"Could not restore the previous 2D images to {images_dir}: {e}")
+            if discarded:
+                with contextlib.suppress(OSError):
+                    os.rename(discarded, images_dir)
+            return
+    if discarded:
+        shutil.rmtree(discarded, ignore_errors=True)
+
+
 def _persist_zip_twod_sources(scans: List[Scan], output_path: str,
                               tempdir: Optional[str],
-                              messages: Optional[List[str]] = None) -> Optional[str]:
-    """Copy ZIP-extracted 2D images to <stem>_images beside output_path and repoint the scans.
-    By-reference 2D would otherwise die with the extraction tempdir; return the dir or None."""
-    if not tempdir:
-        return None
-    temp_root = os.path.realpath(tempdir)
-    pending = [s for s in scans if s.twod and
-               os.path.realpath(str(s.twod)).startswith(temp_root + os.sep)]
+                              messages: Optional[List[str]] = None,
+                              cancel: Optional[threading.Event] = None) -> Optional[str]:
+    """Move ZIP-extracted 2D images to <stem>_images beside output_path and repoint the scans.
+    Return the dir or None; a set cancel stops before the next move, leaving the dir to generate."""
+    pending = _zip_twod_scans(scans, tempdir)
     if not pending:
         return None
+    temp_root = os.path.realpath(tempdir)
 
     images_dir = os.path.splitext(output_path)[0] + "_images"
     marker = os.path.join(images_dir, ".operaxn_images")
@@ -380,6 +505,7 @@ def _persist_zip_twod_sources(scans: List[Scan], output_path: str,
         # Only replace a directory this tool created (marker file present):
         # a user's own folder with this name must never be deleted
         if os.path.isfile(marker):
+            # Still here only when generate could not set it aside
             shutil.rmtree(images_dir, ignore_errors=True)
         else:
             logger.warning(f"Existing directory {images_dir} was not created by "
@@ -392,16 +518,29 @@ def _persist_zip_twod_sources(scans: List[Scan], output_path: str,
             return None
 
     copied: Dict[str, str] = {}
+    failed = 0
     try:
         os.makedirs(images_dir, exist_ok=True)
         with open(marker, "w") as f:
             f.write("Created by OperaXN alongside the matching .nxs file.\n")
         for scan in pending:
+            check_cancelled(cancel)
             src = os.path.realpath(str(scan.twod))
             if src not in copied:
                 dest = os.path.join(images_dir, os.path.relpath(src, temp_root))
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                shutil.copy2(src, dest)
+                try:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    # A move: the extraction tempdir is deleted on return anyway
+                    shutil.move(src, dest)
+                except OSError as e:
+                    # A copy that landed beside a source another program holds open is kept
+                    if not (getattr(e, "filename", None) == src and os.path.isfile(dest)
+                            and os.path.getsize(dest) == os.path.getsize(src)):
+                        # One failed copy (e.g. a path past MAX_PATH) costs one image, not the rest
+                        logger.warning(f"Could not persist zip-extracted 2D image "
+                                       f"{os.path.relpath(src, temp_root)}: {e}")
+                        failed += 1
+                        continue
                 copied[src] = dest
             scan.twod = copied[src]
     except OSError as e:
@@ -411,10 +550,20 @@ def _persist_zip_twod_sources(scans: List[Scan], output_path: str,
         if messages is not None:
             messages.append("Warning: some 2D images from the ZIP could not "
                             "be copied and will not be viewable")
-        return images_dir if copied else None
-
-    logger.info(f"Persisted {len(copied)} zip-extracted 2D images to {images_dir}")
-    return images_dir
+    else:
+        if failed and messages is not None:
+            total = failed + len(copied)
+            messages.append(f"Warning: {failed} of {total} 2D image{'s' if total != 1 else ''} "
+                            "from the ZIP could not be copied and will not be viewable")
+        if copied:
+            logger.info(f"Persisted {len(copied)} zip-extracted 2D "
+                        f"image{'s' if len(copied) != 1 else ''} to {images_dir}")
+    if copied:
+        return images_dir
+    # Nothing was copied: remove the folder made above (its marker says it is ours)
+    if os.path.isfile(marker):
+        shutil.rmtree(images_dir, ignore_errors=True)
+    return None
 
 
 def validate(scans: List[Scan], echem_df: pd.DataFrame) -> List[str]:
@@ -422,7 +571,7 @@ def validate(scans: List[Scan], echem_df: pd.DataFrame) -> List[str]:
     errors: List[str] = []
 
     if not scans:
-        errors.append("No scan data available")
+        errors.append("No scan data available; check the data source and the selection")
 
     if echem_df.empty:
         errors.append("Warning: No echem data available")
@@ -449,10 +598,11 @@ def generate(input_paths: List[str],
              sample_description: Optional[str] = None,
              sample_preparation_date: Optional[str] = None,
              cycling_protocol: Optional[Dict[str, Any]] = None,
-             echem_time_tolerance: float = ECHEM_TIME_TOLERANCE
+             echem_time_tolerance: float = ECHEM_TIME_TOLERANCE,
+             cancel: Optional[threading.Event] = None
              ) -> Tuple[bool, List[str]]:
     """Run the full pipeline from raw paths to the canonical .nxs; return (success, messages).
-    The preparation date is ISO 8601; `cycling_protocol` keys follow CYCLING_PROTOCOL_FIELDS."""
+    Preparation date ISO 8601; protocol keys CYCLING_PROTOCOL_FIELDS; `cancel` fails the run."""
     error = _tolerance_error(echem_time_tolerance)
     if error:
         return False, [f"Error: {error}"]
@@ -460,7 +610,7 @@ def generate(input_paths: List[str],
         # The FileProcessor context must span writing too: the writer reads
         # data from the scans' file paths, which for ZIP inputs live in the
         # processor's temp extraction directory.
-        with FileProcessor(data_source) as processor:
+        with FileProcessor(data_source, cancel) as processor:
             scans, echem_df = _run_pipeline(processor, input_paths, data_source,
                                             progress_callback, time_method,
                                             echem_time_tolerance)
@@ -475,17 +625,6 @@ def generate(input_paths: List[str],
 
             if progress_callback:
                 progress_callback("Writing NeXus file...")
-
-            # ZIP-extracted 2D references must outlive the extraction tempdir
-            if not include_2d_images:
-                images_dir = _persist_zip_twod_sources(scans, output_path,
-                                                       processor.tempdir,
-                                                       messages)
-                if images_dir:
-                    messages.append(
-                        "Warning: 2D images copied to "
-                        f"{os.path.basename(images_dir)} so ZIP references "
-                        "stay viewable")
 
             # Convert standard echem xlsx/csv the same way as everything else,
             # keeping the original path for provenance
@@ -504,10 +643,35 @@ def generate(input_paths: List[str],
                                sample_preparation_date=sample_preparation_date,
                                cycling_protocol=cycling_protocol,
                                echem_time_tolerance=echem_time_tolerance)
-            writer.write(output_path, scans, echem_df, std_files)
+
+            # ZIP-extracted 2D references must outlive the extraction tempdir; a previous
+            # OperaXN sidecar waits aside until the new .nxs is in place
+            sidecar = os.path.splitext(output_path)[0] + "_images"
+            zip_twod = not include_2d_images and bool(_zip_twod_scans(scans, processor.tempdir))
+            previous = _move_aside(sidecar, ".old") if zip_twod else None
+            # A failure is undone only from a free path: a marked folder that could not
+            # move is replaced in place by persist
+            undo = zip_twod and not os.path.isdir(sidecar)
+            try:
+                if zip_twod:
+                    _persist_zip_twod_sources(scans, output_path, processor.tempdir,
+                                              messages, cancel)
+                writer.write(output_path, scans, echem_df, std_files, cancel)
+            except BaseException:
+                # The writer kept any previous .nxs: put back the images that belong to it
+                if undo:
+                    _restore(sidecar, previous)
+                raise
+            if previous:
+                shutil.rmtree(previous, ignore_errors=True)
 
         return True, messages or ["NeXus file generated successfully"]
 
+    except Cancelled:
+        logger.info("NeXus generation cancelled")
+        return False, ["Error: Generation cancelled"]
+    except InputError as e:
+        return False, [f"Error: {e}"]
     except Exception as e:
         logger.exception("Error generating NeXus file")
         return False, [f"Error: {e}"]

@@ -32,7 +32,7 @@ def _display_ts(value: Any) -> Any:
     if _RELATIVE_TS_RE.fullmatch(value):
         return value
     try:
-        return pd.to_datetime(value).strftime('%Y-%m-%d %H:%M:%S')
+        return pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
     except (ValueError, TypeError):
         return value
 
@@ -78,22 +78,32 @@ def is_canonical_nxs(path: str) -> bool:
 def read_data_source(path: str) -> Optional[str]:
     """Return the data source ('inhouse', 'synchrotron', 'neutron') a canonical .nxs records.
     None if unrecorded or unreadable; reads only load()'s fields, in its precedence, no scans."""
+    return _read_process_field(path, 'data_source')
+
+
+def read_correlation_method(path: str) -> Optional[str]:
+    """Return the correlation method ('absolute', 'relative') a canonical .nxs records, or None."""
+    return _read_process_field(path, 'correlation_method')
+
+
+def _read_process_field(path: str, field: str) -> Optional[str]:
+    """Return a recorded process text field (v4 process, else entry or global_metadata attrs)."""
     try:
         with h5py.File(path, 'r') as f:
             entry = f.get('entry')
             if _entry_is_canonical(entry):
                 process = entry.get('process')
-                value = (_dataset_scalar(process, 'data_source')
+                value = (_dataset_scalar(process, field)
                          if isinstance(process, h5py.Group) else None)
                 if value is None:
-                    value = entry.attrs.get('data_source')
+                    value = entry.attrs.get(field)
             else:
                 gm = f.get('global_metadata')
                 if not isinstance(gm, h5py.Group):
                     return None
-                value = _dataset_scalar(gm, 'data_source')
+                value = _dataset_scalar(gm, field)
                 if value is None:
-                    value = gm.attrs.get('data_source')
+                    value = gm.attrs.get(field)
             value = _decode(value)
             return value if isinstance(value, str) and value else None
     except Exception:
@@ -102,7 +112,7 @@ def read_data_source(path: str) -> Optional[str]:
 
 def load(path: str) -> ExperimentModel:
     """Load a canonical .nxs file into an ExperimentModel."""
-    model = ExperimentModel(source_path=os.path.abspath(path))
+    model = ExperimentModel()
 
     with h5py.File(path, 'r') as f:
         entry = f.get('entry')
@@ -111,7 +121,8 @@ def load(path: str) -> ExperimentModel:
         else:
             _load_legacy(f, model)
 
-    logger.info(f"Loaded {len(model.scans)} scans from {os.path.basename(path)}")
+    logger.info(f"Loaded {len(model.scans)} scan{'s' if len(model.scans) != 1 else ''} "
+                f"from {os.path.basename(path)}")
     return model
 
 

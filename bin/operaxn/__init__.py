@@ -16,20 +16,7 @@ __license__ = "MIT"
 
 from .config import (  # noqa: F401  (package API re-exports)
     DataSourceType,
-    DEFAULT_TWOD_YMIN_PERCENT,
-    DEFAULT_TWOD_YMAX_PERCENT,
-    DEFAULT_TWOD_XMIN_PERCENT,
-    DEFAULT_TWOD_XMAX_PERCENT,
-    CACHE_ENABLED,
-    PARALLEL_PROCESSING,
-    MAX_CACHE_SIZE_MB,
-    EXPORT_DPI,
-    FIGURE_DPI,
-    OPERAXNTheme,
-    DEBUG_MODE,
-    APP_NAME,
-    APP_COPYRIGHT,
-    DOCUMENTATION_URL
+    OPERAXNTheme
 )
 
 from .gui import OPERAXN, UIState, VisualiserConfig
@@ -52,8 +39,6 @@ from .input import (
     make_echem_arrays,
     get_correlated_data,
     add_standard_echem_files,
-    FileType,
-    DataType,
     TimeMethod
 )
 
@@ -74,8 +59,7 @@ from .dialog import (
     UploadOptionsDialog,
     PlotSettingsDialog,
     ExportOptionsDialog,
-    GIFSettingsDialog,
-    ProgressDialog
+    GIFSettingsDialog
 )
 
 __all__ = [
@@ -120,13 +104,10 @@ __all__ = [
     'PlotSettingsDialog',
     'ExportOptionsDialog',
     'GIFSettingsDialog',
-    'ProgressDialog',
 
     # Enums
     'DataSourceType',
     'UIState',
-    'FileType',
-    'DataType',
     'TimeMethod',
 
     # Version info
@@ -134,14 +115,4 @@ __all__ = [
     '__author__',
     '__email__',
     '__license__',
-
-    # Application info
-    'APP_NAME',
-    'APP_COPYRIGHT',
-    'DEBUG_MODE',
-
-    # Performance settings
-    'CACHE_ENABLED',
-    'PARALLEL_PROCESSING',
-    'MAX_CACHE_SIZE_MB',
 ]

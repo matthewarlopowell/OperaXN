@@ -40,17 +40,17 @@ a human-entered field that will be made required at NIAC submission.
 | `sample/description` | required | recommended | Human-entered; cannot be harvested from source data. | tighten at NIAC |
 | `cycling_protocol` (NXnote) | required | recommended; `technique` required within the group | Human-entered; the writer omits the whole group when `technique` is empty so no non-conforming file can be produced. | tighten at NIAC |
 | `operando_electrochemistry` | required | recommended | Absent from diffraction-only files (no electrochemistry supplied). | forced |
-| `environment/voltage`, `environment/current` | required | recommended | Present when the scan was matched to an electrochemistry point less than the correlation tolerance away, as recorded in `operando_electrochemistry/echem_time_tolerance` (set per run in the upload dialog, 300 s by default; a file without that field was matched with 300 s); absent for uncorrelated scans and diffraction-only files. | forced |
+| `environment/voltage`, `environment/current` | required | recommended | Present when the scan was matched to an electrochemistry point less than the correlation tolerance away, as recorded in `operando_electrochemistry/echem_time_tolerance` (set at generation in the upload dialog, 300 s by default; a file without that field was matched with 300 s); absent for uncorrelated scans and diffraction-only files. | forced |
 | `environment/voltage_min`, `voltage_max`, `current_min`, `current_max` | required | optional | Extrema over every electrochemistry point inside [`start_time`, `end_time`], both bounds inclusive, in the same clock alignment as the correlation; absent when the window holds no point (short exposures against a sparse logging cadence) or `end_time` is unknown. | forced |
 | `environment/scan_timestamp` | required | required | Always written (presence guarantee equals `start_time`'s). | matches |
 | `end_time` (entry) | optional | optional | | matches |
 | `process`, `process/correlation_method` | required | required | Always written. | matches |
 | `program_name` | required | absent | Duplicate of `process/program` and `process/version`; `process` is the single provenance record. | structural choice |
-| `MONITOR` (inherited from NXtofnpd: `mode`, `preset`, `distance`, `data`, `time_of_flight`) | required | tofnpd: one optional entry-level `monitor` holding `mode` (required within the group) and the `detector_number` / `distance` / `polar_angle` / `azimuthal_angle` arrays `[nMon]` of every beam-monitor element; monopd: optional entry-level `monitor` holding `mode` and the shared `preset` of in-house acquisitions, plus a per-scan `monitor/integral` only for acquisitions whose EDF header carries a positive beam-monitor counter | tofnpd: the monitor record is invariant over the experiment, so it is held once like `instrument`. Reduced files record no monitor; `mode` and the monitor geometry come from the per-instrument profile (POLARIS: `timer`, its runs end on the clock; 14 elements at seven positions from the instrument definition), so an unprofiled instrument writes no group. The parent's single scalar `distance` presumes one monitor; the reduction of focussed data used none in particular, so all are described. `preset` is not recorded (the realised duration of each acquisition is `environment/exposure_time`) and reduced data has no monitor spectrum. monopd: in-house acquisitions count to a time preset shared by all scans, so mode and preset are held once; the Pilatus counters in the EDF header are the detector's own totals, not a monitor reading, and are not recorded; synchrotron sources record none. | forced |
+| `MONITOR` (inherited from NXtofnpd: `mode`, `preset`, `distance`, `data`, `time_of_flight`) | required | tofnpd: one optional entry-level `monitor` holding `mode` (required within the group) and the `detector_number` / `distance` / `polar_angle` / `azimuthal_angle` arrays `[nMon]` of every beam-monitor element; monopd: optional entry-level `monitor` holding `mode` and the shared `preset` of in-house (laboratory) acquisitions, plus a per-scan `monitor/integral` only for acquisitions whose EDF header carries a positive beam-monitor counter | tofnpd: the monitor record is invariant over the experiment, so it is held once like `instrument`. Reduced files record no monitor; `mode` and the monitor geometry come from the per-instrument profile (POLARIS: `timer`, its runs end on the clock; 14 elements at seven positions from the instrument definition), so an unprofiled instrument writes no group. The parent's single scalar `distance` presumes one monitor; the reduction of focussed data used none in particular, so all are described. `preset` is not recorded (the realised duration of each acquisition is `environment/exposure_time`) and reduced data has no monitor spectrum. monopd: in-house acquisitions count to a time preset shared by all scans, so mode and preset are held once; the Pilatus counters in the EDF header are the detector's own totals, not a monitor reading, and are not recorded; synchrotron sources record none. | forced |
 | `environment/echem_index_start`, `_end` | required | absent | Window indices into the `operando_electrochemistry` arrays are a pure function of the acquisition window (searchsorted), and nothing consumed them. | structural choice |
 | Electrochemistry array length symbol | `nP` | `nE` | Figure 4 uses `nP` for the electrochemistry series; monopd needs `nP` for the diffraction pattern length, so the electrochemistry arrays use `nE`. | naming |
-| `SCAN/data` (monopd) | required | optional | Image-only acquisitions carry `image_source` instead; the writer enforces at least one of `data` / `image_source`. | forced |
-| `MONITOR` / `DATA` placement | printed at subentry indent in Fig. 4 (the parents define them at entry level) | one `data` group (monopd) or one NXdata per bank (tofnpd) per acquisition subentry; `monitor` at entry level for tofnpd and per subentry for in-house monopd acquisitions | Each acquisition's pattern, and for in-house data its beam-monitor reading, lives in its own subentry; the neutron monitor record is invariant and lives with the instrument. | structural choice |
+| `SCAN/data` (monopd) | required | optional | Image-only acquisitions carry `image_source` instead. The group is also left out when a 1-D pattern cannot be read or holds no data points, so an acquisition without a 2-D image is then recorded by its `environment` only. | forced |
+| `MONITOR` / `DATA` placement | printed at subentry indent in Fig. 4 (the parents define them at entry level) | one `data` group (monopd) or one NXdata per bank (tofnpd) per acquisition subentry; `monitor` at entry level for both (tofnpd: mode and geometry; monopd: mode and preset), plus a per-subentry `monitor/integral` for in-house (laboratory) acquisitions with a positive counter | Each acquisition's pattern, and for in-house data its beam-monitor reading, lives in its own subentry; the neutron monitor record is invariant and lives with the instrument. | structural choice |
 | `SUBENTRY/instrument` | link | HDF5 soft link with `@target` (documented, not declared) | NXDL links cannot be optional (XSD); pynxtools traverses the soft link and checks `@target` but does not match a `<link>` against a linked group, so declaring one fails every conforming file. Linking avoids N copies of the invariant instrument. | forced |
 | `SUBENTRY/definition`, `title`, `start_time`, `end_time` | subentry-level fields | absent; the acquisition window is `environment/start_time` / `end_time` | `definition` and `title` repeat entry-level facts (the neutron run title is kept verbatim in `environment/logbook_entry`); the window sits in the environment group it bounds. | structural choice |
 | `environment/capacity` | optional | absent | Never computed; removed rather than reserved. | structural choice |
@@ -63,9 +63,10 @@ only the Figure 4 content still validates): `definition@version` and
 extra `instrument` fields and the verbatim
 `edf_metadata` / `synchrotron_metadata` NXcollection harvests; `user`;
 `standard_electrochemistry` (non-correlated electrochemistry files);
-`operando_electrochemistry/echem_time_tolerance` (the per-run correlation
-tolerance the scan subentries were matched with: a scan matches when the
-two timestamps are less than it apart, on both sides of the record);
+`operando_electrochemistry/echem_time_tolerance` (the correlation tolerance
+set at generation that the scan subentries were matched with: a scan
+matches when the two timestamps are less than it apart, on both sides of
+the record);
 `environment/voltage_timestamp` and `logbook_entry`;
 `data/data_errors`;
 `image_source` and `image_data`; per-bank NXdata attributes (`spectrum`,
@@ -79,16 +80,14 @@ arrays.
 |---|---|---|---|---|
 | Intensities (`data`) | NX_INT | NX_NUMBER | forced | Azimuthally averaged / focussed, normalised: processed data, not raw counts. |
 | `data_errors` field | absent | optional NX_NUMBER, `[nP]` in monopd (tofnpd leaves it undimensioned: bank lengths vary) | choice (addition) | Carries the propagated uncertainties (Sigma_I) that reduction software exports, named per the NXdata `FIELDNAME_errors` convention (the bare `errors` name is deprecated since NIAC 2018). |
-| Per-bank axes (tofnpd) | single `time_of_flight` `[nTimeChan]` | one NXdata per bank, `bank_N` (time-of-flight) and optional sibling `bank_N_d` (d-spacing) | choice | Focussed banks have different native axes and lengths. |
-| `data` XOR `image_source` (monopd) | `data` required | at least one of `data` / `image_source` (writer-enforced) | forced | Image-only acquisitions have no 1-D pattern yet must be recorded. |
+| Per-bank axes (tofnpd) | single `time_of_flight` `[nTimeChan]` | one NXdata per bank, `bank_N` (time-of-flight) and optional sibling `bank_N_d` (d-spacing) | choice | Focussed banks have different native axes and lengths. A bank whose file cannot be read is left out; a scan none of whose bank files can be read is written without bank groups, with a terminal warning naming it. That subentry then has none of the bank NXdata the definition asks for (`minOccurs="1"`), so such a file does not fully conform; pynxtools 0.15 does not check that minimum for variable-name groups and still validates it. |
+| `data` / `image_source` (monopd) | `data` required | `data` optional; `image_source` whenever a 2-D image exists, with or without `data`; neither when a 1-D pattern without a 2-D image cannot be read or is empty | forced | Image-only acquisitions have no 1-D pattern yet must be recorded; an unreadable or empty pattern is left out rather than written as an empty group. |
 | `instrument` in each subentry | n/a (single entry) | HDF5 soft link + `@target`, not an NXDL `<link>` | forced | See Figure 4 table: `<link>` cannot be optional and pynxtools does not match it against a linked group. |
-| `echem_index_first`/`_last` | n/a | `_first`/`_last` naming | forced | `_end` is a reserved suffix; parents have no equivalent. |
-| `twod_*` process fields | n/a | absent for neutron | choice | 2-D images do not arise in reduced neutron data. |
 | `rotation_angle` (monopd) | required NX_FLOAT | absent | choice | The operando cell is stationary / the angle is not recorded. |
 | Detector `polar_angle` / `data` | instrument-level, `[nDet]` under NXdetector | per-scan `SCAN/data` NXdata `[nP]` | structural | Each acquisition is its own subentry with its own pattern. |
 | Entry-level NXdata links | `data` NXdata linking to detector fields | direct datasets in each subentry's NXdata | structural | No detector-level arrays to link to; per-subentry storage. |
 | `monitor` group (tofnpd) | required at entry level: `mode`, `preset`, `distance` (scalar), `data`, `time_of_flight` | optional entry-level group with `mode` (required within it) and `detector_number` / `distance` / `polar_angle` / `azimuthal_angle` `[nMon]` for every monitor element | forced | Reduced files record no monitor, so `mode` and the geometry come from the instrument profile (POLARIS: `timer`, 14 elements) and an unprofiled instrument writes no group; the arrays describe all monitors because none in particular was used. |
-| `monitor` group (monopd) | required at entry level: `mode`, `preset`, `integral` | optional entry-level group with `mode` and `preset` for in-house acquisitions; `integral` in the acquisition subentry, only when its EDF header carries a positive beam-monitor counter | forced | In-house acquisitions count to a time preset shared by all scans; synchrotron sources record no monitor. |
+| `monitor` group (monopd) | required at entry level: `mode`, `preset`, `integral` | optional entry-level group with `mode` and `preset` for in-house (laboratory) acquisitions; `integral` in the acquisition subentry, only when its EDF header carries a positive beam-monitor counter | forced | In-house acquisitions count to a time preset shared by all scans; synchrotron sources record no monitor. |
 | `monitor/preset` (monopd) | required | optional | forced | Absent when the acquisitions do not share one exposure (each is in `environment/exposure_time`). |
 | `monitor/integral` (monopd) | required, entry level | optional, per acquisition subentry | forced | Absent on instruments without a beam monitor (the Pilatus image totals in the header are not monitor counts). |
 | `crystal` (monopd) | required NXcrystal with `wavelength [i]` | recommended, scalar `wavelength` | forced/choice | Absent for neutron sources; a monochromatic beam has one wavelength. |
@@ -156,19 +155,28 @@ sample-to-bank distance and scattering angle of its five focussed banks,
 taken from the Mantid instrument definition `Polaris_upgrade` (valid from
 2012-05-01) embedded in a Mantid-processed POLARIS file. `azimuthal_angle`
 is omitted: the banks are rings around the beam. Its `monitor/mode` is
-`timer`: in an operando POLARIS dataset every run lasted 126 or 127 s while
-the delivered proton charge varied, and runs that received no beam still
-ended on the clock, so acquisitions are time-terminated. Its `monitor`
-arrays list all 14 beam-monitor elements of the instrument definition (six
-upstream positions and one downstream transmission monitor at 3.270 m, two
-elements each); the reduction used none of them in particular (it
-normalises to proton charge), so none is singled out.
+`timer`: in an operando POLARIS dataset every complete run lasted 126 or
+127 s (the last, cut short, 87 s) while the delivered proton charge varied,
+and runs that received no beam still ended on the clock, so acquisitions
+are time-terminated. Its `monitor` arrays list all 14 beam-monitor elements
+of the instrument definition (six upstream positions and one downstream
+transmission monitor at 3.270 m, two elements each); the reduction used
+none of them in particular (it normalises to proton charge), so none is
+singled out.
 
 WISH (ISIS) ships its source and instrument name only (`ISIS`, `WISH`): the
 flight path, the five paired banks (1/10 to 5/6; the reduced data imply
 scattering angles of 27.1, 58.3, 90.0, 121.7 and 153.2 degrees at a total
 flight path of 42.2 m) and the monitors are not written until a
 Mantid-processed WISH file supplies them.
+
+X-ray profiles (laboratory, synchrotron, Diamond i11-1) fill the source and
+instrument names, and may also carry `wavelength`, the incident wavelength in
+angstrom. It is written to `instrument/crystal/wavelength` when the source
+files give none (an EDF `WaveLength` header always wins; i11-1 scan files
+carry none, the beamline keeps it in its `.poni` calibration). A value that
+is not a finite number is skipped with a terminal warning. Neutron files never
+write it.
 
 To add an instrument, derive its block from any Mantid `SaveNexusProcessed`
 file of that instrument (the focussed banks plus the embedded IDF) and
@@ -195,7 +203,7 @@ files here must be copied into it once (and again after every pynxtools
 upgrade, which replaces the bundle):
 
 ```bash
-pip install 'pynxtools>=0.15,<0.16'
+pip install "pynxtools>=0.15,<0.16"
 
 # 1. locate pynxtools' contributed-definitions folder
 python -c "import pynxtools, os; print(os.path.join(os.path.dirname(pynxtools.__file__), 'definitions', 'contributed_definitions'))"
@@ -218,8 +226,9 @@ The entry `entry` in file `experiment.nxs` is valid according to the
 `NXoperando_monopd` application definition.
 ```
 
-(`NXoperando_tofnpd` for neutron files. Older pynxtools versions use
-`validate_nexus experiment.nxs` instead of `pynx validate`.)
+(`NXoperando_tofnpd` for neutron files. `validate_nexus experiment.nxs`
+does the same: the test suite uses it, and older pynxtools versions have
+only that form.)
 
 After editing either NXDL, the copies inside pynxtools' contributed
 definitions folder must be refreshed (repeat step 2) or validation silently

@@ -71,8 +71,8 @@ def test_monopd_environment(inhouse_nxs):
         assert abs(env["voltage_max"][()] - 3.77) < 1e-9
         assert abs(env["current_min"][()] - 0.105) < 1e-9
         assert abs(env["current_max"][()] - 0.107) < 1e-9
-        for name in ("echem_index_first", "echem_index_last", "capacity",
-                     "voltage_log", "current_log"):
+        for name in ("echem_index_start", "echem_index_end", "echem_index_first",
+                     "echem_index_last", "capacity", "voltage_log", "current_log"):
             assert name not in env, f"{name} is derivable and must not be stored"
         assert wall(env["scan_timestamp"]) == "2024-02-05T10:05:00"
         assert wall(env["midpoint_adjusted_timestamp"]) == "2024-02-05T10:06:00"

@@ -4,10 +4,12 @@ Electrochemistry parsing and scan/echem time-correlation for the core pipeline.
 The canonical .nxs file always stores absolute timestamps. RELATIVE mode,
 selected at upload, matches scans to echem by relative offsets (for
 unsynchronised instrument clocks); relative display time is a GUI-side view
-transform (`generate` runs this processor with the display rewrite off).
+transform.
 """
 
 import logging
+import os
+import re
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,9 +18,46 @@ import pandas as pd
 
 from .config import ECHEM_TIME_TOLERANCE
 from .model import DataSourceType, Scan, TimeMethod
-from .classify import LOGBOOK_TIME_FORMAT, NeutronFileGrouper, NeutronMetadataParser
+from .classify import NeutronFileGrouper, NeutronMetadataParser, name_list, strip_utc_offset
 
 logger = logging.getLogger(__name__)
+
+
+def _is_number(text: str) -> bool:
+    """True when text reads as a plain number ('12.5', '1e3')."""
+    try:
+        float(text)
+        return True
+    except ValueError:
+        return False
+
+
+def _unit(label: str) -> str:
+    """Return a column label's unit, the text after its last '/', '(' or '[' ('Ewe/V' -> 'v')."""
+    return re.split(r"[/(\[]", label.lower().replace(" ", ""))[-1].rstrip(")]")
+
+
+def _voltage_scale(label: str) -> Optional[float]:
+    """Return the factor taking a voltage label's unit to volts (V 1.0, mV 0.001), else None."""
+    scale = {"v": 1.0, "mv": 0.001}.get(_unit(label))
+    if scale is None:
+        # A V or mV unit followed by more text, e.g. 'Voltage(V) avg' or 'Ewe/V vs. Li'
+        match = re.search(r"[/(\[]\s*(mv|v)(?![a-z])", label.lower())
+        if match:
+            scale = 1.0 if match.group(1) == "v" else 0.001
+    return scale
+
+
+def _current_scale(label: str) -> Optional[float]:
+    """Return the factor taking a current label's unit to milliamps, None when it names none."""
+    part = label.lower().replace(" ", "")
+    scale = None
+    if "current" in part or re.match(r"<?i>?[/(\[]", part):
+        scale = {"a": 1000.0, "ma": 1.0, "ua": 0.001, "µa": 0.001, "μa": 0.001,
+                 "na": 1e-6, "pa": 1e-9}.get(_unit(label))
+        if scale is None and "(a)" in part:
+            scale = 1000.0  # an amp unit followed by more text, e.g. 'Current(A) avg'
+    return scale
 
 
 def _nan_to_none(value: Any) -> Any:
@@ -48,11 +87,12 @@ class EchemParser:
 
     HEADER_KEYWORDS = ["time", "date", "ecell", "ewe", "voltage", "current", "i/", "v/"]
 
-    def parse(self, path: str) -> Optional[pd.DataFrame]:
+    def parse(self, path: str, name: Optional[str] = None) -> Optional[pd.DataFrame]:
         """Parse an echem file into a timestamp/echem_data/current DataFrame, or None.
-        Ambiguous dates are read day-first (UK convention)."""
+        Ambiguous dates are read day-first (UK convention); messages call the file `name`."""
+        name = name or os.path.basename(path)
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
                 lines = f.readlines()
 
             if not lines:
@@ -61,19 +101,32 @@ class EchemParser:
             has_header = any(h in lines[0].lower() for h in self.HEADER_KEYWORDS)
 
             if has_header:
+                # An ANSI header is read as cp1252: dropping its bytes would turn "I/µA" into
+                # amps. It is decoded on its own, so a stray byte in a data row cannot do the same
+                with open(path, "rb") as f:
+                    header = f.readline().splitlines()[0]
+                try:
+                    header.decode("utf-8")
+                except UnicodeDecodeError:
+                    lines[0] = header.decode("cp1252", errors="replace") + "\n"
                 data_rows = [ln for ln in lines[1:] if ln.strip()]
                 columns = self._detect_columns(
                     lines[0],
                     data_rows[0] if data_rows else None,
-                    data_rows[-1] if data_rows else None)
-                current_scale = self._current_unit_scale(lines[0], columns)
+                    data_rows[-1] if data_rows else None,
+                    name=name)
+                if not columns:
+                    return None
+                voltage_scale = self._voltage_unit_scale(lines[0], columns, name)
+                current_scale = self._current_unit_scale(lines[0], columns, name)
                 data_lines = lines[1:]
             else:
                 columns = {"time": 0, "voltage": 1, "current": 2}
-                current_scale = 1.0
+                voltage_scale = current_scale = 1.0
                 data_lines = lines
 
-            data = self._parse_data_lines(data_lines, columns, current_scale)
+            data = self._parse_data_lines(data_lines, columns, voltage_scale, current_scale,
+                                          name=name)
 
             if data:
                 return pd.DataFrame(data)
@@ -81,13 +134,14 @@ class EchemParser:
             return None
 
         except Exception as e:
-            logger.error(f"Failed to parse echem file: {e}")
+            logger.error(f"Failed to parse echem file {name}: {e}")
             return None
 
     def _detect_columns(self, header_line: str,
                         sample_line: Optional[str] = None,
-                        last_sample_line: Optional[str] = None) -> Dict[str, int]:
-        """Map time/voltage/current to header indices by keyword (-1 when disabled).
+                        last_sample_line: Optional[str] = None,
+                        name: str = "") -> Dict[str, int]:
+        """Map time/voltage/current to header indices by keyword (-1 disabled; {} skips the file).
         The first and last data rows confirm a date-named column carries per-row timestamps."""
         header_parts = [part.strip().lower() for part in header_line.strip().split("\t")]
 
@@ -180,50 +234,98 @@ class EchemParser:
         for col_name in columns:
             if col_name not in detected and columns[col_name] in used_indices:
                 logger.warning(
-                    f"Default column '{col_name}' at index {columns[col_name]} "
-                    f"collides with detected column. Disabling."
+                    f"{name}: default column '{col_name}' at index {columns[col_name]} "
+                    f"collides with a detected column; it is not read"
                 )
                 columns[col_name] = -1
+
+        # A voltage or current taken by position must carry its unit (V or mV; a current unit
+        # as _current_scale reads it), so a column of another log is never read as echem
+        if columns["time"] >= 0 and columns["voltage"] >= 0:
+            cells = header_line.strip().split("\t")
+            for col_name in ("voltage", "current"):
+                idx = columns[col_name]
+                if col_name in detected or idx < 0:
+                    continue
+                label = cells[idx].strip().strip("\"'").strip() if idx < len(cells) else ""
+                has_unit = (_voltage_scale(label) if col_name == "voltage"
+                            else _current_scale(label)) is not None
+                if not has_unit:
+                    logger.warning(f"Skipping {name}: column '{label}' is not a {col_name} column"
+                                   if label else f"Skipping {name}: no {col_name} column")
+                    return {}
 
         return columns
 
     @staticmethod
-    def _current_unit_scale(header_line: str, columns: Dict[str, int]) -> float:
-        """Return 1000.0 when the current column is labelled in amps, else 1.0.
-        Stored current values are milliamps (e.g. Arbin's 'Current(A)' is scaled)."""
-        idx = columns.get("current", -1)
-        parts = [p.strip().lower() for p in header_line.strip().split("\t")]
-        if 0 <= idx < len(parts):
-            part = parts[idx].replace(" ", "")
-            if "(a)" in part and ("current" in part or part.startswith("i(")
-                                  or part.startswith("i/")):
-                return 1000.0
-        return 1.0
+    def _voltage_unit_scale(header_line: str, columns: Dict[str, int], name: str = "") -> float:
+        """Return the factor taking the voltage column's unit to volts (1.0 for V or no unit).
+        The unit follows the last '/', '(' or '[' of the label; any but V or mV is read as V."""
+        idx = columns.get("voltage", -1)
+        cells = header_line.strip().split("\t")
+        if not 0 <= idx < len(cells):
+            return 1.0
+        label = cells[idx].strip().strip("\"'").strip()
+        column = f"Echem voltage column '{label}'" + (f" in {name}" if name else "")
+        scale = _voltage_scale(label)
+        if scale is None:
+            if re.search(r"[/(\[]", label):
+                logger.warning(f"{column} is not in V; values read as V")
+            return 1.0
+        if scale != 1.0:
+            logger.info(f"{column} converted to V (x{scale:g})")
+        return scale
 
     @staticmethod
-    def _parse_data_lines(lines: List[str], columns: Dict[str, int],
-                          current_scale: float = 1.0) -> List[Dict[str, Any]]:
+    def _current_unit_scale(header_line: str, columns: Dict[str, int], name: str = "") -> float:
+        """Return the factor taking the current column's unit to milliamps (1.0 when unlabelled).
+        The unit follows the last '/', '(' or '[' of a current label: A, mA, uA, µA, nA or pA."""
+        idx = columns.get("current", -1)
+        cells = header_line.strip().split("\t")
+        if not 0 <= idx < len(cells):
+            return 1.0
+        label = cells[idx].strip().strip("\"'").strip()
+        column = f"Echem current column '{label}'" + (f" in {name}" if name else "")
+        scale = _current_scale(label)
+        if scale is None:
+            logger.warning(f"{column} has no recognised unit (A, mA, uA, nA, pA); values read as mA")
+            return 1.0
+        if scale != 1.0:
+            logger.info(f"{column} converted to mA (x{scale:g})")
+        return scale
+
+    @staticmethod
+    def _parse_data_lines(lines: List[str], columns: Dict[str, int], voltage_scale: float,
+                          current_scale: float, name: str) -> List[Dict[str, Any]]:
         """Parse data lines into row dicts, skipping unparseable and placeholder rows.
         Ambiguous dates are read day-first (UK convention, by design)."""
         # A disabled time/voltage column (-1) would silently index parts[-1]
         if columns["time"] < 0 or columns["voltage"] < 0:
-            logger.warning("Echem time/voltage column could not be resolved; skipping file")
+            logger.warning(f"Skipping {name}: echem time/voltage column could not be resolved")
             return []
 
         data = []
-        max_idx = max(columns.values())
+        offsets = set()
+        # A row needs its time and voltage; a blank or missing current is read as None
+        rows = [parts for parts in (line.strip().split("\t") for line in lines)
+                if len(parts) > max(columns["time"], columns["voltage"])]
+        # Voltage-only files (no row reaches the current column) are not read
+        if not any(len(parts) > columns["current"] for parts in rows):
+            return []
+
+        # Elapsed-time exports hold plain numbers, which dateutil reads as years or clocks
+        cells = [parts[columns["time"]] for parts in rows if parts[columns["time"]].strip()]
+        if cells and all(_is_number(cell) for cell in cells):
+            logger.warning(f"Skipping {name}: echem time column holds plain numbers "
+                           "(elapsed seconds?), not dates")
+            return []
 
         with warnings.catch_warnings():
             # pandas warns when a value can only be month-first (e.g. 05/13);
             # day-first stays the intended reading, so the warning is noise
             warnings.filterwarnings("ignore", message=".*dayfirst.*")
 
-            for line in lines:
-                parts = line.strip().split("\t")
-
-                if len(parts) <= max_idx:
-                    continue
-
+            for parts in rows:
                 # Skip epoch-zero placeholder rows
                 ts_str = parts[columns["time"]]
                 if ts_str.startswith("1970/01/01"):
@@ -233,8 +335,11 @@ class EchemParser:
                     if ts_str[:4].isdigit() and ts_str[4:5] in ("-", "/"):
                         # Year-first strings, e.g. converted xlsx dates:
                         # dayfirst=True silently swaps month and day on these
-                        timestamp = pd.to_datetime(ts_str.replace("/", "-"),
-                                                   format="ISO8601")
+                        iso = ts_str.replace("/", "-")
+                        try:
+                            timestamp = pd.to_datetime(iso, format="ISO8601")
+                        except ValueError:  # 'UTC' or 'GMT' after the clock
+                            timestamp = pd.to_datetime(strip_utc_offset(iso), format="ISO8601")
                     else:
                         timestamp = pd.to_datetime(ts_str, dayfirst=True)
                 except (ValueError, TypeError):
@@ -244,17 +349,20 @@ class EchemParser:
                 # win the nearest-timestamp match and void every correlation
                 if pd.isna(timestamp):
                     continue
+                if timestamp.tzinfo is not None:
+                    offsets.add(timestamp.strftime("%z"))
+                timestamp = strip_utc_offset(timestamp)
 
                 try:
-                    voltage = float(parts[columns["voltage"]])
-                except (ValueError, IndexError):
+                    voltage = float(parts[columns["voltage"]]) * voltage_scale
+                except ValueError:
                     continue
 
                 current = None
                 if 0 <= columns["current"] < len(parts):
                     try:
                         current = float(parts[columns["current"]]) * current_scale
-                    except (ValueError, IndexError):
+                    except ValueError:
                         pass
 
                 data.append({
@@ -263,6 +371,15 @@ class EchemParser:
                     "current": current
                 })
 
+        if len(offsets) > 1:
+            logger.warning(f"{name}: echem times change UTC offset ({', '.join(sorted(offsets))}); "
+                           "matched by wall clock, so the hour around a clock change may pair "
+                           "with the wrong pass")
+        early = sum(1 for row in data if row["timestamp"].year < 1900)
+        if early:
+            logger.warning(f"{name}: {early} echem row{'s' if early != 1 else ''} dated before 1900 "
+                           f"(placeholders?) {'were' if early != 1 else 'was'} skipped")
+            data = [row for row in data if row["timestamp"].year >= 1900]
         return data
 
 
@@ -275,16 +392,10 @@ class ScanProcessor:
 
     def __init__(self, time_method: TimeMethod = TimeMethod.ABSOLUTE,
                  data_source: DataSourceType = DataSourceType.INHOUSE,
-                 echem_time_tolerance: float = ECHEM_TIME_TOLERANCE,
-                 apply_relative_display: bool = True):
+                 echem_time_tolerance: float = ECHEM_TIME_TOLERANCE):
         self.time_method = time_method
         self.data_source = data_source
         self.echem_time_tolerance = echem_time_tolerance
-        # RELATIVE affects two things: how scans are *matched* to echem
-        # (relative offsets, for unsynchronised clocks) and how timestamps are
-        # *displayed*. The canonical pipeline keeps the matching but disables
-        # the display rewrite so files always store absolute time.
-        self.apply_relative_display = apply_relative_display
         self.xrd_reference_time: Optional[pd.Timestamp] = None
         self.echem_reference_time: Optional[pd.Timestamp] = None
         self.neutron_reference_time: Optional[pd.Timestamp] = None
@@ -297,8 +408,6 @@ class ScanProcessor:
         neutron_metadata_df = None
         if self.data_source == DataSourceType.NEUTRON:
             neutron_metadata_df = self._process_neutron_metadata(df)
-            if neutron_metadata_df is not None:
-                logger.info(f"Found {len(neutron_metadata_df)} neutron scans")
 
         scan_list = self._create_scan_list(df, neutron_metadata_df)
 
@@ -308,14 +417,14 @@ class ScanProcessor:
         if self.time_method == TimeMethod.RELATIVE:
             self._set_reference_times(combined_echem_df, scan_list)
 
-        # Correlate scans with echem using absolute timestamps (before formatting)
+        # Correlate scans with echem by time (absolute or relative)
         if not combined_echem_df.empty:
             self._correlate_with_echem(scan_list, combined_echem_df)
+            matched = sum(scan.echem is not None for scan in scan_list)
+            if 0 < matched < len(scan_list):
+                logger.info(f"Echem matched {matched} of {len(scan_list)} scans within "
+                            f"{self.echem_time_tolerance:g} s")
             self._annotate_echem_window(scan_list, combined_echem_df)
-
-        # Convert display timestamps to relative HH:MM:SS strings
-        if self.time_method == TimeMethod.RELATIVE and self.apply_relative_display:
-            self._apply_relative_time(scan_list, combined_echem_df)
 
         return scan_list, combined_echem_df
 
@@ -323,7 +432,8 @@ class ScanProcessor:
         """Parse and concatenate every logbook file; None when none parse."""
         neutron_meta_paths = df[df["neutron_meta"].notna()]["neutron_meta"].tolist()
 
-        logger.info(f"Found {len(neutron_meta_paths)} neutron metadata files")
+        logger.info(f"Found {len(neutron_meta_paths)} neutron metadata "
+                    f"file{'s' if len(neutron_meta_paths) != 1 else ''}")
 
         if not neutron_meta_paths:
             return None
@@ -337,7 +447,15 @@ class ScanProcessor:
 
         if neutron_dfs:
             combined_df = pd.concat(neutron_dfs, ignore_index=True)
-            logger.info(f"Combined neutron metadata: {len(combined_df)} total entries")
+            # A run listed in two logbooks (e.g. cumulative exports) is one scan
+            duplicates = int(combined_df["scan_id"].duplicated().sum())
+            if duplicates:
+                logger.warning(f"{duplicates} logbook entries repeat a run already listed "
+                               "and were skipped" if duplicates != 1 else
+                               "1 logbook entry repeats a run already listed and was skipped")
+                combined_df = combined_df.drop_duplicates(subset="scan_id").reset_index(drop=True)
+            logger.info(f"Combined neutron metadata: {len(combined_df)} total "
+                        f"{'entries' if len(combined_df) != 1 else 'entry'}")
             return combined_df
 
         return None
@@ -354,15 +472,19 @@ class ScanProcessor:
         echem_dfs = []
 
         for e_path, orig in zip(echem_paths, originals):
-            e_df = self.echem_parser.parse(e_path)
+            e_df = self.echem_parser.parse(
+                e_path, os.path.basename(orig) if pd.notna(orig) else None)
             if e_df is not None:
                 e_df["source_file"] = orig if pd.notna(orig) else e_path
                 echem_dfs.append(e_df)
 
+        if len(echem_dfs) > 1:
+            names = sorted(os.path.basename(str(e_df["source_file"].iloc[0])) for e_df in echem_dfs)
+            logger.info(f"Echem data from {len(names)} files: {name_list(names)}")
         if echem_dfs:
             combined_df = (pd.concat(echem_dfs, ignore_index=True)
                            .sort_values("timestamp").reset_index(drop=True))
-            logger.info(f"Echem data: {len(combined_df)} rows")
+            logger.info(f"Echem data: {len(combined_df)} row{'s' if len(combined_df) != 1 else ''}")
             return combined_df
 
         return pd.DataFrame(columns=["timestamp", "echem_data", "current", "source_file"])
@@ -408,14 +530,14 @@ class ScanProcessor:
 
         neutron_files = [
             row["path"] for _, row in df.iterrows()
-            if pd.notna(row["path"]) and row["path"].endswith('.dat')
+            if pd.notna(row["path"]) and row["path"].lower().endswith('.dat')
         ]
-        logger.info(f"Found {len(neutron_files)} .dat files")
+        logger.info(f"Found {len(neutron_files)} .dat file{'s' if len(neutron_files) != 1 else ''}")
 
         grouper = NeutronFileGrouper()
         neutron_groups = grouper.group_neutron_files(neutron_files)
 
-        scans_without_data = 0
+        unmatched: List[str] = []  # logbook runs with no data files
 
         for _, meta_row in neutron_metadata_df.iterrows():
             scan_id = str(meta_row["scan_id"])
@@ -423,17 +545,11 @@ class ScanProcessor:
             neutron_data_files = neutron_groups.get(scan_id, {})
 
             if not neutron_data_files:
-                scans_without_data += 1
+                unmatched.append(scan_id)
                 continue
 
             start_time = meta_row["start_time"]
             end_time = meta_row["end_time"]
-
-            if isinstance(start_time, str):
-                start_time = pd.to_datetime(start_time, format=LOGBOOK_TIME_FORMAT)
-            if isinstance(end_time, str):
-                end_time = pd.to_datetime(end_time, format=LOGBOOK_TIME_FORMAT)
-
             midpoint = start_time + (end_time - start_time) / 2
 
             logbook = {
@@ -457,10 +573,21 @@ class ScanProcessor:
             )
             scan_list.append(scan)
 
-        logger.info(f"Created {len(scan_list)} neutron scans with data")
-        if scans_without_data:
+        logger.info(f"Created {len(scan_list)} neutron "
+                    f"scan{'s' if len(scan_list) != 1 else ''} with data")
+        if unmatched:
             logger.warning(
-                f"{scans_without_data} logbook entries had no matching data files and were skipped")
+                f"{len(unmatched)} logbook entries had no matching data files and were skipped: "
+                f"{name_list(sorted(unmatched, key=int))}" if len(unmatched) != 1 else
+                f"1 logbook entry had no matching data files and was skipped: {unmatched[0]}")
+        # Every bank file counts as used, so a run the logbook does not list is named here
+        logged = {str(scan_id) for scan_id in neutron_metadata_df["scan_id"]}
+        unlogged = sorted((run for run in neutron_groups if run not in logged), key=int)
+        if unlogged:
+            logger.warning(
+                f"{len(unlogged)} runs have bank files but no logbook entry and were skipped: "
+                f"{name_list(unlogged)}" if len(unlogged) != 1 else
+                f"1 run has bank files but no logbook entry and was skipped: {unlogged[0]}")
 
         return scan_list
 
@@ -523,9 +650,17 @@ class ScanProcessor:
                     )
                     scan_list.append(scan)
 
-        # Sort by timestamp; safe sentinel avoids pandas datetime resolution mismatches
-        _sort_sentinel = pd.Timestamp("1900-01-01")
-        scan_list.sort(key=lambda s: pd.to_datetime(s.timestamp) if s.timestamp else _sort_sentinel)
+        # A scan without a start time cannot be placed, correlated or written validly
+        if self.data_source != DataSourceType.NEUTRON:
+            untimed = [s for s in scan_list if not s.timestamp]
+            if untimed:
+                names = [os.path.basename(str(s.source_nxs or s.oned or s.twod)) for s in untimed]
+                logger.warning(f"{len(untimed)} scans have no start time and were skipped: "
+                               f"{name_list(names)}" if len(untimed) != 1 else
+                               f"1 scan has no start time and was skipped: {names[0]}")
+                scan_list = [s for s in scan_list if s.timestamp]
+
+        scan_list.sort(key=lambda s: pd.to_datetime(s.timestamp))
 
         for i, scan in enumerate(scan_list, start=1):
             scan.scan_num = i
@@ -612,15 +747,12 @@ class ScanProcessor:
 
     @staticmethod
     def _parse_echem_timestamps(echem_df: pd.DataFrame) -> Optional[pd.Series]:
-        """Parse echem timestamps, falling back to the day-first formats; None if all fail."""
-        for kwargs in ({}, {"format": "%d/%m/%Y %H:%M:%S.%f"},
-                       {"format": "%d/%m/%Y %H:%M:%S"}):
-            try:
-                return pd.to_datetime(echem_df["timestamp"], **kwargs)
-            except (ValueError, TypeError):
-                continue
-        logger.error("Could not parse echem timestamps")
-        return None
+        """Return the echem timestamps as datetime64; None, logged, when no one unit holds them all."""
+        try:
+            return pd.to_datetime(echem_df["timestamp"])
+        except (ValueError, TypeError):
+            logger.error("Could not parse echem timestamps")
+            return None
 
     def _correlate_absolute_time(self, scan_list: List[Scan], echem_df: pd.DataFrame) -> None:
         """Match scans to nearest echem point by absolute timestamp proximity."""
@@ -631,15 +763,14 @@ class ScanProcessor:
         echem_start = echem_timestamps.min()
         echem_end = echem_timestamps.max()
         tolerance = pd.Timedelta(seconds=self.echem_time_tolerance)
+        scan_times = []
 
         for scan in scan_list:
             scan_time = scan.timestamp_for_correlation
             if not scan_time:
                 scan.echem_timestamp = None
                 continue
-
-            if isinstance(scan_time, str):
-                scan_time = pd.to_datetime(scan_time)
+            scan_times.append(scan_time)
 
             # Skip scans outside echem window + tolerance
             if scan_time < echem_start - tolerance or scan_time > echem_end + tolerance:
@@ -661,6 +792,18 @@ class ScanProcessor:
                 scan.echem = None
                 scan.current = None
                 scan.echem_timestamp = None
+
+        # Not one match is usually a day/month swap in the echem dates or the wrong time method
+        if scan_times and all(scan.echem is None for scan in scan_list):
+            n = len(scan_times)
+            logger.warning(
+                f"No scan matched the echem data: {n} scan{'s' if n != 1 else ''} from "
+                f"{min(scan_times).isoformat(' ', 'minutes')} to "
+                f"{max(scan_times).isoformat(' ', 'minutes')}, echem from "
+                f"{echem_start.isoformat(' ', 'minutes')} to "
+                f"{echem_end.isoformat(' ', 'minutes')}, "
+                f"tolerance {self.echem_time_tolerance:g} s; check the echem date format and "
+                "the time method")
 
     def _acquisition_window(self, scan: Scan) -> Tuple[Optional[pd.Timestamp],
                                                        Optional[pd.Timestamp]]:
@@ -686,8 +829,7 @@ class ScanProcessor:
     def _annotate_echem_window(self, scan_list: List[Scan],
                                echem_df: pd.DataFrame) -> None:
         """Fill per-scan voltage/current extrema over the acquisition window, bounds inclusive.
-        Clock-aligned like the nearest-point match (the Figure 4 window summary); runs before
-        the relative-display rewrite of echem_df."""
+        Clock-aligned like the nearest-point match (the Figure 4 window summary)."""
         echem_timestamps = self._parse_echem_timestamps(echem_df)
         if echem_timestamps is None:
             return
@@ -732,37 +874,6 @@ class ScanProcessor:
                 if not np.all(np.isnan(window_i)):
                     scan.current_min = float(np.nanmin(window_i))
                     scan.current_max = float(np.nanmax(window_i))
-
-    def _apply_relative_time(self, scan_list: List[Scan], echem_df: pd.DataFrame) -> None:
-        """Replace scan and echem timestamps with relative HH:MM:SS display strings."""
-        if self.data_source == DataSourceType.NEUTRON:
-            reference_time = self.neutron_reference_time
-        else:
-            reference_time = self.xrd_reference_time
-
-        if reference_time:
-            for scan in scan_list:
-                base_time = None
-
-                if scan.timestamp_for_correlation is not None:
-                    base_time = scan.timestamp_for_correlation
-                elif scan.timestamp:
-                    try:
-                        base_time = pd.to_datetime(scan.timestamp)
-                    except (ValueError, TypeError):
-                        base_time = None
-
-                if base_time is not None:
-                    scan.original_timestamp = scan.timestamp
-                    relative_seconds = (base_time - reference_time).total_seconds()
-                    scan.timestamp = format_relative_time(relative_seconds)
-
-        if not echem_df.empty and self.echem_reference_time:
-            original_timestamps = pd.to_datetime(echem_df["timestamp"])
-            relative_seconds = (original_timestamps - self.echem_reference_time).dt.total_seconds()
-
-            echem_df["original_timestamp"] = echem_df["timestamp"].copy()
-            echem_df["timestamp"] = [format_relative_time(sec) for sec in relative_seconds]
 
 
 def format_relative_time(seconds: float) -> str:

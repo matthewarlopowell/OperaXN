@@ -22,6 +22,9 @@ dist/
 .coverage
 htmlcov/
 
+# Debug log (OPERAXN_DEBUG=1 writes operaxn.log)
+*.log
+
 # OS files
 .DS_Store
 Thumbs.db

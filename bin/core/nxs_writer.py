@@ -7,9 +7,12 @@ and the deliberate NXmonopd / NXtofnpd deviations. Groups list members in creati
 Timestamps are offset-aware ISO 8601 (_iso); string fallbacks keep unparseable ones verbatim.
 """
 
+import contextlib
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+import threading
+from datetime import datetime
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import h5py
 import numpy as np
@@ -18,9 +21,10 @@ import pandas as pd
 from .config import (DEFAULT_PROFILES, DEFINITION_URL_BASE, DEFINITION_VERSION,
                      ECHEM_TIME_TOLERANCE,
                      GENERATOR_NAME, GENERATOR_VERSION, INSTRUMENT_PROFILES)
-from .classify import extract_edf_scan_fields, parse_mantid_header
+from .classify import (extract_edf_scan_fields, parse_mantid_header,
+                       parse_mantid_header_lines)
 from .correlate import EchemParser
-from .model import DataSourceType, Scan
+from .model import DataSourceType, Scan, check_cancelled
 from .readers import FABIO_AVAILABLE, DataReaderFactory, HDFReader, fabio
 
 logger = logging.getLogger(__name__)
@@ -35,8 +39,8 @@ EDF_EXCLUDE_FIELDS = {
     'SumForIntensity1', 'TransmittedFlux', 'Saturation',
     'pilai0', 'pilai1', 'pilct0', 'pilct1', 'pilroi0', 'pilroi1', 'Pil_Roi0'
 }
-# Per-scan items of a source scan .nxs (the window and the run number live
-# in the subentries); count_time stays, it is a detector setting
+# A source scan .nxs's acquisition window and scan_identifier (the subentries hold them);
+# its other small fields are the first scan's, verbatim, entry_identifier and count_time included
 NXS_EXCLUDE_FIELDS = {'start_time', 'end_time', 'scan_identifier'}
 
 # Targeted pulls from a source synchrotron .nxs for the NXinstrument slots
@@ -69,10 +73,11 @@ def extract_edf_global_metadata(edf_path: str) -> Dict[str, Any]:
             if value is None or str(value).strip() == '':
                 continue
             metadata[key] = value
-        logger.info(f"Extracted {len(metadata)} EDF metadata fields")
+        logger.debug(f"Extracted {len(metadata)} EDF metadata "
+                     f"field{'s' if len(metadata) != 1 else ''}")
         return metadata
     except Exception as e:
-        logger.error(f"Error extracting EDF metadata: {e}")
+        logger.error(f"Error extracting EDF metadata from {os.path.basename(edf_path)}: {e}")
         return {}
 
 
@@ -113,10 +118,11 @@ def extract_nxs_global_metadata(nxs_path: str) -> Dict[str, Any]:
 
             f.visititems(extract_item)
 
-        logger.info(f"Extracted {len(metadata)} NeXus metadata fields")
+        logger.debug(f"Extracted {len(metadata)} NeXus metadata "
+                     f"field{'s' if len(metadata) != 1 else ''}")
         return metadata
     except Exception as e:
-        logger.error(f"Error extracting NeXus metadata: {e}")
+        logger.error(f"Error extracting NeXus metadata from {os.path.basename(nxs_path)}: {e}")
         return {}
 
 
@@ -215,6 +221,20 @@ CYCLING_PROTOCOL_FIELDS = (
 )
 
 
+@contextlib.contextmanager
+def replace_when_done(path: str) -> Iterator[str]:
+    """Yield '<path>.part' to write, moved onto path only when the block succeeds.
+    On any failure the part file is removed and path keeps its previous content."""
+    part = path + '.part'
+    try:
+        yield part
+        os.replace(part, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(part)
+        raise
+
+
 def _is_blank(value: Any) -> bool:
     """True for None or a whitespace-only string."""
     return value is None or (isinstance(value, str) and not value.strip())
@@ -224,7 +244,7 @@ def _ts_sort_key(value: Any) -> Tuple[int, Any]:
     """Return a sort key for a str or Timestamp value; unparseable values sort last.
     Offsets are dropped so naive and tz-aware values stay comparable."""
     try:
-        ts = pd.to_datetime(value)
+        ts = pd.Timestamp(value)
     except (ValueError, TypeError):
         return (1, pd.Timestamp.max)
     if ts.tzinfo is not None:
@@ -239,7 +259,7 @@ def _scan_window(scan: Scan) -> Tuple[Any, Any]:
     end = scan.neutron_end
     if end is None and start and scan.exposure_time:
         try:
-            end = pd.to_datetime(start) + pd.Timedelta(seconds=scan.exposure_time)
+            end = pd.Timestamp(start) + pd.Timedelta(seconds=scan.exposure_time)
         except (ValueError, TypeError):
             end = None
     return start, end
@@ -262,12 +282,16 @@ def _iso(value: Any) -> Optional[str]:
     if value is None:
         return None
     try:
-        ts = pd.to_datetime(value)
+        ts = pd.Timestamp(value)
     except (ValueError, TypeError):
         return None
     if pd.isna(ts):
         return None
-    return ts.to_pydatetime().astimezone().isoformat()
+    try:
+        return ts.to_pydatetime().astimezone().isoformat()
+    except (OverflowError, OSError):
+        # Windows has no local offset before 1970: use the zone's offset on 1971-01-01
+        return ts.tz_localize(datetime(1971, 1, 1).astimezone().tzinfo).isoformat()
 
 
 def _nx_group(parent: h5py.Group, name: str, nx_class: str) -> h5py.Group:
@@ -375,15 +399,17 @@ class NXSWriter:
     # --- top level ---
 
     def write(self, output_path: str, scans: List[Scan], echem_df: pd.DataFrame,
-              standard_echem_files: Optional[List[Union[str, Tuple[str, str]]]] = None
-              ) -> None:
-        """Write the full canonical file: metadata, scans, and echem layers."""
+              standard_echem_files: Optional[List[Union[str, Tuple[str, str]]]] = None,
+              cancel: Optional[threading.Event] = None) -> None:
+        """Write the full canonical file: metadata, scans, and echem layers.
+        A set cancel raises Cancelled before the next scan; output_path keeps its old content."""
         harvest = self._harvest_experiment_metadata(scans)
 
         # track_order: members list in the order written here (the NXmonopd /
         # NXtofnpd sequence, additions after the item they extend) instead
         # of HDF5's default alphabetical index; see definitions/README.md
-        with h5py.File(output_path, 'w', track_order=True) as f:
+        with replace_when_done(output_path) as part, \
+                h5py.File(part, 'w', track_order=True) as f:
             f.attrs['NX_class'] = 'NXroot'
             f.attrs['file_name'] = os.path.basename(output_path)
             f.attrs['file_time'] = _iso(pd.Timestamp.now())
@@ -394,7 +420,7 @@ class NXSWriter:
             self._write_process(entry, scans)
             self._write_flightpath(entry, harvest)
             self._write_user(entry, harvest)
-            self._write_instrument(entry, scans, harvest)
+            self._write_instrument(entry, harvest)
             self._write_sample(entry, harvest)
             self._write_cycling_protocol(entry, echem_df)
             self._write_monitor(entry, scans, harvest)
@@ -402,44 +428,47 @@ class NXSWriter:
             self._write_standard_echem(entry, standard_echem_files)
 
             for scan in scans:
+                check_cancelled(cancel)
                 self._write_scan(entry, scan)
 
         logger.info(f"NeXus file written to {output_path}")
 
     def _harvest_experiment_metadata(self, scans: List[Scan]) -> Dict[str, Any]:
-        """Harvest metadata from the first scan's files, merged over the instrument profile."""
+        """Harvest each source from the first scan that has it, merged over the instrument profile."""
         harvested: Dict[str, Any] = {}
 
-        first = scans[0] if scans else None
-        if first is not None:
-            # Laboratory: EDF header of the first 2D file
-            twod = first.twod
-            if twod and str(twod).lower().endswith('.edf'):
-                edf = extract_edf_scan_fields(str(twod))
-                harvested.update(edf.get('instrument', {}))
-                harvested['_edf_global'] = extract_edf_global_metadata(str(twod))
+        # Laboratory: EDF header of the first 2D file
+        twod = next((str(s.twod) for s in scans
+                     if s.twod and str(s.twod).lower().endswith('.edf')), None)
+        if twod:
+            edf = extract_edf_scan_fields(twod)
+            harvested.update(edf.get('instrument', {}))
+            harvested['_edf_global'] = extract_edf_global_metadata(twod)
 
-            # Synchrotron: targeted slots + full dump from the source .nxs
-            if self.data_source == DataSourceType.SYNCHROTRON:
-                src = first.source_nxs
-                if src and os.path.isfile(src):
-                    harvested.update(extract_synchrotron_fields(src))
-                    harvested['_nxs_global'] = extract_nxs_global_metadata(src)
+        # Synchrotron: targeted slots + full dump from the first source .nxs
+        if self.data_source == DataSourceType.SYNCHROTRON:
+            src = next((s.source_nxs for s in scans
+                        if s.source_nxs and os.path.isfile(s.source_nxs)), None)
+            if src:
+                harvested.update(extract_synchrotron_fields(src))
+                harvested['_nxs_global'] = extract_nxs_global_metadata(src)
 
-            # Neutron: Mantid header of the first data file + logbook extras
-            if self.data_source == DataSourceType.NEUTRON:
-                if first.neutron_files:
-                    for meas in first.neutron_files.values():
-                        path = meas.get('tof') or meas.get('d')
-                        if path:
-                            mantid = parse_mantid_header(path)
-                            if mantid.get('instrument'):
-                                harvested['instrument_name'] = mantid['instrument']
-                            break
-                if first.logbook:
-                    for key in ('run_title', 'users', 'proposal'):
-                        if first.logbook.get(key):
-                            harvested[key] = first.logbook[key]
+        # Neutron: Mantid header of the first data file + logbook extras
+        if self.data_source == DataSourceType.NEUTRON:
+            files = next((s.neutron_files for s in scans if s.neutron_files), None)
+            if files:
+                for meas in files.values():
+                    path = meas.get('tof') or meas.get('d')
+                    if path:
+                        mantid = parse_mantid_header(path)
+                        if mantid.get('instrument'):
+                            harvested['instrument_name'] = mantid['instrument']
+                        break
+            logbook = next((s.logbook for s in scans if s.logbook), None)
+            if logbook:
+                for key in ('run_title', 'users', 'proposal'):
+                    if logbook.get(key):
+                        harvested[key] = logbook[key]
 
         profile = get_profile(self.data_source, harvested.get('instrument_name'))
         # harvested values win over profile defaults
@@ -496,8 +525,7 @@ class NXSWriter:
             logger.warning(f"Skipping non-numeric pre_sample_flightpath "
                            f"{flightpath!r}")
 
-    def _write_instrument(self, entry: h5py.Group, scans: List[Scan],
-                          harvest: Dict[str, Any]) -> None:
+    def _write_instrument(self, entry: h5py.Group, harvest: Dict[str, Any]) -> None:
         """Write the NXinstrument: source, crystal, detector and the raw-harvest collections."""
         inst = _nx_group(entry, 'instrument', 'NXinstrument')
         # NeXus linking convention: the linked-to object names its own path
@@ -520,8 +548,16 @@ class NXSWriter:
                 wavelength = float(harvest['wavelength_m']) * 1e10  # m -> Angstrom
             except (ValueError, TypeError):
                 pass
-        elif 'wavelength' in harvest:
-            wavelength = harvest['wavelength']
+        elif harvest.get('wavelength') is not None:
+            # Profile value, angstrom (i11-1: supplied per experiment)
+            try:
+                wavelength = float(harvest['wavelength'])
+            except (ValueError, TypeError):
+                wavelength = float('nan')
+            if not np.isfinite(wavelength):
+                logger.warning(f"Skipping profile wavelength {harvest['wavelength']!r}: "
+                               "not a finite number")
+                wavelength = None
         if wavelength and self.data_source != DataSourceType.NEUTRON:
             crystal = _nx_group(inst, 'crystal', 'NXcrystal')
             ds = crystal.create_dataset('wavelength', data=float(wavelength))
@@ -548,19 +584,30 @@ class NXSWriter:
             'beam_center_x': 'pixel',
             'beam_center_y': 'pixel',
         }
-        present = {name: value for name, value in detector_fields.items()
-                   if value is not None}
+        present: Dict[str, Any] = {}
+        for name, value in detector_fields.items():
+            if value is None:
+                continue
+            if name == 'description':
+                present[name] = str(value)
+                continue
+            try:
+                number = float(value)
+            except (ValueError, TypeError):
+                number = float('nan')
+            if np.isfinite(number):
+                present[name] = number
+            else:
+                # The verbatim header value stays in edf_metadata
+                logger.warning(f"Skipping detector {name} {value!r}: not a finite number")
         geometry = (self._geometry_arrays(harvest.get('detector_banks'))
                     if self.data_source == DataSourceType.NEUTRON else None)
         if present or geometry:
             detector = _nx_group(inst, 'detector', 'NXdetector')
             for name, value in present.items():
-                try:
-                    ds = detector.create_dataset(name, data=float(value))
-                    if detector_units.get(name):
-                        ds.attrs['units'] = detector_units[name]
-                except (ValueError, TypeError):
-                    detector.create_dataset(name, data=str(value))
+                ds = detector.create_dataset(name, data=value)
+                if detector_units.get(name):
+                    ds.attrs['units'] = detector_units[name]
             if geometry:
                 self._write_geometry(detector, geometry)
 
@@ -773,11 +820,11 @@ class NXSWriter:
 
     def _write_scan_monitor(self, sub: h5py.Group, scan: Scan) -> None:
         """Write one in-house acquisition's monitor integral from its EDF Monitor counter.
-        No group for a missing or non-positive count; mode and preset live at entry level."""
+        No group unless the count is finite and positive; mode and preset live at entry level."""
         if not (scan.twod and str(scan.twod).lower().endswith('.edf')):
             return
         integral = extract_edf_scan_fields(str(scan.twod)).get('monitor', {}).get('Monitor')
-        if not integral or float(integral) <= 0:
+        if not integral or not np.isfinite(float(integral)) or float(integral) <= 0:
             return
         monitor = _nx_group(sub, 'monitor', 'NXmonitor')
         integral_ds = monitor.create_dataset('integral', data=float(integral))
@@ -789,7 +836,7 @@ class NXSWriter:
             # Read before creating the group: a read failure must not leave
             # an empty NXdata shell behind
             try:
-                arr = np.asarray(DataReaderFactory.read_file(scan.oned))
+                arr = np.asarray(DataReaderFactory.read_file(scan.oned, use_cache=False))
                 if arr.ndim != 2 or arr.shape[1] < 2:
                     raise ValueError(f"expected an (N, >=2) array, got {arr.shape}")
             except Exception as e:
@@ -832,7 +879,7 @@ class NXSWriter:
                     data_2d = hdf_reader.read(twod_path, use_cache=False)
                     original_shape = hdf_reader.original_shape
                 else:
-                    data_2d = DataReaderFactory.read_file(twod_path)
+                    data_2d = DataReaderFactory.read_file(twod_path, use_cache=False)
                     original_shape = data_2d.shape
 
                 image = _nx_group(sub, 'image_data', 'NXdata')
@@ -872,9 +919,10 @@ class NXSWriter:
                 # Read before creating the group: a failed read must not
                 # leave an empty NXdata shell (the definition requires data)
                 try:
-                    arr = DataReaderFactory.read_file(path, is_neutron=True)
+                    reader = DataReaderFactory.get_reader(path, is_neutron=True)
+                    arr, lines = reader.read_with_lines(path)
                 except Exception as e:
-                    logger.error(f"Error reading {key} data {path}: {e}")
+                    logger.error(f"Error reading {key} data for scan {scan.scan_num}: {e}")
                     continue
                 bank = _nx_group(sub, name, 'NXdata')
                 try:
@@ -887,7 +935,7 @@ class NXSWriter:
                         bank.create_dataset('data_errors', data=arr[:, 2])
                     x_ds = bank.create_dataset(x_name, data=arr[:, 0])
 
-                    header = parse_mantid_header(path)
+                    header = parse_mantid_header_lines(lines)
                     label = header.get('x_unit')
                     if label:
                         # Mantid exports axis labels, not units
@@ -904,6 +952,10 @@ class NXSWriter:
                 except Exception as e:
                     logger.error(f"Error writing {name}: {e}")
                     del sub[name]
+        if not any(name.startswith('bank_') for name in sub):
+            run = (scan.logbook or {}).get('full_line', '').split('\t')[0].strip()
+            label = f"Scan {scan.scan_num} (run {run})" if run else f"Scan {scan.scan_num}"
+            logger.warning(f"{label}: no bank file could be read; written without data")
 
     # --- electrochemistry layers ---
 
@@ -931,16 +983,22 @@ class NXSWriter:
             # (parse_path, display_path) pairs keep the user's filename as
             # provenance when the parsed file is a converted temp copy
             parse_path, display_path = item if isinstance(item, tuple) else (item, item)
+            name = os.path.basename(display_path)
+            if parse_path.lower().endswith(('.xlsx', '.csv')):
+                continue  # conversion failed, already logged
             if not os.path.isfile(parse_path):
+                logger.warning(f"Standard electrochemistry file {name} not found; skipped")
                 continue
-            standard_echem_df = self.echem_parser.parse(parse_path)
+            standard_echem_df = self.echem_parser.parse(parse_path, name)
             if standard_echem_df is None or standard_echem_df.empty:
+                logger.warning(f"No electrochemistry data found in {name}; not stored")
                 continue
-            datasets.append({'source_file': os.path.basename(display_path),
+            datasets.append({'source_file': name,
                              'data': standard_echem_df})
             logger.info(f"Added standard electrochemistry file"
-                        f" {os.path.basename(display_path)}"
-                        f" ({len(standard_echem_df)} points)")
+                        f" {name}"
+                        f" ({len(standard_echem_df)} "
+                        f"point{'s' if len(standard_echem_df) != 1 else ''})")
 
         if datasets:
             write_standard_echem_group(entry, datasets)

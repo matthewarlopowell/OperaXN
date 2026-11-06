@@ -1,5 +1,6 @@
 """Schema v4 metadata: reader round-trips, overrides, profiles, v3 back-compat and validation."""
 import ast
+import logging
 import os
 import re
 
@@ -10,7 +11,7 @@ import pytest
 import core
 
 import _builders
-from _helpers import s, wall, tz_aware, assert_pynxtools_valid
+from _helpers import s, wall, tz_aware, assert_pynxtools_valid, needs_fabio
 
 
 def test_monopd_reader_roundtrip(inhouse_nxs):
@@ -71,6 +72,25 @@ def test_v3_backcompat(legacy_v3_nxs):
     assert lm.global_metadata.get("generator_version") == "2.0.0"
     assert "echem_time_tolerance" not in lm.global_metadata, \
         "files written before the tolerance was recorded carry no key"
+    assert lm.data_source == "inhouse"
+
+
+def test_v1_layout_loads(legacy_v1_nxs):
+    """A file in the released v1.0.0 layout loads its scans, patterns, echem values and record,
+    metadata and data source."""
+    assert core.is_canonical_nxs(legacy_v1_nxs)
+    lm = core.load(legacy_v1_nxs)
+    assert [s.scan_num for s in lm.scans] == [1, 2]
+    s1, s2 = lm.scans
+    assert s1.echem == 3.76 and s1.current == 0.106 and s1.exposure_time == 120.0
+    assert s2.echem == 3.81 and s2.timestamp == "2024-02-05 10:10:00"
+    assert s1.midpoint_timestamp == "2024-02-05 10:06:00" and s1.echem_timestamp == "2024-02-05 10:06:00"
+    assert np.allclose(s1.oned["x"], _builders.ONED_X)
+    assert np.allclose(s2.oned["y"], _builders.inhouse_scan_y(2)) and s2.oned["source"] == "scan_002.dat"
+    assert lm.echem_df is not None and len(lm.echem_df) == 40
+    assert str(lm.echem_df["timestamp"].iloc[1]) == "2024-02-05 10:01:00"
+    assert np.allclose(lm.echem_df["current"].iloc[:2], [0.1, 0.101])
+    assert lm.global_metadata.get("generator_version") == "1.0.0"
     assert lm.data_source == "inhouse"
 
 
@@ -198,6 +218,82 @@ def test_tofnpd_geometry_placeholders_skipped(tmp_path, polaris_src, monkeypatch
         assert "detector" not in e["instrument"], \
             "nothing to write, so no empty detector group"
         assert "monitor" not in e, "None monitor_mode must write no monitor group"
+
+
+@needs_fabio
+def test_na_edf_geometry_is_not_written_and_file_validates(tmp_path):
+    """SampleDistance 'NA' leaves distance out (raw header kept) instead of a string in NX_FLOAT."""
+    src = str(tmp_path / "edf_na")
+    os.makedirs(src)
+    _builders.write_xrd_dat(os.path.join(src, "scan_001.dat"), _builders.SCAN_TIMES[0])
+    _builders.write_edf_image(os.path.join(src, "image_001.edf"), _builders.SCAN_TIMES[0],
+                              SampleDistance="NA", Center_1="NA", DetectorModel="300")
+    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
+    out = str(tmp_path / "na.nxs")
+    ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
+    assert ok, msgs
+    with h5py.File(out, "r") as f:
+        det = f["entry/instrument/detector"]
+        assert "distance" not in det and "beam_center_x" not in det
+        assert det["description"].dtype.kind in "OS", "description is NX_CHAR"
+        assert f["entry/instrument/edf_metadata/SampleDistance"][()] in (b"NA", "NA")
+    assert_pynxtools_valid(out, "edf NA")
+
+
+@needs_fabio
+def test_nan_and_inf_edf_geometry_are_not_written(tmp_path, caplog):
+    """SampleDistance 'nan' and PSize_1 'inf' are left out with a warning, like 'NA'."""
+    src = str(tmp_path / "lab")
+    _builders.write_lab_dir(src)
+    _builders.write_edf_image(os.path.join(src, "image_001.edf"), _builders.SCAN_TIMES[0],
+                              SampleDistance="nan", PSize_1="inf", PSize_2="0.000172")
+    out = str(tmp_path / "nonfinite.nxs")
+    with caplog.at_level(logging.WARNING):
+        ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
+    assert ok, msgs
+    with h5py.File(out, "r") as f:
+        det = f["entry/instrument/detector"]
+        assert "distance" not in det and "x_pixel_size" not in det
+        assert det["y_pixel_size"][()] == pytest.approx(0.000172)
+    assert sum("not a finite number" in r.getMessage() for r in caplog.records) == 2
+    assert_pynxtools_valid(out, "nan geometry")
+
+
+@needs_fabio
+def test_numeric_edf_comment_and_detector_model_are_stored_verbatim(tmp_path):
+    """A Comment "4225" names the sample "4225" and a DetectorModel "300" stays "300"."""
+    src = str(tmp_path / "lab")
+    _builders.write_lab_dir(src)
+    _builders.write_edf_image(os.path.join(src, "image_001.edf"), _builders.SCAN_TIMES[0],
+                              Comment="4225", DetectorModel="300")
+    out = str(tmp_path / "numeric_text.nxs")
+    ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
+    assert ok, msgs
+    with h5py.File(out, "r") as f:
+        assert s(f["entry/sample/name"]) == "4225"
+        assert s(f["entry/instrument/detector/description"]) == "300"
+    assert_pynxtools_valid(out, "numeric comment")
+
+
+@needs_fabio
+def test_metadata_comes_from_the_first_scan_with_an_edf(tmp_path):
+    """Scan 1 without an EDF: scan 2's header gives wavelength, detector, edf_metadata and sample name."""
+    src = str(tmp_path / "lab")
+    _builders.write_lab_dir(src)
+    for i in (2, 3):
+        _builders.write_edf_image(os.path.join(src, f"image_{i:03d}.edf"),
+                                  _builders.SCAN_TIMES[i - 1])
+    out = str(tmp_path / "later_edf.nxs")
+    ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
+    assert ok, msgs
+    with h5py.File(out, "r") as f:
+        assert "image_source" not in f["entry/scan_000001"]
+        assert "image_source" in f["entry/scan_000002"]
+        inst = f["entry/instrument"]
+        assert inst["crystal/wavelength"][()] == pytest.approx(1.541891)
+        assert "distance" in inst["detector"] and "edf_metadata" in inst
+        assert s(f["entry/sample/name"]) == "Cell_TEST"
+    assert_pynxtools_valid(out, "edf from scan 2")
 
 
 def test_polaris_profile_geometry_written(tmp_path, polaris_src):
@@ -404,9 +500,7 @@ def test_wish_profile_minimal(tmp_path):
     assert not any(k in profile for k in ("pre_sample_flightpath_m", "detector_banks",
                                           "monitors", "monitor_mode")), str(profile)
     src = tmp_path / "wish"
-    _builders.write_detailed_neutron_dir(str(src))
-    for dat in src.glob("*.dat"):
-        dat.write_text(dat.read_text().replace("Instrument POLARIS", "Instrument WISH"))
+    _builders.write_wish_dir(str(src))
     nxs = str(tmp_path / "wish.nxs")
     ok, msgs = core.generate([str(src)], nxs, core.DataSourceType.NEUTRON)
     assert ok, msgs
@@ -507,3 +601,69 @@ def test_release_version_matches_package_and_citation():
     assert package and cited, "version line not found"
     assert package.group(1) == core.GENERATOR_VERSION, "pyproject.toml version differs"
     assert cited.group(1).strip("'\"") == core.GENERATOR_VERSION, "CITATION.cff version differs"
+
+
+def test_dependency_floors_agree():
+    """pyproject.toml, requirements.txt and the README Dependencies list declare the same floors."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def read(name):
+        with open(os.path.join(root, name), encoding="utf-8") as fh:
+            return fh.read()
+
+    deps = read("pyproject.toml").split("\ndependencies = [", 1)[1].split("]", 1)[0]
+    declared = dict(re.findall(r'"([A-Za-z0-9_-]+)>=([\d.]+)"', deps))
+    listed = dict(re.findall(r"^([A-Za-z0-9_-]+)>=([\d.]+)\s*$", read("requirements.txt"), re.M))
+    readme = read("README.md").split("\n## Dependencies", 1)[1].split("\n## ", 1)[0]
+    shown = {name.lower(): floor
+             for name, floor in re.findall(r"^- (\S+) >= ([\d.]+)\s*$", readme, re.M)}
+    shown.pop("python", None)
+    assert len(declared) == 6, declared
+    assert listed == declared, "requirements.txt floors differ from pyproject.toml"
+    assert shown == declared, "README.md floors differ from pyproject.toml"
+
+
+@needs_fabio
+def test_pre_1970_scan_times_write_a_valid_file(tmp_path):
+    """Scans dated 1 January 1970 (an epoch-reset clock) generate in relative mode and validate."""
+    src = tmp_path / "clock1970"
+    src.mkdir()
+    for i, m in enumerate(("05", "15", "25"), start=1):
+        stamp = f"1970-01-01T10:{m}:00"
+        _builders.write_xrd_dat(str(src / f"scan_{i:03d}.dat"), stamp, y=_builders.inhouse_scan_y(i))
+        _builders.write_edf_image(str(src / f"scan_{i:03d}.edf"), stamp, offset=float(i))
+    _builders.write_echem_txt(str(src / "echem.txt"))
+    out = str(tmp_path / "clock1970.nxs")
+    ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE,
+                             time_method=core.TimeMethod.RELATIVE)
+    assert ok, str(msgs)
+    model = core.load(out)
+    assert [round(s.echem, 2) for s in model.scans] == [3.7, 3.8, 3.9]
+    with h5py.File(out, "r") as f:
+        start = f["entry/start_time"][()].decode()
+    assert start.startswith("1970-01-01T10:") and start[-6] in "+-", start
+    assert_pynxtools_valid(out)
+
+
+@needs_fabio
+@pytest.mark.parametrize("bad_side, bad_file, expected", [
+    pytest.param("dat", "scan_002.dat", [(True, True), (False, True), (True, True)], id="dat"),
+    pytest.param("edf", "scan_002.edf", [(True, True), (True, False), (True, True)], id="edf"),
+])
+def test_unreadable_date_skips_only_that_file(tmp_path, caplog, bad_side, bad_file, expected):
+    """An unreadable Date skips that one file with one warning naming it; its twin stays a
+    correlated scan of its own and the generate succeeds with a valid file."""
+    bad = [_builders.SCAN_TIMES[0], "unknown", _builders.SCAN_TIMES[2]]
+    src = str(tmp_path / "pairs")
+    _builders.write_dated_pairs(src, bad if bad_side == "dat" else _builders.SCAN_TIMES,
+                                bad if bad_side == "edf" else _builders.SCAN_TIMES)
+    out = str(tmp_path / "skip.nxs")
+    with caplog.at_level(logging.WARNING, logger="core"):
+        ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
+    assert ok, str(msgs)
+    named = [r.getMessage() for r in caplog.records if bad_file in r.getMessage()]
+    assert len(named) == 1 and "'unknown'" in named[0], named
+    model = core.load(out)
+    assert [(s.oned is not None, s.twod_source is not None) for s in model.scans] == expected
+    assert [round(s.echem, 2) for s in model.scans] == [3.76, 3.81, 3.86]
+    assert_pynxtools_valid(out)

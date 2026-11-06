@@ -24,7 +24,7 @@ from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 
 from .config import (
-    CSV_ENCODING, FIGURE_DPI, OPERAXNTheme, SECONDS_PER_HOUR, TIME_HOURS_LABEL,
+    CSV_ENCODING, FIGURE_DPI, OPERAXNTheme, SECONDS_PER_HOUR,
 )
 
 # Theme shorthands, also imported by heatmap.py
@@ -53,10 +53,27 @@ _FONT = OPERAXNTheme.FONTS['small']
 _FONT_BTN = OPERAXNTheme.FONTS['button']
 _PAD_S = OPERAXNTheme.PADDING['small']
 
+# ICI keeps its units in parentheses until the merge with the new ICI version
+TIME_HOURS_LABEL_ICI = 'Time (h)'
+
 
 # ============================================================================
 # Window Helpers
 # ============================================================================
+
+def trace_write(owner: tk.Misc, var: tk.Variable, callback) -> None:
+    """Call callback on every write to var until owner is destroyed (a live trace would keep owner)."""
+    name = var.trace_add('write', callback)
+
+    def _remove(event) -> None:
+        if event.widget is owner:
+            try:
+                var.trace_remove('write', name)
+            except tk.TclError:
+                pass
+
+    owner.bind('<Destroy>', _remove, add='+')
+
 
 def maximise_window(win: tk.Toplevel) -> None:
     """Maximise a toplevel, with fallbacks per window manager."""
@@ -351,7 +368,7 @@ def echem_source_button(master, var, values, command=None,
 
     set_values(values)
     button.config(menu=source_menu)
-    var.trace_add('write', lambda *_: display_var.set(display_text(var.get())))
+    trace_write(button, var, lambda *_: display_var.set(display_text(var.get())))
     button.set_values = set_values
     return button
 
@@ -403,7 +420,7 @@ class _SelectorStrip(tk.Frame):
         self._cycle_spin.pack(side='left', padx=2)
         _Btn(cycle_frame, '▶', width=1, padx=2,
              command=self._next_cycle).pack(side='left', padx=1)
-        self.cycle_var.trace_add('write', lambda *_: self._on_change())
+        trace_write(self, self.cycle_var, lambda *_: self._on_change())
 
         _separator(row, horizontal=False).pack(
             side='left', fill='y', padx=2, pady=3)
@@ -420,7 +437,7 @@ class _SelectorStrip(tk.Frame):
         self._pulse_spin.pack(side='left', padx=2)
         _Btn(pulse_frame, '▶', width=1, padx=2,
              command=self._next_pulse).pack(side='left', padx=1)
-        self.pulse_var.trace_add('write', lambda *_: self._on_change())
+        trace_write(self, self.pulse_var, lambda *_: self._on_change())
 
         _separator(row, horizontal=False).pack(
             side='left', fill='y', padx=2, pady=3)
@@ -564,7 +581,7 @@ class _RegressionBar(tk.Frame):
 
         # Any edit (arrows or typing) applies live to the selected pulse
         for var in (self.start_var, self.length_var, self.max_rest_var):
-            var.trace_add('write', lambda *_: self._on_change())
+            trace_write(self, var, lambda *_: self._on_change())
 
         _Btn(row, 'Apply All', style='primary',
              command=self._on_apply_all).pack(side='left', padx=2)
@@ -600,7 +617,7 @@ class _RKAxisBar(tk.Frame):
         mass_entry.pack(side='left', padx=(2, _PAD_S))
         mass_entry.bind('<Return>', lambda *_: self._on_change())
         mass_entry.bind('<FocusOut>', lambda *_: self._on_change())
-        self.mass_var.trace_add('write', lambda *_: self._on_change())
+        trace_write(self, self.mass_var, lambda *_: self._on_change())
 
         _separator(row, horizontal=False).pack(
             side='left', fill='y', padx=_PAD_S, pady=3)
@@ -677,10 +694,7 @@ def embed_figure(fig, parent) -> FigureCanvasTkAgg:
     def _sync_after_resize(_event=None):
         job = getattr(canvas, '_operaxn_sync_job', None)
         if job is not None:
-            try:
-                parent.after_cancel(job)
-            except tk.TclError:
-                pass
+            parent.after_cancel(job)
 
         def run():
             canvas._operaxn_sync_job = None
@@ -688,7 +702,14 @@ def embed_figure(fig, parent) -> FigureCanvasTkAgg:
 
         canvas._operaxn_sync_job = parent.after(180, run)
 
+    # A sync still pending when the frame goes would fire into its deleted callback
+    def _cancel_sync(event):
+        job = getattr(canvas, '_operaxn_sync_job', None)
+        if event.widget is parent and job is not None:
+            parent.after_cancel(job)
+
     parent.bind('<Configure>', _sync_after_resize, add='+')
+    parent.bind('<Destroy>', _cancel_sync, add='+')
     return canvas
 
 
@@ -726,18 +747,22 @@ def watch_figure_sync(win, canvases):
     """Re-fit each canvas to its widget 150 ms after opening, then every 200 ms, 12 times in all.
     Layout and the DPI adjustment settle in no fixed order, so a one-shot timer can miss."""
     attempts = 0
+    job = None
 
     def watchdog():
-        nonlocal attempts
-        if not win.winfo_exists():
-            return
+        nonlocal attempts, job
         for canvas in canvases:
             sync_figure_to_widget(canvas)
         attempts += 1
-        if attempts < 12:
-            win.after(200, watchdog)
+        job = win.after(200, watchdog) if attempts < 12 else None
 
-    win.after(150, watchdog)
+    # Closing the window cancels the next run, which would fire into its deleted callback
+    def cancel(event):
+        if event.widget is win and job is not None:
+            win.after_cancel(job)
+
+    job = win.after(150, watchdog)
+    win.bind('<Destroy>', cancel, add='+')
 
 
 # ============================================================================
@@ -871,6 +896,8 @@ class ICIWindow(tk.Toplevel):
         self._fig_right = Figure(figsize=(5.0, 10), facecolor=PLOT_BG, dpi=FIGURE_DPI)
         self._build_right_axes()
         self._canvas_right = embed_figure(self._fig_right, right_frame)
+        self._canvas_right.mpl_connect('resize_event', self._fit_right_margins)
+        self._fit_right_margins()
 
         # A third of the screen, or enough for the R/k axis controls
         # (idle tasks first so the axis bar's requested width is computed)
@@ -892,8 +919,8 @@ class ICIWindow(tk.Toplevel):
                       top=0.88, bottom=0.18)
         self.ax_overview = self._fig_top.add_subplot(gs[0, 0])
         self.ax_pulse = self._fig_top.add_subplot(gs[0, 1])
-        _style_ax(self.ax_overview, TIME_HOURS_LABEL, 'Voltage (V)', 'Overview')
-        _style_ax(self.ax_pulse, TIME_HOURS_LABEL, 'Voltage (V)', 'Pulse zoom')
+        _style_ax(self.ax_overview, TIME_HOURS_LABEL_ICI, 'Voltage (V)', 'Overview')
+        _style_ax(self.ax_pulse, TIME_HOURS_LABEL_ICI, 'Voltage (V)', 'Pulse zoom')
 
     def _build_bot_axes(self):
         """Create the ICI-fit and R² axes."""
@@ -910,10 +937,7 @@ class ICIWindow(tk.Toplevel):
 
     def _build_right_axes(self):
         """Create the four stacked R/k axes."""
-        gs = GridSpec(4, 1, figure=self._fig_right,
-                      hspace=0.40,
-                      left=0.14, right=0.97,
-                      top=0.95, bottom=0.04)
+        gs = GridSpec(4, 1, figure=self._fig_right)
         self.ax_r_chg = self._fig_right.add_subplot(gs[0])
         self.ax_r_dis = self._fig_right.add_subplot(gs[1])
         self.ax_k_chg = self._fig_right.add_subplot(gs[2])
@@ -924,6 +948,30 @@ class ICIWindow(tk.Toplevel):
         _style_ax(self.ax_k_dis, 'V (V)', 'k', 'k – Discharge')
         for ax in (self.ax_r_chg, self.ax_r_dis, self.ax_k_chg, self.ax_k_dis):
             _stub(ax, 'No data')
+
+    def _fit_right_margins(self, _event=None):
+        """Space the R/k plots with even white bands around the room their labels take."""
+        fig = self._fig_right
+        width, height = max(fig.bbox.width, 1.0), max(fig.bbox.height, 1.0)
+        band = 0.028 * height  # the left figures' white band at the maximised size
+        renderer = fig.canvas.get_renderer()
+        axes = fig.axes
+        boxes = [ax.get_window_extent(renderer) for ax in axes]
+        xaxes = [ax.xaxis.get_tightbbox(renderer) for ax in axes]
+        below = [box.y0 - xaxis.y0 for box, xaxis in zip(boxes, xaxes)]
+        above = [ax.title.get_window_extent(renderer).y1 - box.y1 for ax, box in zip(axes, boxes)]
+        right = max(0.0, *(xaxis.x1 - box.x1 for box, xaxis in zip(boxes, xaxes)))
+        top = 1 - (band + above[0]) / height
+        bottom = (band + below[-1]) / height
+        gap = band + max(b + a for b, a in zip(below, above[1:]))
+        # hspace is in mean axes heights: n - 1 gaps among n rows
+        n = len(axes)
+        fig.subplots_adjust(top=top, bottom=bottom,
+                            hspace=n * gap / max((top - bottom) * height - (n - 1) * gap, 1.0))
+        # Tick labels follow the new plot heights, so measure the y labels' room afterwards
+        left = max(ax.get_window_extent(renderer).x0 - ax.yaxis.get_tightbbox(renderer).x0
+                   for ax in axes)
+        fig.subplots_adjust(left=(band + left) / width, right=1 - (band + right) / width)
 
     # ------------------------------------------------------------------
     # Data Loading
@@ -1005,7 +1053,7 @@ class ICIWindow(tk.Toplevel):
         """Plot voltage against time for the selected cycle, highlighting the pulse."""
         ax = self.ax_overview
         ax.cla()
-        _style_ax(ax, TIME_HOURS_LABEL, 'Voltage (V)', 'Overview')
+        _style_ax(ax, TIME_HOURS_LABEL_ICI, 'Voltage (V)', 'Overview')
         if self._df is None:
             _stub(ax, 'No data loaded')
             return
@@ -1045,7 +1093,7 @@ class ICIWindow(tk.Toplevel):
 
         ax = self.ax_pulse
         ax.cla()
-        _style_ax(ax, TIME_HOURS_LABEL, 'Voltage (V)', 'Pulse zoom')
+        _style_ax(ax, TIME_HOURS_LABEL_ICI, 'Voltage (V)', 'Pulse zoom')
 
         if self._df is None:
             _stub(ax, 'No data loaded')
@@ -1229,11 +1277,12 @@ class ICIWindow(tk.Toplevel):
     }
 
     def _get_mass_mg(self) -> float:
-        """Return the sample mass (mg) from the R/k axis bar, 0.0 when unset or invalid."""
+        """Return the sample mass (mg) from the R/k axis bar, 0.0 unless a finite positive number."""
         try:
-            return float(self.rk_axis_bar.mass_var.get())
+            value = float(self.rk_axis_bar.mass_var.get())
         except (ValueError, tk.TclError):
             return 0.0
+        return value if np.isfinite(value) and value > 0 else 0.0
 
     def _update_right_plots(self, cycle: int, phase: str, scope: str):
         """Redraw the four stacked R/k panels for the selected scope."""
@@ -1254,12 +1303,14 @@ class ICIWindow(tk.Toplevel):
         if self._df is None:
             for ax, _, _ in panels:
                 _stub(ax)
+            self._fit_right_margins()
             self._canvas_right.draw_idle()
             return
 
         if xaxis == 'specific_capacity' and mass_mg <= 0:
             for ax, _, _ in panels:
                 _stub(ax, 'Enter mass (mg) > 0')
+            self._fit_right_margins()
             self._canvas_right.draw_idle()
             return
 
@@ -1306,6 +1357,7 @@ class ICIWindow(tk.Toplevel):
             else:
                 _stub(ax, 'No data')
 
+        self._fit_right_margins()
         self._canvas_right.draw_idle()
 
     # ------------------------------------------------------------------
@@ -1340,6 +1392,7 @@ class ICIWindow(tk.Toplevel):
                    'R (Ohm)', 'R_error (Ohm)',
                    'k (Ohm.s^-1/2)', 'k_error (Ohm.s^-1/2)', 'R2']
 
+        tables = {}
         for phase in ('charge', 'discharge'):
             rows = []
             for cycle in range(1, max_cycle + 1):
@@ -1356,10 +1409,15 @@ class ICIWindow(tk.Toplevel):
                         'k_error (Ohm.s^-1/2)': r['k_err'],
                         'R2': r['r2'],
                     })
-            out = pd.DataFrame(rows, columns=columns)
-            out.to_csv(os.path.join(directory, f'{self._export_stem}_ici_{phase}.csv'),
-                       index=False,
-                       encoding=CSV_ENCODING)
+            tables[phase] = pd.DataFrame(rows, columns=columns)
+        try:
+            for phase, out in tables.items():
+                out.to_csv(os.path.join(directory, f'{self._export_stem}_ici_{phase}.csv'),
+                           index=False, encoding=CSV_ENCODING)
+        except OSError as exc:
+            # A file open in Excel is locked: say so instead of a console traceback
+            messagebox.showerror('Export failed', str(exc), parent=self)
+            return
 
         messagebox.showinfo(
             'Export complete',

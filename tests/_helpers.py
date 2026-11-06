@@ -110,12 +110,12 @@ def pynxtools_verdict(path):
 
 def assert_pynxtools_valid(path, tag=""):
     """Assert validate_nexus declares path valid; skip when validation is unavailable.
-    OPERAXN_REQUIRE_VALIDATION (set on every CI leg) turns that skip into a failure."""
+    OPERAXN_REQUIRE_VALIDATION=1 (set on every CI leg) turns that skip into a failure."""
     out = pynxtools_verdict(path)
     if out is None:
-        if os.environ.get("OPERAXN_REQUIRE_VALIDATION"):
+        if os.environ.get("OPERAXN_REQUIRE_VALIDATION") == "1":
             pytest.fail("pynxtools validation unavailable but "
-                        "OPERAXN_REQUIRE_VALIDATION is set")
+                        "OPERAXN_REQUIRE_VALIDATION=1")
         pytest.skip("pynxtools validation unavailable")
     tail = out.strip().splitlines()[-1] if out.strip() else "no output"
     assert "is valid" in out, (f"{tag}: {tail}" if tag else tail)

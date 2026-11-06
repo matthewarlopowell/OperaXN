@@ -6,12 +6,16 @@ size and mtime; `read_file` flags are keyword-only and `HDFReader` downsampling 
 per-instance. fabio is optional: core imports without it and EDF reads raise ImportError.
 """
 
+import codecs
+import io
+import itertools
 import logging
 import os
 import sys
 import threading
+import warnings
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import h5py
 import numpy as np
@@ -40,57 +44,66 @@ logger = logging.getLogger(__name__)
 # Cache
 # ============================================================================
 
+def _entry_size(value: Any) -> int:
+    """Return the bytes a cached value keeps alive (an array view counts its whole base)."""
+    if isinstance(value, np.ndarray):
+        owner = value.base if isinstance(value.base, np.ndarray) else value
+        return max(owner.nbytes, value.nbytes)
+    return sys.getsizeof(value)
+
+
 class FileCache:
-    """Thread-safe file-data cache evicting least-accessed entries to fit a byte budget."""
+    """Thread-safe file-data cache evicting least recently used entries to fit a byte budget."""
 
     def __init__(self, max_size_mb: int = MAX_CACHE_SIZE_MB) -> None:
         self.cache: Dict[str, Any] = {}
         self.max_size_bytes: int = max_size_mb * 1024 * 1024
         self.current_size: int = 0
         self.lock: threading.Lock = threading.Lock()
-        self.access_count: Dict[str, int] = {}
+        self.last_used: Dict[str, int] = {}  # key -> last-use tick
+        self._clock = itertools.count()
 
     def get(self, key: str) -> Optional[Any]:
-        """Return the cached value for key (bumping its access count), or None."""
+        """Return the cached value for key (marking it most recently used), or None."""
         with self.lock:
             if key in self.cache:
-                self.access_count[key] = self.access_count.get(key, 0) + 1
+                self.last_used[key] = next(self._clock)
                 return self.cache[key]
         return None
 
     def put(self, key: str, value: Any) -> None:
-        """Store value, evicting least-accessed entries to stay within budget."""
+        """Store value, evicting least recently used entries to stay within budget."""
         with self.lock:
-            size_bytes = sys.getsizeof(value)
+            size_bytes = _entry_size(value)
             # Replacing a key (two threads reading one file) must not count it twice
             previous = self.cache.pop(key, None)
             if previous is not None:
-                self.current_size -= sys.getsizeof(previous)
-                # Its stale count would otherwise be the eviction pick, never in the cache
-                self.access_count.pop(key, None)
+                self.current_size -= _entry_size(previous)
+                # Its stale tick would otherwise be the eviction pick, never in the cache
+                self.last_used.pop(key, None)
 
             while self.current_size + size_bytes > self.max_size_bytes and self.cache:
-                self._evict_lfu()
+                self._evict_lru()
 
             self.cache[key] = value
             self.current_size += size_bytes
-            self.access_count[key] = 1
+            self.last_used[key] = next(self._clock)
 
-    def _evict_lfu(self) -> None:
-        """Drop the entry with the lowest access count."""
+    def _evict_lru(self) -> None:
+        """Drop the least recently used entry."""
         if not self.cache:
             return
-        lfu_key = min(self.access_count.keys(), key=lambda k: self.access_count.get(k, 0))
-        if lfu_key in self.cache:
-            value = self.cache.pop(lfu_key)
-            self.current_size -= sys.getsizeof(value)
-            self.access_count.pop(lfu_key, None)
+        lru_key = min(self.last_used.keys(), key=lambda k: self.last_used.get(k, 0))
+        if lru_key in self.cache:
+            value = self.cache.pop(lru_key)
+            self.current_size -= _entry_size(value)
+            self.last_used.pop(lru_key, None)
 
     def clear(self) -> None:
         """Empty the cache and reset accounting."""
         with self.lock:
             self.cache.clear()
-            self.access_count.clear()
+            self.last_used.clear()
             self.current_size = 0
 
 
@@ -105,6 +118,13 @@ def clear_global_cache() -> None:
 # ============================================================================
 # Readers
 # ============================================================================
+
+def _floor_clip(data: np.ndarray) -> np.ndarray:
+    """Raise non-positive values to the minimum positive one (unchanged if none)."""
+    pos = data > 0
+    # The floor in the frame's own dtype, so a uint32 or float32 frame keeps its dtype
+    return np.clip(data, data[pos].min(), None) if pos.any() else data
+
 
 class DataReader(ABC):
     """Abstract base for file readers with optional caching."""
@@ -134,6 +154,40 @@ class DataReader(ABC):
         return f"{path}_{stat.st_size}_{stat.st_mtime}"
 
 
+def _first_data_row(lines: List[str]) -> int:
+    """Return the index of the first line whose first two fields are numbers, else len(lines)."""
+    for i, line in enumerate(lines):
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                float(parts[0])
+                float(parts[1])
+                return i
+            except ValueError:
+                continue
+    return len(lines)
+
+
+def _quiet_loadtxt(source: Any, **kwargs: Any) -> np.ndarray:
+    """Return np.loadtxt(source) without numpy's empty-input warning (callers raise their own)."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="loadtxt: input contained no data")
+        return np.loadtxt(source, **kwargs)
+
+
+def _blocks_loadtxt(line: str) -> bool:
+    """Return True if numpy (comments='#') cannot read this line as an X Y row or skip it."""
+    parts = line.split('#', 1)[0].split()
+    if not parts:
+        return False
+    try:
+        float(parts[0])
+        float(parts[1])
+        return False
+    except (ValueError, IndexError):
+        return True
+
+
 class DATReader(DataReader):
     """Reader for .dat files (XRD or neutron) as X/Y(/error) column arrays."""
 
@@ -143,68 +197,81 @@ class DATReader(DataReader):
 
     def _read_impl(self, path: str) -> np.ndarray:
         """Load columns via numpy, falling back to a tolerant X/Y(/E) line parse."""
+        return self.read_with_lines(path)[0]
+
+    def read_with_lines(self, path: str) -> Tuple[np.ndarray, List[str]]:
+        """Return the columns and the file's lines (for header parsing), bypassing the cache."""
         try:
-            # Fast path: numpy bulk load
-            try:
-                data = np.loadtxt(path, comments='#')
-                if data.ndim == 1:
-                    data = data.reshape(-1, 2)
-                return data
-            except (ValueError, OSError) as e:
-                logger.debug(f"NumPy loadtxt failed for {path}: {e}")
-
-            # Slow path: line-by-line parsing
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-
-            data = []
-            for line in lines:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-
-                parts = line.split()
-                if len(parts) >= 2:
-                    try:
-                        row = [float(parts[0]), float(parts[1])]
-                        # Keep the uncertainty column when present (X, Y, E)
-                        if len(parts) >= 3:
-                            try:
-                                row.append(float(parts[2]))
-                            except ValueError:
-                                pass
-                        data.append(row)
-                    except ValueError:
-                        continue
-
-            if not data:
-                file_type = "neutron" if self.data_type == "neutron" else "DAT"
-                raise ValueError(f"No valid data found in {file_type} file: {path}")
-
-            # Rows must be rectangular; drop the error column if inconsistent
-            ncols = min(len(r) for r in data)
-            data = [r[:ncols] for r in data]
-
-            return np.array(data, dtype=float)
-
+            # One open (each costs an on-access scan); a UTF-8 BOM is dropped for both decodes
+            with open(path, "rb") as f:
+                raw = f.read().removeprefix(codecs.BOM_UTF8)
+            lines = io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8", errors="ignore").readlines()
+            return self._parse_lines(path, lines, raw), lines
         except Exception as e:
             file_type = "neutron DAT" if self.data_type == "neutron" else "DAT"
             raise IOError(f"Error reading {file_type} file {path}: {e}")
+
+    def _parse_lines(self, path: str, lines: List[str], raw: bytes) -> np.ndarray:
+        """Parse the file's lines into an (N, 2 or 3+) float array; raise ValueError if none."""
+        # Fast path: numpy bulk load. Real exports open with a line numpy
+        # cannot skip (Mantid 'XYDATA', an azimAvg column header), so read
+        # the numeric block after it, keeping X, Y, E as the line parse does
+        start = _first_data_row(lines)
+        try:
+            if start < len(lines) and any(map(_blocks_loadtxt, lines[:start])):
+                data = np.loadtxt(lines[start:], comments=None, ndmin=2)
+                return data if data.shape[1] <= 3 else np.ascontiguousarray(data[:, :3])
+            # Decoded again as numpy decodes a path (locale); the utf-8 lines differ in cp1252 files
+            data = _quiet_loadtxt(io.TextIOWrapper(io.BytesIO(raw)), comments='#')
+            if data.size == 0:
+                raise ValueError("no data rows")
+            if data.ndim == 1:
+                data = data.reshape(-1, 2)
+            return data
+        except (ValueError, OSError) as e:
+            logger.debug(f"NumPy loadtxt failed for {path}: {e}")
+
+        # Slow path: line-by-line parsing
+        data = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    row = [float(parts[0]), float(parts[1])]
+                    # Keep the uncertainty column when present (X, Y, E)
+                    if len(parts) >= 3:
+                        try:
+                            row.append(float(parts[2]))
+                        except ValueError:
+                            pass
+                    data.append(row)
+                except ValueError:
+                    continue
+
+        if not data:
+            raise ValueError("no data rows")
+
+        # Rows must be rectangular; drop the error column if inconsistent
+        ncols = min(len(r) for r in data)
+        data = [r[:ncols] for r in data]
+
+        return np.array(data, dtype=float)
 
 
 class EDFReader(DataReader):
     """Reader for .edf detector images as 2D arrays with floor clipping."""
 
     def _read_impl(self, path: str) -> np.ndarray:
-        """Load the image via fabio, clipping to the minimum positive value."""
+        """Load the image via fabio in its own dtype, clipping to the minimum positive value."""
         if not FABIO_AVAILABLE:
             raise ImportError("fabio is required to read EDF files")
 
         try:
-            arr = np.asarray(fabio.open(path).data.astype(float))
-            pos = arr > 0
-            floor = float(arr[pos].min()) if pos.any() else 0.0
-            return np.clip(arr, floor, None)
+            return _floor_clip(np.asarray(fabio.open(path).data))
         except Exception as e:
             raise IOError(f"Error reading EDF file {path}: {e}")
 
@@ -215,7 +282,9 @@ class XYReader(DataReader):
     def _read_impl(self, path: str) -> np.ndarray:
         """Load whitespace-delimited columns via numpy."""
         try:
-            data = np.loadtxt(path)
+            data = _quiet_loadtxt(path)
+            if data.size == 0:
+                raise ValueError("no data rows")
             if data.ndim == 1:
                 data = data.reshape(-1, 2)
             return data
@@ -264,7 +333,7 @@ class HDFReader(DataReader):
                     raise ValueError("No suitable data found in HDF file")
 
                 data = self._process_data_shape(data)
-                data = self._apply_floor_clipping(data)
+                data = _floor_clip(data)
                 self.original_shape = data.shape
                 data = self._downsample_if_needed(data)
 
@@ -278,6 +347,9 @@ class HDFReader(DataReader):
         for data_path in self.COMMON_DATA_PATHS:
             if data_path in h5file:
                 dataset = h5file[data_path]
+                # A group here (e.g. an NXdata) is refused: no other array is guessed in its place
+                if not isinstance(dataset, h5py.Dataset):
+                    return None
                 break
 
         if dataset is None:
@@ -344,15 +416,6 @@ class HDFReader(DataReader):
 
         raise ValueError(f"Cannot determine shape for 1D data of size {data.size}")
 
-    @staticmethod
-    def _apply_floor_clipping(data: np.ndarray) -> np.ndarray:
-        """Raise non-positive values to the minimum positive one (unchanged if none)."""
-        pos = data > 0
-        if pos.any():
-            floor = float(data[pos].min())
-            return np.clip(data, floor, None)
-        return data
-
     def _downsample_if_needed(self, data: np.ndarray) -> np.ndarray:
         """Apply the per-instance display-size cap (0 disables)."""
         if self.max_display_size <= 0:
@@ -374,7 +437,8 @@ class HDFReader(DataReader):
             return data
 
         step = int(np.ceil(scale_factor))
-        return data[::step, ::step]
+        # A copy, so the result does not keep the full-size frame alive
+        return data[::step, ::step].copy()
 
 
 # ============================================================================
@@ -396,7 +460,7 @@ class DataReaderFactory:
     @classmethod
     def get_reader(cls, file_path: str, *, is_neutron: bool = False) -> DataReader:
         """Return the shared reader for the file's extension; raise ValueError if unsupported."""
-        if is_neutron and file_path.endswith('.dat'):
+        if is_neutron and file_path.lower().endswith('.dat'):
             return cls.NEUTRON_READER
 
         ext = os.path.splitext(file_path)[1].lower()

@@ -61,19 +61,19 @@ def tk_root():
 
 @pytest.fixture
 def inhouse_dir(tmp_path):
-    """Return a dir of 3 XRD scans at 10:05/10:10/10:15 + echem (60 s cadence from 10:00,
-    V = 3.7 + 0.01/step). Known-good: scan 1 midpoint 10:06 -> V = 3.76."""
+    """Return a dir of 3 azimAvg scans at 10:05/10:10/10:15 + EC-Lab echem (60 s cadence from
+    10:00, V = 3.7 + 0.01/step). Known-good: scan 1 midpoint 10:06 -> V = 3.76."""
     d = tmp_path / "inhouse"
-    _builders.write_inhouse_dir(str(d))
+    _builders.write_lab_dir(str(d))
     return str(d)
 
 
 @pytest.fixture
 def neutron_dir(tmp_path):
-    """Return a dir of a 10:00-10:30 logbook + 2 banks x (TOF, d) + echem.
+    """Return a WISH-shaped dir: 10:00-10:30 logbook line, 2 banks x (TOF, d), EC-Lab echem.
     Known-good: midpoint 10:15 -> V = 3.85."""
     d = tmp_path / "neutron"
-    _builders.write_neutron_dir(str(d))
+    _builders.write_wish_dir(str(d))
     return str(d)
 
 
@@ -190,4 +190,48 @@ def legacy_v3_nxs(tmp_path_factory):
         oe.create_dataset("timestamps", data=ts, dtype=h5py.string_dtype())
         oe.create_dataset("voltage (V)", data=3.7 + 0.01 * np.arange(10))
         oe.create_dataset("current (mA)", data=0.1 + 0.001 * np.arange(10))
+    return path
+
+
+@pytest.fixture(scope="module")
+def legacy_v1_nxs(tmp_path_factory):
+    """Return a hand-built file in the released v1.0.0 layout: root scan_NNNN groups, global_metadata and
+    operando_electrochemistry, as v1.0.0's writer laid them out."""
+    path = str(tmp_path_factory.mktemp("layout_v1") / "legacy_v1.nxs")
+    with h5py.File(path, "w") as f:
+        f.attrs["NX_class"] = "NXroot"
+        f.attrs["file_name"] = "legacy_v1.nxs"
+        f.attrs["file_time"] = "2025-06-01T12:00:00"
+        for n, (ts, mid, volt, amps) in enumerate(
+                [("2024-02-05 10:05:00", "2024-02-05 10:06:00", 3.76, 0.106),
+                 ("2024-02-05 10:10:00", "2024-02-05 10:11:00", 3.81, 0.111)], start=1):
+            scan = f.create_group(f"scan_{n:04d}")
+            scan.attrs["NX_class"] = "NXentry"
+            scan.attrs["scan_number"] = n
+            md = scan.create_group("metadata")
+            md.attrs["NX_class"] = "NXcollection"
+            md.create_dataset("voltage (V)", data=volt)
+            md.create_dataset("current (mA)", data=amps)
+            md.create_dataset("voltage_timestamp", data=mid)
+            md.create_dataset("scan_timestamp", data=ts)
+            md.create_dataset("midpoint_adjusted_timestamp", data=mid)
+            md.create_dataset("exposure_time", data=120.0)
+            xrd = scan.create_group("xrd_data")
+            xrd.attrs["NX_class"] = "NXdata"
+            xrd.create_dataset("oned_2theta", data=_builders.ONED_X)
+            xrd.create_dataset("oned_intensity", data=_builders.inhouse_scan_y(n))
+            xrd.attrs["oned_source_file"] = f"scan_{n:03d}.dat"
+        gm = f.create_group("global_metadata")
+        gm.attrs["NX_class"] = "NXcollection"
+        gm.attrs["total_scans"] = 2
+        gm.attrs["data_source"] = "inhouse"
+        gm.attrs["generator"] = "OperaXN"
+        gm.attrs["generator_version"] = "1.0.0"
+        gm.attrs["twod_included"] = False
+        oe = f.create_group("operando_electrochemistry")
+        oe.attrs["NX_class"] = "NXdata"
+        ts = np.array([f"2024-02-05 10:{mm:02d}:00" for mm in range(40)], dtype=object)
+        oe.create_dataset("timestamps", data=ts, dtype=h5py.string_dtype())
+        oe.create_dataset("voltage (V)", data=3.7 + 0.01 * np.arange(40))
+        oe.create_dataset("current (mA)", data=0.1 + 0.001 * np.arange(40))
     return path

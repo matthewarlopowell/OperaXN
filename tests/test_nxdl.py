@@ -84,7 +84,8 @@ def test_figure4_elements_present(path):
         f = _one(env, f"nx:field[@name='{name}']")
         assert (f.get("type"), f.get("units"), f.get("optional")) == (
             "NX_FLOAT", units, "true"), name
-    for name in ("capacity", "echem_index_first", "echem_index_last"):
+    for name in ("capacity", "echem_index_start", "echem_index_end",
+                 "echem_index_first", "echem_index_last"):
         assert not env.xpath(f"nx:field[@name='{name}']", namespaces=NS), name
     assert not env.xpath("nx:group[@type='NXlog']", namespaces=NS)
     assert _required(_one(env, "nx:field[@name='scan_timestamp']"))

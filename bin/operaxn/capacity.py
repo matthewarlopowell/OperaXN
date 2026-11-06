@@ -19,12 +19,13 @@ from matplotlib import cm
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 
-from .config import CSV_ENCODING, FIGURE_DPI, SECONDS_PER_HOUR, TIME_HOURS_LABEL
+from .config import (CSV_ENCODING, FIGURE_DPI, MAX_LEGEND_CYCLES, SECONDS_PER_HOUR,
+                     TIME_HOURS_LABEL)
 from .ici import (
     BG, BG2, BG3, BORDER, DIM, INPUT, TEXT, _FONT, _PAD_S,
     PLOT_BG, PLOT_BORDER, PLOT_TEXT,
     _Btn, _canvas_frame, _label, _separator, _spinbox, _style_ax,
-    echem_source_button, embed_figure, maximise_window, watch_figure_sync,
+    echem_source_button, embed_figure, maximise_window, trace_write, watch_figure_sync,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,10 +103,10 @@ def _start_cycle_plot(ax, echem_df, xlabel, cycles_to_plot):
     """Reset ax for a voltage plot; return (df, cycles, colours), or None after a no-data note."""
     ax.clear()
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("Voltage (V)")
+    ax.set_ylabel("Voltage [V]")
     ax.grid(True, alpha=0.3)
     if echem_df is None or echem_df.empty:
-        ax.text(0.5, 0.5, "No echem data loaded", ha="center", va="center",
+        ax.text(0.5, 0.5, "No echem data available", ha="center", va="center",
                 transform=ax.transAxes, color="grey", fontsize=11)
         return None
     df = assign_cycles(echem_df)
@@ -116,12 +117,19 @@ def _start_cycle_plot(ax, echem_df, xlabel, cycles_to_plot):
     return df, cycles, colors
 
 
+def _cycle_label(cycle_num, cycles):
+    """Return a cycle's legend label; above MAX_LEGEND_CYCLES only the first and last get one."""
+    if len(cycles) <= MAX_LEGEND_CYCLES or cycle_num in (cycles[0], cycles[-1]):
+        return f"Cycle {cycle_num}"
+    return None
+
+
 def plot_capacity_vs_voltage(ax, echem_df, mass_mg=0.0, cycles_to_plot=None):
     """Plot voltage against capacity (mAh/g when mass_mg > 0), one colour per cycle.
     Charge and discharge legs share the cycle colour; only the charge leg is labelled."""
     use_specific = mass_mg > 0
     setup = _start_cycle_plot(
-        ax, echem_df, "Specific Capacity (mAh/g)" if use_specific else "Capacity (mAh)",
+        ax, echem_df, "Specific capacity [mAh/g]" if use_specific else "Capacity [mAh]",
         cycles_to_plot)
     if setup is None:
         return
@@ -137,7 +145,7 @@ def plot_capacity_vs_voltage(ax, echem_df, mass_mg=0.0, cycles_to_plot=None):
             if use_specific:
                 cap = cap / (mass_mg / 1000.0)
             ax.plot(cap, phase_df["echem_data"].values, color=color, linewidth=1.5,
-                    label=f"Cycle {cycle_num}" if phase == "charge" else None)
+                    label=_cycle_label(cycle_num, cycles) if phase == "charge" else None)
     if ax.get_legend_handles_labels()[0]:
         ax.legend(fontsize=7, loc="best")
 
@@ -151,7 +159,8 @@ def plot_time_vs_voltage(ax, echem_df, cycles_to_plot=None):
     for cycle_num in cycles:
         cycle_df = df[df["cycle"] == cycle_num]
         ax.plot(cycle_df["t_s"].values / SECONDS_PER_HOUR, cycle_df["echem_data"].values,
-                color=colors.get(cycle_num, "grey"), linewidth=1.5, label=f"Cycle {cycle_num}")
+                color=colors.get(cycle_num, "grey"), linewidth=1.5,
+                label=_cycle_label(cycle_num, cycles))
     if ax.get_legend_handles_labels()[0]:
         ax.legend(fontsize=7, loc="best")
 
@@ -182,6 +191,8 @@ class CapacityWindow(tk.Toplevel):
         self._on_add_source = on_add_source
         self._export_stem = export_stem
         self._mass_job = None
+        self._source_job = None
+        self.bind('<Destroy>', self._cancel_pending, add='+')
 
         self._build_ui()
         self._refresh_available()
@@ -208,7 +219,7 @@ class CapacityWindow(tk.Toplevel):
         mass_entry.pack(side='left', padx=(2, _PAD_S))
         mass_entry.bind('<Return>', self._replot)
         mass_entry.bind('<FocusOut>', self._queue_mass_replot)
-        self.mass_var.trace_add('write', self._queue_mass_replot)
+        trace_write(self, self.mass_var, self._queue_mass_replot)
         _separator(bar, horizontal=False).pack(side='left', fill='y', padx=_PAD_S, pady=3)
         _Btn(bar, 'Export CSV', command=self._export_csv).pack(side='left', padx=2)
 
@@ -218,7 +229,7 @@ class CapacityWindow(tk.Toplevel):
         # Swap datasets only once the dropdown has closed
         self.source_button = echem_source_button(
             strip, self.source_var, list(self._sources),
-            command=lambda name: self.after_idle(self._on_source_change, name),
+            command=self._queue_source_change,
             on_add=self._on_add_source)
         self.source_button.pack(side='left', padx=2)
         _separator(strip, horizontal=False).pack(side='left', fill='y', padx=2, pady=3)
@@ -305,11 +316,12 @@ class CapacityWindow(tk.Toplevel):
             return None
 
     def _get_mass(self) -> float:
-        """Return the entered sample mass in mg (0 while blank or invalid)."""
+        """Return the entered sample mass in mg (0 unless a finite positive number)."""
         try:
-            return float(self.mass_var.get())
+            value = float(self.mass_var.get())
         except (ValueError, tk.TclError):
             return 0.0
+        return value if np.isfinite(value) and value > 0 else 0.0
 
     def _get_cycles(self) -> List[int]:
         """Return every available cycle, or the selected one when stepping."""
@@ -331,11 +343,19 @@ class CapacityWindow(tk.Toplevel):
     def _queue_mass_replot(self, *_args) -> None:
         """Redraw shortly after the last mass edit, so typing stays responsive."""
         if self._mass_job is not None:
-            try:
-                self.after_cancel(self._mass_job)
-            except tk.TclError:
-                pass
+            self.after_cancel(self._mass_job)
         self._mass_job = self.after(MASS_REPLOT_DELAY_MS, self._run_mass_replot)
+
+    def _queue_source_change(self, name: str) -> None:
+        """Swap datasets once the dropdown has closed."""
+        self._source_job = self.after_idle(self._on_source_change, name)
+
+    def _cancel_pending(self, event) -> None:
+        """Cancel pending mass and source jobs on close, as their callbacks go with the window."""
+        if event.widget is self:
+            for job in (self._mass_job, self._source_job):
+                if job is not None:
+                    self.after_cancel(job)
 
     def _run_mass_replot(self) -> None:
         """Run the queued mass redraw."""
@@ -400,8 +420,8 @@ class CapacityWindow(tk.Toplevel):
             messagebox.showwarning('No cycles', 'No cycles selected to export.', parent=self)
             return
         path = filedialog.asksaveasfilename(
-            parent=self, defaultextension='.csv',
-            filetypes=[('CSV', '*.csv')], initialfile=f'{self._export_stem}_capacity.csv')
+            parent=self, title='Export Capacity CSV', defaultextension='.csv',
+            filetypes=[('CSV files', '*.csv')], initialfile=f'{self._export_stem}_capacity.csv')
         if not path:
             return
         mass = self._get_mass()
@@ -427,5 +447,10 @@ class CapacityWindow(tk.Toplevel):
                         'Capacity (mAh)': c,
                         'Specific Capacity (mAh/g)': sc,
                     })
-        pd.DataFrame(rows).to_csv(path, index=False, encoding=CSV_ENCODING)
-        messagebox.showinfo('Export complete', f'Saved data to:\n{path}', parent=self)
+        try:
+            pd.DataFrame(rows).to_csv(path, index=False, encoding=CSV_ENCODING)
+        except OSError as exc:
+            messagebox.showerror('Export failed', f'Capacity data could not be exported: {exc}',
+                                 parent=self)
+            return
+        messagebox.showinfo('Export complete', f'Capacity data exported to:\n{path}', parent=self)

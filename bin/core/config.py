@@ -49,6 +49,10 @@ SCAN_ID_MAX_DIGITS = 7
 #       entry/pre_sample_flightpath (NXoperando_tofnpd), metres
 #   detector_description
 #       entry/instrument/detector/description (free text)
+#   wavelength
+#       entry/instrument/crystal/wavelength (X-ray sources), angstrom; used
+#       when the source files give none (an EDF WaveLength wins); a value
+#       that is not a finite number is skipped with a warning
 #   detector_banks  {bank: {"distance_m", "polar_angle_deg", "azimuthal_angle_deg"}}
 #       the NXoperando_tofnpd instrument/detector arrays [nBank]: nominal
 #       sample-to-bank distance (m), scattering angle 2theta and azimuth
@@ -100,9 +104,10 @@ INSTRUMENT_PROFILES = {
             4: {"distance_m": 0.898, "polar_angle_deg": 92.59, "azimuthal_angle_deg": None},
             5: {"distance_m": 1.251, "polar_angle_deg": 146.72, "azimuthal_angle_deg": None},
         },
-        # Counting mode from the run records (Polaris_LDE_Nov25, 108 runs):
-        # every run lasted 126 or 127 s while the proton charge varied, and
-        # two runs that received 0 uAh still ended on the clock, so runs are
+        # Counting mode from the run records (Polaris_LDE_Nov25, 109 runs):
+        # every complete run lasted 126 or 127 s while the proton charge
+        # varied (the last, run 153975, ended early at 87 s), and two runs
+        # that received 0 uAh still ended on the clock, so runs are
         # time-terminated (to be confirmed with G. Perez, ISIS). The preset
         # is not recorded anywhere; realised durations are per scan in
         # environment/exposure_time.
@@ -148,7 +153,8 @@ INSTRUMENT_PROFILES = {
         "probe": "x-ray",
         "instrument_name": "i11-1",
         # Wavelength comes from the .poni calibration at the beamline and is
-        # not stored in the scan .nxs; supply per-experiment when known.
+        # not stored in the scan .nxs; add "wavelength" (angstrom) per
+        # experiment when known.
     },
 }
 
@@ -181,7 +187,6 @@ CACHE_ENABLED = True
 MAX_CACHE_SIZE_MB = 1000
 PARALLEL_PROCESSING = True
 MAX_WORKERS = min(multiprocessing.cpu_count(), 8)
-BATCH_SIZE = 20  # minimum files per parallel chunk
 PARALLEL_PROCESSING_THRESHOLD = 20  # go parallel above this many files
 
 # --- 2D data handling ---

@@ -1,7 +1,10 @@
-"""operaxn.input adapter: the GUI contract over the core pipeline."""
+"""operaxn.input adapter and main window: the GUI contract over the core pipeline, exports and lifecycle."""
+import argparse
 import logging
 import os
 import shutil
+import warnings
+import weakref
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,10 +17,12 @@ pytest.importorskip("tkinter")
 import h5py
 
 import core
+import core.readers as readers
 import operaxn
+from core import nxs_writer
 from operaxn import input as gui_input
-from operaxn.dialog import UploadOptions, UploadOptionsDialog
-from operaxn.gui import OPERAXN
+from operaxn.dialog import GIFSettings, UploadOptions, UploadOptionsDialog
+from operaxn.gui import OPERAXN, PerformanceMonitor
 from operaxn.main import main as cli_main
 from operaxn.input import (
     DataSourceType,
@@ -39,6 +44,7 @@ from operaxn.input import (
     process_paths,
     reset_session,
 )
+from operaxn.output import get_scan_time_positions
 
 import _builders
 from _helpers import needs_fabio
@@ -48,7 +54,7 @@ def _reset_session():
     """Restore operaxn.input._session to its pristine module state."""
     gui_input._session.update({"nxs_path": None, "input_paths": None,
                                "exported": False, "standard_echem": [],
-                               "stem": None, "data_source": None})
+                               "stem": None, "data_source": None, "images_nxs": None})
     gui_input._session.pop("global_metadata", None)
 
 
@@ -154,10 +160,10 @@ def test_make_echem_arrays_absolute(inhouse_dir):
 
 def test_get_correlated_data(inhouse_dir):
     """get_correlated_data bundles the 1D arrays and voltage for one scan."""
-    scans, echem_df, _ = process_paths(
+    scans, _, _ = process_paths(
         [inhouse_dir], time_method=TimeMethod.ABSOLUTE,
         data_source=DataSourceType.INHOUSE)
-    corr = get_correlated_data(scans, echem_df, 1)
+    corr = get_correlated_data(scans, 1)
     assert corr["oned"] is not None
     assert np.allclose(corr["oned"]["x"], _builders.ONED_X)
     assert corr["echem_value"] == 3.76
@@ -200,6 +206,41 @@ def test_relative_view_transform(inhouse_dir):
     assert rel_echem_arrays["x"][5] == 300.0, f"got {rel_echem_arrays['x'][5]}"
 
 
+@needs_fabio
+def test_relative_view_reference_survives_unreadable_data(tmp_path):
+    """t=0 is the earliest midpoint of all scans, as at write time, even when that scan's data is gone."""
+    src = tmp_path / "src"; src.mkdir()
+    _builders.write_edf_image(str(src / "image_000.edf"), "2024-02-05T10:00:00")
+    _builders.write_xrd_dat(str(src / "scan_002.dat"), "2024-02-05T10:10:00")
+    _builders.write_xrd_dat(str(src / "scan_003.dat"), "2024-02-05T10:15:00")
+    _builders.write_echem_txt(str(src / "echem.txt"))
+    out = str(tmp_path / "rel.nxs")
+    assert core.generate([str(src)], out, DataSourceType.INHOUSE, time_method=TimeMethod.RELATIVE)[0]
+    (src / "image_000.edf").unlink()
+    scans, echem_df, method = process_paths([out], time_method=TimeMethod.RELATIVE,
+                                            data_source=DataSourceType.INHOUSE)
+    reset_session()
+    assert [s["timestamp"] for s in scans] == ["00:00:00", "00:10:00", "00:15:00"]
+    assert get_scan_time_positions(scans, echem_df, method) == [0, 600, 900]
+
+
+@needs_fabio
+def test_relative_view_of_edf_only_file_with_no_reachable_image(tmp_path):
+    """An EDF-only file whose images are all gone still gets relative labels instead of raising."""
+    src = tmp_path / "src"; src.mkdir()
+    for i, ts in enumerate(["2024-02-05T10:05:00", "2024-02-05T10:10:00"], start=1):
+        _builders.write_edf_image(str(src / f"image_{i:03d}.edf"), ts)
+    _builders.write_echem_txt(str(src / "echem.txt"))
+    out = str(tmp_path / "edf.nxs")
+    assert core.generate([str(src)], out, DataSourceType.INHOUSE, time_method=TimeMethod.RELATIVE)[0]
+    for f in src.glob("*.edf"):
+        f.unlink()
+    scans, echem_df, method = process_paths([out], time_method=TimeMethod.RELATIVE,
+                                            data_source=DataSourceType.INHOUSE)
+    reset_session()
+    assert get_scan_time_positions(scans, echem_df, method) == [0, 300]
+
+
 def test_neutron_adapter(neutron_dir):
     """Neutron upload yields one correlated scan with per-bank display names."""
     scans_n, _, _ = process_paths(
@@ -209,14 +250,21 @@ def test_neutron_adapter(neutron_dir):
     sn = scans_n[0]
     assert sn["echem"] == 3.85, f"got {sn['echem']}"
     assert sn["neutron_files"] is not None, str(sn["neutron_files"])
-    assert sn["neutron_files"]["1"]["tof"] == "123456-1-0.dat", \
-        str(sn["neutron_files"])
-    assert sn["neutron_files"]["1"]["d"] == "123456-1-d-0.dat", \
-        str(sn["neutron_files"])
+    tof_name, d_name = _builders.wish_bank_names("123456", 1)
+    assert sn["neutron_files"]["1"]["tof"] == tof_name, str(sn["neutron_files"])
+    assert sn["neutron_files"]["1"]["d"] == d_name, str(sn["neutron_files"])
 
     n_arrays = make_neutron_arrays(scans_n)
     assert set(n_arrays[1].keys()) == {"1", "2"}
     assert np.allclose(n_arrays[1]["1"]["tof"]["x"], _builders.TOF_X)
+
+
+def test_one_scan_load_progress_reads_singular(neutron_dir):
+    """A one-run load's last progress line is 'Loaded 1 scan'."""
+    lines = []
+    process_paths([neutron_dir], lines.append, time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.NEUTRON)
+    assert lines[-1] == "Loaded 1 scan", lines
 
 
 @needs_fabio
@@ -262,6 +310,41 @@ def test_export_default_keeps_twod_by_reference(inhouse_edf_dir, tmp_path):
     exported_model = core.load(export_dest)
     assert not exported_model.scans[0].twod_embedded
     assert exported_model.scans[0].twod is None
+
+
+def test_export_failure_keeps_previous_destination(inhouse_dir, tmp_path, monkeypatch):
+    """A copy that fails part way leaves the earlier export whole and no .part beside it."""
+    process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    dest = str(tmp_path / "exported.nxs")
+    assert export_nxs(dest)[0]
+
+    def half_copy(src, dst):
+        with open(dst, "wb") as f:
+            f.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(shutil, "copyfile", half_copy)
+    with pytest.raises(OSError, match="disk full"):
+        export_nxs(dest)
+    assert len(core.load(dest).scans) == 3
+    assert not os.path.exists(dest + ".part")
+    _discard(core.default_cache_path([inhouse_dir]))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="case-insensitive file names")
+def test_export_case_only_rename_is_a_save(inhouse_dir, tmp_path):
+    """Exporting an opened Run3.nxs as run3.nxs is the same file: a save, not SameFileError."""
+    process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    user_file = str(tmp_path / "Run3.nxs")
+    assert export_nxs(user_file)[0]
+    _discard(core.default_cache_path([inhouse_dir]))
+    process_paths([user_file], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    ok, msgs = export_nxs(str(tmp_path / "run3.nxs"))
+    assert ok, msgs
+    assert len(core.load(user_file).scans) == 3
 
 
 def test_direct_nxs_load_survives_cleanup_and_exports(inhouse_dir, tmp_path):
@@ -458,6 +541,67 @@ def test_working_copy_carries_images_sidecar(tmp_path):
         "2D not viewable in the second-generation export"
 
 
+def _add_echem_as_the_sidecar_copy_fails(tmp_path, monkeypatch, partial):
+    """Reopen an exported 3-image ZIP load and add echem as its sidecar copy fails; return both.
+    partial: the copy stops before scan_003.edf (a member path too long); else it copies nothing."""
+    src = tmp_path / "src"
+    _builders.write_dated_pairs(str(src), _builders.SCAN_TIMES, _builders.SCAN_TIMES)
+    process_paths([_builders.zip_tree(str(src), str(tmp_path / "failcopy.zip"))],
+                  time_method=TimeMethod.ABSOLUTE, data_source=DataSourceType.INHOUSE)
+    zip_cache = get_loaded_nxs_path()
+    opened = str(tmp_path / "failcopy.nxs")
+    ok, _ = export_nxs(opened)
+    assert ok
+    scans, _, _ = process_paths([opened], time_method=TimeMethod.ABSOLUTE,
+                                data_source=DataSourceType.INHOUSE)
+    _discard(zip_cache)
+
+    def failing_copytree(source, destination, **kwargs):
+        if not partial:
+            raise OSError("no space left on device")
+        for root, _, names in os.walk(source):
+            target = os.path.join(destination, os.path.relpath(root, source))
+            os.makedirs(target, exist_ok=True)
+            for name in names:
+                if name != "scan_003.edf":
+                    shutil.copy2(os.path.join(root, name), target)
+        raise shutil.Error([(source, destination, "path too long")])
+
+    extra = str(tmp_path / "extra_echem.txt")
+    _builders.write_echem_txt(extra, n_rows=5)
+    with monkeypatch.context() as patch:
+        patch.setattr(gui_input.shutil, "copytree", failing_copytree)
+        assert add_standard_echem_files([extra]), "standard echem must append"
+    return opened, scans
+
+
+@needs_fabio
+def test_failed_sidecar_copy_keeps_reading_the_opened_files_images(tmp_path, monkeypatch):
+    """Add-echem whose sidecar copy fails keeps showing 2D from the opened file's sidecar."""
+    _, scans = _add_echem_as_the_sidecar_copy_fails(tmp_path, monkeypatch, partial=False)
+    core.clear_global_cache()
+    shapes = {n: getattr(a.get("image"), "shape", a) for n, a in make_twod_arrays(scans).items()}
+    assert shapes == {1: (8, 8), 2: (8, 8), 3: (8, 8)}, shapes
+
+
+@needs_fabio
+def test_export_after_a_partial_sidecar_copy_keeps_every_image(tmp_path, monkeypatch):
+    """After a partial sidecar copy, saving over the opened file or elsewhere keeps every image."""
+    opened, _ = _add_echem_as_the_sidecar_copy_fails(tmp_path, monkeypatch, partial=True)
+
+    def images(nxs):
+        return sorted(f for _, _, fs in os.walk(os.path.splitext(nxs)[0] + "_images")
+                      for f in fs if f.endswith(".edf"))
+
+    every = ["scan_001.edf", "scan_002.edf", "scan_003.edf"]
+    assert export_nxs(opened)[0] and images(opened) == every, \
+        "saving over the opened file lost images"
+    elsewhere = str(tmp_path / "copy" / "failcopy_echem.nxs")
+    os.makedirs(os.path.dirname(elsewhere))
+    assert export_nxs(elsewhere)[0] and images(elsewhere) == every, \
+        "the export elsewhere lost images"
+
+
 @needs_fabio
 def test_resolution_handles_foreign_separator_paths(tmp_path):
     """A recorded path with the other OS's separators still resolves."""
@@ -469,10 +613,63 @@ def test_resolution_handles_foreign_separator_paths(tmp_path):
     assert ok
     process_paths([dest], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.INHOUSE)
-    recorded = "/tmp/operaxn_cache/cell_images/image_001.edf"  # POSIX form
+    recorded = "/tmp/operaxn_cache/cell_images/zip1/image_001.edf"  # POSIX form, one level per archive
     resolved = gui_input._resolve_twod_source(recorded)
     assert resolved and resolved.endswith("image_001.edf") and \
         os.path.isfile(resolved), f"got {resolved}"
+
+
+@needs_fabio
+def test_failed_zip_generate_leaves_no_cache_sidecar(tmp_path, monkeypatch):
+    """A ZIP load whose write fails leaves neither a partial .nxs nor its _images sidecar."""
+    zpath = _builders.write_twod_zip(tmp_path / "cellz.zip", tmp_path)
+
+    def fail(self, entry, scan):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(nxs_writer.NXSWriter, "_write_scan", fail)
+    with pytest.raises(RuntimeError, match="simulated disk full"):
+        process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
+                      data_source=DataSourceType.INHOUSE)
+    cache = core.default_cache_path([zpath])
+    assert not os.path.exists(cache) and not os.path.exists(cache + ".part")
+    assert not os.path.isdir(os.path.splitext(cache)[0] + "_images")
+
+
+@needs_fabio
+@pytest.mark.parametrize("stage", ["extract", "warm_up", "classify", "sidecar", "write"])
+def test_cancelled_zip_load_raises_and_leaves_no_files(tmp_path, monkeypatch, stage):
+    """A cancel mid ZIP load raises and leaves no extraction folder, .part, .nxs or sidecar."""
+    import importlib
+    import tempfile
+    import threading
+    import zipfile
+    generate_module = importlib.import_module("core.generate")
+    src = tmp_path / "src"
+    _builders.write_dated_pairs(str(src), _builders.SCAN_TIMES, _builders.SCAN_TIMES)
+    zpath = _builders.zip_tree(str(src), str(tmp_path / "cellc.zip"))
+    monkeypatch.setattr(generate_module, "PARALLEL_PROCESSING_THRESHOLD", 0)
+    cancel = threading.Event()
+    owner, name = {"extract": (zipfile.ZipFile, "extract"),
+                   "warm_up": (generate_module.FileProcessor, "_warm_up"),
+                   "classify": (core.DATClassifier, "classify"),
+                   "sidecar": (generate_module.shutil, "move"),
+                   "write": (nxs_writer.NXSWriter, "_write_scan")}[stage]
+    original = getattr(owner, name)
+
+    def cancel_then_run(*args, **kwargs):
+        cancel.set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name,
+                        staticmethod(cancel_then_run) if stage == "warm_up" else cancel_then_run)
+    tmp, cache = tempfile.gettempdir(), core.cache_dir()
+    before = set(os.listdir(tmp))
+    with pytest.raises(RuntimeError, match="Generation cancelled"):
+        process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
+                      data_source=DataSourceType.INHOUSE, cancel=cancel)
+    assert set(os.listdir(tmp)) == before, "extraction folder left"
+    assert [n for n in os.listdir(cache) if n.startswith("cellc")] == []
 
 
 # ============================================================================
@@ -538,6 +735,34 @@ def test_standard_echem_append_after_user_nxs(inhouse_dir, tmp_path):
     _discard(core.default_cache_path([inhouse_dir]))
 
 
+def test_added_csv_echem_is_named_in_its_unit_line(inhouse_dir, tmp_path, caplog):
+    """Add echem names a .csv file in its current-unit line, not the converted temp copy."""
+    process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    csv = tmp_path / "added7.csv"
+    csv.write_text("Time,Ewe/V,I/A\n" + "".join(
+        f"06/02/2024 09:{m:02d}:00,{4.0 + m * 0.01:.4f},0.0005\n" for m in range(10)))
+    with caplog.at_level(logging.INFO, logger="core"):
+        assert len(add_standard_echem_files([str(csv)])) == 1
+    lines = [r.getMessage() for r in caplog.records if "current column" in r.getMessage()]
+    assert lines == ["Echem current column 'I/A' in added7.csv converted to mA (x1000)"], lines
+    _discard(core.default_cache_path([inhouse_dir]))
+
+
+def test_unconverted_added_table_is_named_once(inhouse_dir, tmp_path, caplog):
+    """Add echem names a missing or unreadable .csv/.xlsx once, by its conversion error."""
+    process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    (tmp_path / "broken.xlsx").write_bytes(b"not a workbook")
+    for name in ("gone.csv", "broken.xlsx"):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert add_standard_echem_files([str(tmp_path / name)]) == []
+        named = [r.getMessage() for r in caplog.records if name in r.getMessage()]
+        assert len(named) == 1 and named[0].startswith("Error converting tabular file "), named
+    _discard(core.default_cache_path([inhouse_dir]))
+
+
 @needs_fabio
 def test_standard_echem_combines_with_embedded_twod(inhouse_edf_dir, tmp_path):
     """Standard echem and 2D inclusion can be combined at generation."""
@@ -589,6 +814,28 @@ def test_process_paths_threads_tolerance(inhouse_dir):
                   data_source=DataSourceType.INHOUSE)
     assert get_experiment_metadata().get("echem_time_tolerance") == \
         core.ECHEM_TIME_TOLERANCE
+
+
+def test_process_paths_raises_the_generate_error(tmp_path):
+    """A failed generate reaches the caller as an error naming the reason."""
+    junk = tmp_path / "junk"
+    junk.mkdir()
+    (junk / "notes.txt").write_text("nothing to see\n")
+    with pytest.raises(RuntimeError, match="No scan data available"):
+        process_paths([str(junk)], time_method=TimeMethod.ABSOLUTE,
+                      data_source=DataSourceType.INHOUSE)
+
+
+def test_process_paths_names_a_damaged_nxs(inhouse_dir, tmp_path):
+    """A truncated .nxs is reported by name as damaged, not as 'No scan data available'."""
+    nxs = str(tmp_path / "cut.nxs")
+    ok, msgs = core.generate([inhouse_dir], nxs, core.DataSourceType.INHOUSE)
+    assert ok, msgs
+    with open(nxs, "r+b") as f:
+        f.truncate(os.path.getsize(nxs) // 2)
+    with pytest.raises(RuntimeError, match=r"^cut\.nxs could not be opened \(damaged, incomplete "
+                                           r"or in use by another program: .+\)$"):
+        process_paths([nxs], time_method=TimeMethod.ABSOLUTE, data_source=DataSourceType.INHOUSE)
 
 
 @pytest.mark.display
@@ -751,6 +998,23 @@ def test_cli_profile_option(tmp_path, capsys):
     assert "error:" in capsys.readouterr().err
 
 
+def test_cli_prints_the_version_and_has_no_dependency_check(monkeypatch, capsys):
+    """The CLI prints its version, names itself operaxn however launched and has no --check-deps."""
+    from operaxn.config import APP_VERSION
+    with pytest.raises(SystemExit) as info:
+        cli_main(["--version"])
+    assert info.value.code == 0
+    assert capsys.readouterr().out.strip() == f"OperaXN {APP_VERSION}"
+    monkeypatch.setattr("sys.argv", ["main.py"])
+    with pytest.raises(SystemExit) as info:
+        cli_main(["--help"])
+    assert info.value.code == 0
+    assert capsys.readouterr().out.startswith("usage: operaxn [-h]"), "argv[0] must not name it"
+    with pytest.raises(SystemExit) as info:
+        cli_main(["--check-deps"])
+    assert info.value.code == 2 and "unrecognized arguments" in capsys.readouterr().err
+
+
 def test_excel_sheet_widths_survive_nan_and_empty_frames():
     """Column fitting handles NaN (pandas 3 keeps it through astype(str)) and a header-only sheet."""
     from openpyxl import Workbook
@@ -814,6 +1078,115 @@ def test_excel_export_asks_for_the_file_before_its_thread(monkeypatch):
     assert asked == [threading.current_thread()] and started == []
 
 
+def _excel_fake(monkeypatch, path, messages):
+    """Return an OPERAXN stand-in whose export thread runs inline."""
+    from tkinter import filedialog
+    import operaxn.gui as gui_module
+    monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **_k: path)
+
+    class InlineThread:
+        def __init__(self, target, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr(gui_module.threading, "Thread", InlineThread)
+    fake = SimpleNamespace(
+        master=None, performance=PerformanceMonitor(),
+        state=SimpleNamespace(scans=[{"scan_num": 1}], echem_df=None,
+                              data_source=core.DataSourceType.INHOUSE),
+        _warn_if_busy=lambda action: False, _set_busy=lambda busy: None,
+        after=lambda ms, fn: fn(), _finish_busy=lambda outcome: outcome and outcome(),
+        _show_message=lambda *a: messages.append(a),
+        _create_summary_dataframe=lambda: pd.DataFrame({"scan number": [1],
+                                                        "voltage (V)": [3.7]}))
+    fake._save_to_csv = lambda df, name: OPERAXN._save_to_csv(fake, df, name)
+    fake._save_to_excel = lambda df, name: OPERAXN._save_to_excel(fake, df, name)
+    fake._format_sheet = OPERAXN._format_sheet
+    fake._add_operando_echem_sheet = lambda writer: None
+    fake._add_experiment_sheet = lambda writer: None
+    return fake
+
+
+def test_excel_export_writes_a_workbook(tmp_path, monkeypatch):
+    """An Excel export writes a workbook with its Scan Summary sheet and leaves no .part."""
+    from openpyxl import load_workbook
+    messages = []
+    path = str(tmp_path / "summary.xlsx")
+    OPERAXN._export_to_excel(_excel_fake(monkeypatch, path, messages))
+    assert messages[-1][0] == "Export complete", messages
+    assert load_workbook(path).sheetnames == ["Scan Summary"]
+    assert not os.path.exists(path + ".part")
+
+
+@pytest.mark.parametrize("filename, kind", [("summary.xlsx", "Excel"), ("summary.csv", "CSV")])
+def test_failed_excel_export_keeps_previous_file(tmp_path, monkeypatch, filename, kind):
+    """A save that fails part way names the format written and leaves the earlier file untouched."""
+    messages = []
+    path = tmp_path / filename
+    path.write_bytes(b"previous export")
+    fake = _excel_fake(monkeypatch, str(path), messages)
+
+    def half_save(df, name):
+        with open(name, "wb") as f:
+            f.write(b"partial")
+        raise OSError("disk full")
+
+    fake._save_to_excel = fake._save_to_csv = half_save
+    OPERAXN._export_to_excel(fake)
+    assert messages[-1] == ("Export failed", f"{kind} file could not be exported: disk full",
+                            "error"), messages
+    assert path.read_bytes() == b"previous export"
+    assert not os.path.exists(str(path) + ".part")
+
+
+@pytest.mark.parametrize("export_type, what", [("current", "Image"), ("multiple", "Images")])
+def test_failed_image_export_says_what_could_not_be_exported(export_type, what):
+    """An image or range export that raises closes its page and names what was not exported."""
+    from contextlib import nullcontext
+    from operaxn.dialog import ExportOptions
+    shown, closed = [], []
+
+    def boom(*_a):
+        raise OSError("disk full")
+
+    fake = SimpleNamespace(_exporting_on_tk_thread=nullcontext, _export_current_scan=boom,
+                           _export_multiple_scans=boom, _close_dialog=closed.append,
+                           _show_message=lambda *a: shown.append(a))
+    OPERAXN._perform_export(fake, ExportOptions(export_type, 100, {"oned": True}, [1]), "page")
+    assert closed == ["page"]
+    assert shown == [("Export failed", f"{what} could not be exported: disk full", "error")]
+
+
+@pytest.mark.parametrize("result, text", [
+    pytest.param((False, ["No experiment loaded"]),
+                 "NeXus file could not be exported:\nNo experiment loaded", id="refused"),
+    pytest.param(OSError("disk full"), "NeXus file could not be exported: disk full", id="raises")])
+def test_failed_nexus_export_says_what_could_not_be_exported(tmp_path, monkeypatch, result, text):
+    """A NeXus export that is refused or raises says the NeXus file could not be exported."""
+    messages = []
+
+    def export(_destination):
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr("operaxn.gui.export_nxs", export)
+    OPERAXN._export_nxs(_excel_fake(monkeypatch, str(tmp_path / "cell.nxs"), messages))
+    assert messages == [("Export failed", text, "error")], messages
+
+
+def test_upper_case_csv_name_gets_csv(tmp_path, monkeypatch):
+    """summary.CSV is written as CSV text, not a workbook under a .CSV name."""
+    messages = []
+    path = str(tmp_path / "summary.CSV")
+    OPERAXN._export_to_excel(_excel_fake(monkeypatch, path, messages))
+    assert messages[-1][0] == "Export complete" and "CSV file" in messages[-1][1]
+    with open(path, "rb") as f:
+        assert f.read(11) == b"scan number"
+
+
 def test_config_summary_logs_after_setup(caplog):
     """The debug configuration summary logs its lines when called after logging setup."""
     from operaxn.config import log_config_summary
@@ -849,7 +1222,6 @@ def test_splash_fill_stops_at_track_end():
             pass
 
     fake = SimpleNamespace(
-        animation_running=True, splash=SimpleNamespace(winfo_exists=lambda: True),
         progress_var=Var(99), canvas=Canvas(), _schedule_animation=lambda *_args: None,
         _animate_progress=None,  # rescheduling target; the stub never calls it
         progress_target=100,
@@ -858,6 +1230,33 @@ def test_splash_fill_stops_at_track_end():
     EnhancedSplashScreen._animate_progress(fake)
     assert fake.progress_var.get() == 100
     assert drawn[0][2] == 350, "the fill must end at the track's right edge (50 + 300)"
+
+
+@pytest.mark.display
+def test_startup_failure_closes_splash_and_exits(monkeypatch):
+    """A main-window build error is shown once, the splash goes and run() returns 1."""
+    import operaxn.main as main_module
+
+    def broken(*_a, **_k):
+        raise RuntimeError("broken build")
+
+    monkeypatch.setattr(main_module, "OPERAXN", broken)
+    monkeypatch.setattr(main_module, "SPLASH_DURATION_MS", 400)
+    monkeypatch.setattr(main_module, "setup_logging",
+                        lambda debug=False: logging.getLogger("operaxn.main"))
+    errors = []
+    monkeypatch.setattr(main_module.ApplicationManager, "_show_error",
+                        lambda self, message: errors.append(message))
+    original_ui = main_module.ApplicationManager._initialise_ui
+
+    def ui_with_watchdog(self):
+        original_ui(self)
+        self.root.after(8000, self.root.destroy)  # ends a main loop the failure left running
+
+    monkeypatch.setattr(main_module.ApplicationManager, "_initialise_ui", ui_with_watchdog)
+    manager = main_module.ApplicationManager(argparse.Namespace(debug=False))
+    assert manager.run() == 1
+    assert len(errors) == 1 and "broken build" in errors[0]
 
 
 @pytest.mark.display
@@ -874,6 +1273,32 @@ def test_plot_settings_apply_redraws_once(tk_root):
     assert calls == [1]
 
 
+@pytest.mark.display
+def test_plot_settings_axis_choices_stay_plain_text(tk_root):
+    """Plot Settings keeps plain Tk text for TOF, d-spacing and 2θ (figure labels use mathtext)."""
+    import tkinter as tk
+    from operaxn.dialog import PlotSettingsDialog
+    from operaxn.gui import VisualiserConfig
+
+    def texts(widget, kinds=(tk.Label, tk.Checkbutton, tk.Radiobutton)):
+        own = [w.cget("text") for w in widget.winfo_children() if isinstance(w, kinds)]
+        return own + [t for w in widget.winfo_children() for t in texts(w, kinds)]
+
+    dlg = PlotSettingsDialog(tk_root, VisualiserConfig(data_source=DataSourceType.NEUTRON), None)
+    try:
+        assert texts(dlg, tk.Radiobutton) == ["Time of flight (μs)", "d-spacing (Å)"]
+        assert not [t for t in texts(dlg) if "$" in t]
+    finally:
+        dlg.destroy()
+    dlg = PlotSettingsDialog(tk_root, VisualiserConfig(), None)
+    try:
+        shown = texts(dlg)
+        assert {"X-axis range (2θ [°]):", "Show d-spacing instead of 2θ"} <= set(shown)
+        assert not [t for t in shown if "$" in t]
+    finally:
+        dlg.destroy()
+
+
 def test_direct_nxs_opens_as_its_recorded_source(neutron_dir, tmp_path):
     """A directly opened .nxs is read and displayed as the source it records,
     whatever was selected; an unreadable path gives None."""
@@ -888,6 +1313,22 @@ def test_direct_nxs_opens_as_its_recorded_source(neutron_dir, tmp_path):
                                 data_source=DataSourceType.INHOUSE)
     assert get_loaded_data_source() == DataSourceType.NEUTRON
     assert make_neutron_arrays(scans), "neutron banks must load from a directly opened file"
+
+
+def test_direct_nxs_uses_its_recorded_time_method(inhouse_dir, tmp_path):
+    """A relative-recorded .nxs opened with Absolute selected shows relative time, so every
+    scan marker sits on the voltage stored for that scan."""
+    nxs = str(tmp_path / "rel.nxs")
+    ok, msgs = core.generate([inhouse_dir], nxs, core.DataSourceType.INHOUSE,
+                             time_method=core.TimeMethod.RELATIVE)
+    assert ok, msgs
+    assert core.read_correlation_method(nxs) == "relative"
+    scans, echem_df, method = process_paths(
+        [nxs], time_method=TimeMethod.ABSOLUTE, data_source=DataSourceType.INHOUSE)
+    assert method == "relative"
+    arrays = make_echem_arrays(echem_df, method)
+    for scan, t in zip(scans, get_scan_time_positions(scans, echem_df, method)):
+        assert abs(np.interp(t, arrays["x"], arrays["y"]) - scan["echem"]) < 0.011
 
 
 def test_working_copy_keeps_the_export_stem(inhouse_dir, tmp_path):
@@ -926,6 +1367,76 @@ def test_reset_session_forgets_the_experiment(inhouse_dir, tmp_path):
     assert get_loaded_data_source() is None
     with pytest.raises(RuntimeError):
         add_standard_echem_files([std_echem_path])
+
+
+@needs_fabio
+def test_reset_session_empties_the_reader_cache(inhouse_dir):
+    """Clear All (reset_session) drops the forgotten experiment's images from the cache."""
+    _builders.write_edf_image(os.path.join(inhouse_dir, "image_001.edf"),
+                              _builders.SCAN_TIMES[0])
+    scans, _, _ = process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
+                                data_source=DataSourceType.INHOUSE)
+    assert make_twod_arrays(scans)[1]["image"] is not None
+    assert readers._file_cache.cache, "the shown image goes through the cache"
+    reset_session()
+    assert not readers._file_cache.cache and readers._file_cache.current_size == 0
+
+
+@needs_fabio
+def test_twod_arrays_read_each_image_only_when_shown(inhouse_dir, monkeypatch):
+    """Building, sizing and membership read nothing; indexing reads that one scan."""
+    _builders.write_edf_image(os.path.join(inhouse_dir, "image_001.edf"),
+                              _builders.SCAN_TIMES[0])
+    scans, _, _ = process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
+                                data_source=DataSourceType.INHOUSE)
+    assert scans[0]["twod"]
+    reads = []
+    real = gui_input._load_twod_image
+    monkeypatch.setattr(gui_input, "_load_twod_image",
+                        lambda sd, state=None: reads.append(sd.scan_num) or real(sd, state))
+    arrays = make_twod_arrays(scans)
+    assert bool(arrays) and len(arrays) == 1 and 1 in arrays and 2 not in arrays
+    assert list(arrays) == [1] and arrays.get(2) is None
+    assert reads == [], f"images read before any scan was shown: {reads}"
+    assert arrays[1]["image"].shape == (8, 8)
+    assert reads == [1]
+
+
+@needs_fabio
+def test_unreadable_twod_image_maps_to_error_once(inhouse_dir, monkeypatch):
+    """A 2D source that fails to read shows the error entry and is not re-read on every visit."""
+    edf = os.path.join(inhouse_dir, "image_001.edf")
+    _builders.write_edf_image(edf, _builders.SCAN_TIMES[0])
+    scans, _, _ = process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
+                                data_source=DataSourceType.INHOUSE)
+    with open(edf, "wb") as f:
+        f.write(b"not an image")
+    reads = []
+    real = gui_input._load_twod_image
+    monkeypatch.setattr(gui_input, "_load_twod_image",
+                        lambda sd, state=None: reads.append(sd.scan_num) or real(sd, state))
+    arrays = make_twod_arrays(scans)
+    assert arrays[1] == {"error": True}
+    assert arrays.get(1) == {"error": True} and reads == [1]
+
+
+@needs_fabio
+def test_twod_scan_shown_while_its_source_was_away_shows_the_image_once_it_is_back(tmp_path):
+    """Moving the image folder away turns the panel red; moving it back heals viewed scans."""
+    root = tmp_path / "set"
+    src, images = str(root / "xrd"), str(root / "images")
+    _builders.write_lab_dir(src)
+    os.makedirs(images)
+    for i, ts in enumerate(_builders.SCAN_TIMES, start=1):
+        _builders.write_edf_image(os.path.join(images, f"image_{i:03d}.edf"), ts)
+    scans, _, _ = process_paths([str(root)], time_method=TimeMethod.ABSOLUTE,
+                                data_source=DataSourceType.INHOUSE)
+    arrays = make_twod_arrays(scans)
+    assert "image" in arrays[1]
+    os.rename(images, images + "_away")
+    assert arrays[1] == {"error": True} and arrays[2] == {"error": True}
+    os.rename(images + "_away", images)
+    assert "image" in arrays[1] and "image" in arrays[2] and "image" in arrays[3]
 
 
 def _gui_app(tk_root, monkeypatch):
@@ -993,6 +1504,23 @@ def test_upload_and_clear_locked_while_loading(tk_root, monkeypatch, neutron_dir
         assert app.state.data_source == DataSourceType.NEUTRON
         assert app.state.neutron_arrays, messages
         assert messages and messages[-1][0] == "Success", messages
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
+def test_one_run_neutron_load_message_reads_singular(tk_root, monkeypatch, neutron_dir):
+    """A one-run neutron load says 'Successfully loaded 1 neutron scan'."""
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    try:
+        app._process_files_async(UploadOptions(paths=[neutron_dir],
+                                               data_source=DataSourceType.NEUTRON,
+                                               time_method=TimeMethod.ABSOLUTE, display_size=0,
+                                               include_2d=False))
+        _wait_for_worker(win, app)
+        assert messages[-1] == ("Success", "Successfully loaded 1 neutron scan using absolute "
+                                "timestamps", "info"), messages
     finally:
         if win.winfo_exists():
             win.destroy()
@@ -1076,6 +1604,112 @@ def test_failed_load_unlocks_upload_and_clear(tk_root, monkeypatch, inhouse_dir)
 
 
 @pytest.mark.display
+@pytest.mark.parametrize("failure", ["generate", "arrays", "rows shown"])
+def test_failed_load_leaves_the_window_as_clear_all_does(tk_root, monkeypatch, tmp_path,
+                                                         neutron_dir, failure):
+    """A failed neutron load leaves no scans, rows or view settings behind: the window and its
+    settings are as Clear All leaves them."""
+    import operaxn.gui as gui_module
+    from operaxn.gui import VisualiserConfig
+    path = neutron_dir
+    if failure == "generate":
+        path = tmp_path / "junk"
+        path.mkdir()
+        (path / "notes.txt").write_text("nothing to see\n")
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    if failure == "arrays":
+        def boom(*_a, **_k):
+            raise MemoryError("simulated neutron build failure")
+        monkeypatch.setattr(gui_module, "make_neutron_arrays", boom)
+    elif failure == "rows shown":
+        def boom(*_a, **_k):
+            raise RuntimeError("simulated failure after the rows are shown")
+        monkeypatch.setattr(app.scan_selector, "set_range", boom)  # first step after the rows
+    try:
+        app._apply_data_source(DataSourceType.NEUTRON, 0)  # as _upload_files does first
+        app._process_files_async(UploadOptions(
+            paths=[str(path)], data_source=DataSourceType.NEUTRON,
+            time_method=TimeMethod.ABSOLUTE, display_size=0, include_2d=False))
+        _wait_for_worker(win, app)
+        assert messages[-1][0] == "Error", messages
+        assert app.state.scans == []
+        assert app.config == VisualiserConfig()
+        assert app.file_list.listbox.size() == 0, app.file_list.listbox.get(0, "end")
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+def _inhouse_options(path):
+    """Return the options of an absolute in-house load of path without 2D images."""
+    return UploadOptions(paths=[path], data_source=DataSourceType.INHOUSE,
+                         time_method=TimeMethod.ABSOLUTE, display_size=0,
+                         include_2d=False)
+
+
+@pytest.mark.display
+def test_failed_generate_shows_the_reason_and_clears_progress(tk_root, monkeypatch, tmp_path):
+    """The box names the generate error and the progress row does not stay behind."""
+    junk = tmp_path / "junk"
+    junk.mkdir()
+    (junk / "notes.txt").write_text("nothing to see\n")
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    try:
+        app.file_list.show_progress("Processing laboratory data...")
+        app._process_files_async(_inhouse_options(str(junk)))
+        _wait_for_worker(win, app)
+        assert messages[-1][0] == "Error" and "No scan data available" in messages[-1][1]
+        assert app.file_list.listbox.size() == 0
+        assert app.state.scans == []
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
+def test_array_failure_drops_the_half_load(tk_root, monkeypatch, inhouse_dir):
+    """An error while building arrays is shown, and the scans, session and progress row go."""
+    import operaxn.gui as gui_module
+
+    def boom(*_a, **_k):
+        raise MemoryError("simulated 2D build failure")
+
+    monkeypatch.setattr(gui_module, "make_twod_arrays", boom)
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    try:
+        app._process_files_async(_inhouse_options(inhouse_dir))
+        _wait_for_worker(win, app)
+        assert messages and messages[-1][0] == "Error", messages
+        assert "simulated 2D build failure" in messages[-1][1]
+        assert app.state.scans == [] and app.file_list.listbox.size() == 0
+        assert gui_input.get_loaded_nxs_path() is None
+        assert not os.path.exists(core.default_cache_path([inhouse_dir]))
+        buttons = app.button_panel.buttons
+        assert str(buttons["upload_files"].cget("state")) == "normal"
+        assert str(buttons["plot_data"].cget("state")) == "disabled"
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
+def test_load_without_plottable_data_is_dropped(tk_root, monkeypatch, inhouse_dir):
+    """Scans with no readable pattern give the warning and no orphan scans."""
+    import operaxn.gui as gui_module
+    monkeypatch.setattr(gui_module, "make_oned_arrays", lambda *_a, **_k: {})
+    monkeypatch.setattr(gui_module, "make_twod_arrays", lambda *_a, **_k: {})
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    try:
+        app._process_files_async(_inhouse_options(inhouse_dir))
+        _wait_for_worker(win, app)
+        assert messages[-1][0] == "Warning" and "No valid data" in messages[-1][1]
+        assert app.state.scans == [] and app.file_list.listbox.size() == 0
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
 def test_plot_keeps_or_ends_a_worker_busy_state_correctly(tk_root, monkeypatch, inhouse_dir):
     """Plot during an echem append keeps the append's lock; if the append finishes inside
     Plot's error box, the lock ends rather than coming back when the box closes."""
@@ -1128,6 +1762,36 @@ def test_echem_append_while_busy_is_refused_with_a_message(tk_root, monkeypatch,
 
 
 @pytest.mark.display
+@pytest.mark.parametrize("count, title, body", [
+    (0, "No electrochemistry data",
+     "No valid electrochemistry data was found in the selected files."),
+    (1, "Electrochemistry added without current",
+     "The selected file was loaded, but it has no usable current column and therefore "
+     "cannot be used for ICI or Capacity analysis."),
+    (2, "Electrochemistry added without current",
+     "The selected files were loaded, but they have no usable current column and therefore "
+     "cannot be used for ICI or Capacity analysis."),
+], ids=["none", "one", "two"])
+def test_added_echem_outcomes_say_electrochemistry(tk_root, monkeypatch, count, title, body):
+    """Add Electrochemistry outcomes: one title word, the no-current text by the file count."""
+    import operaxn.gui as gui_module
+    win, app, messages = _gui_app(tk_root, monkeypatch)
+    try:
+        voltage_only = pd.DataFrame({
+            "timestamp": pd.date_range("2024-02-05 10:00", periods=3, freq="min"),
+            "echem_data": [3.7, 3.8, 3.9]})
+        monkeypatch.setattr(gui_module, "add_standard_echem_files",
+                            lambda paths: [{"source_file": p, "data": voltage_only}
+                                           for p in paths[:count]])
+        app._append_standard_echem_async(["v1.txt", "v2.txt"])
+        _wait_for_worker(win, app)
+        assert messages[-1][:2] == (title, body), messages
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
 def test_echem_only_upload_needs_a_loaded_experiment(tk_root, monkeypatch, tmp_path):
     """Standard echem alone (dialog opened with data that a Clear then removed) is refused."""
     import operaxn.gui as gui_module
@@ -1168,7 +1832,7 @@ def test_exports_lock_upload_and_clear(tk_root, monkeypatch, inhouse_dir, tmp_pa
         app._export_nxs()
         assert messages[-1][0] == "Busy", "a second export must wait"
         _wait_for_worker(win, app)
-        assert messages[-1][0] == "Success", messages
+        assert messages[-1][0] == "Export complete", messages
         assert os.path.isfile(target["path"])
 
         target["path"] = str(tmp_path / "summary.csv")
@@ -1176,12 +1840,182 @@ def test_exports_lock_upload_and_clear(tk_root, monkeypatch, inhouse_dir, tmp_pa
         assert app.state.ui_state == UIState.EXPORTING
         assert app._clear_all() is False and app.state.scans
         _wait_for_worker(win, app)
-        assert messages[-1][0] == "Success", messages
+        assert messages[-1][0] == "Export complete", messages
         assert os.path.isfile(target["path"])
 
         assert str(app.button_panel.buttons["clear_all"].cget("state")) == "normal"
         assert app._clear_all() and os.path.isfile(str(tmp_path / "exported.nxs"))
         _discard(cache_file)
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+def _pump_until_closed(win, timeout=10.0):
+    """Pump Tk events until win is destroyed or timeout seconds pass."""
+    import time
+    deadline = time.monotonic() + timeout
+    while win.winfo_exists() and time.monotonic() < deadline:
+        win.update()
+        time.sleep(0.01)
+
+
+@pytest.mark.display
+def test_quit_while_busy_asks_first(tk_root, monkeypatch):
+    """Closing during an export asks; No keeps the window, Yes hides it until the export ends."""
+    from operaxn.gui import UIState
+    win, app, _ = _gui_app(tk_root, monkeypatch)
+    answers, asked, hidden = [False, True], [], []
+    monkeypatch.setattr("operaxn.gui.messagebox.askyesno",
+                        lambda *a, **k: asked.append(a) or answers.pop(0))
+    monkeypatch.setattr(win, "withdraw", lambda: hidden.append(True))
+    try:
+        app._set_busy(UIState.EXPORTING)
+        app._on_closing()
+        assert asked and win.winfo_exists() and not hidden, "No must keep the window and its export"
+        app._on_closing()
+        assert hidden and win.winfo_exists(), "Yes hides the window while the export runs"
+        app._finish_busy(None)  # the export's worker ends
+        _pump_until_closed(win)
+        assert not win.winfo_exists()
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
+def test_quit_closes_at_the_deadline_when_the_work_never_ends(tk_root, monkeypatch):
+    """Work that never reaches a checkpoint keeps the app open for QUIT_WAIT_S at most."""
+    from operaxn.gui import UIState
+    monkeypatch.setattr("operaxn.gui.QUIT_WAIT_S", 0.2)
+    win, app, _ = _gui_app(tk_root, monkeypatch)
+    monkeypatch.setattr("operaxn.gui.messagebox.askyesno", lambda *a, **k: True)
+    try:
+        app._set_busy(UIState.LOADING)
+        app._on_closing()
+        _pump_until_closed(win)
+        assert not win.winfo_exists() and app._is_busy()
+    finally:
+        if win.winfo_exists():
+            win.destroy()
+
+
+@needs_fabio
+@pytest.mark.display
+@pytest.mark.parametrize("stage", ["warm_up", "write"])
+def test_quit_mid_load_closes_once_the_load_has_cleaned_up(tk_root, monkeypatch, tmp_path, stage):
+    """Quit anyway mid ZIP load closes the window only after the stopped load has cleaned up."""
+    import gc
+    import importlib
+    import tempfile
+    import threading
+    import time
+    from tkinter import Toplevel
+    generate_module = importlib.import_module("core.generate")
+    src = tmp_path / "src"
+    _builders.write_dated_pairs(str(src), _builders.SCAN_TIMES, _builders.SCAN_TIMES)
+    zpath = _builders.zip_tree(str(src), str(tmp_path / "cellq.zip"))
+    monkeypatch.setattr(generate_module, "PARALLEL_PROCESSING_THRESHOLD", 0)
+    monkeypatch.setattr("operaxn.gui.messagebox.askyesno", lambda *a, **k: True)
+    reached, pressed = threading.Event(), threading.Event()
+    owner, name = {"warm_up": (generate_module.FileProcessor, "_warm_up"),
+                   "write": (nxs_writer.NXSWriter, "_write_scan")}[stage]
+    original = getattr(owner, name)
+
+    def held(*args, **kwargs):  # the stage's first call waits for the close button
+        if not reached.is_set():
+            reached.set()
+            pressed.wait(10)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, staticmethod(held) if stage == "warm_up" else held)
+    tmp, cache = tempfile.gettempdir(), core.cache_dir()
+    before = set(os.listdir(tmp))
+    win = Toplevel(tk_root)
+    app = OPERAXN(master=win)
+    shown, left = [], []
+    monkeypatch.setattr(app, "_show_message", lambda *a: shown.append(a))
+    # Earlier tests' Tk objects are freed here: freed on the worker, their Tk call can block it
+    gc.collect()
+    others = set(threading.enumerate())
+    app._process_files_async(UploadOptions(paths=[zpath], data_source=DataSourceType.INHOUSE,
+                                           time_method=TimeMethod.ABSOLUTE, display_size=0,
+                                           include_2d=False))
+    worker = (set(threading.enumerate()) - others).pop()
+    deadline = time.monotonic() + 30
+
+    def poll():
+        if reached.is_set() and not pressed.is_set():
+            app._on_closing()
+            pressed.set()
+        if win.winfo_exists() and time.monotonic() < deadline:
+            tk_root.after(10, poll)
+            return
+        left.extend(set(os.listdir(tmp)) - before)  # as the window closes
+        left.extend(n for n in os.listdir(cache) if n.startswith("cellq"))
+        tk_root.quit()
+
+    try:
+        tk_root.after(10, poll)
+        tk_root.mainloop()
+        worker.join(2)
+        assert not win.winfo_exists() and not worker.is_alive(), "the load must stop first"
+        assert left == [] and shown == [], (left, shown)
+    finally:
+        pressed.set()
+        worker.join(30)
+        if win.winfo_exists():
+            win.destroy()
+
+
+@pytest.mark.display
+def test_quit_during_an_image_or_gif_export_asks_and_stops_it(tk_root, monkeypatch, inhouse_dir,
+                                                              tmp_path):
+    """Closing mid range export or GIF asks; No lets it finish, Yes stops it as Stop does."""
+    import glob
+    from operaxn.dialog import ExportOptions
+    win, app, _ = _gui_app(tk_root, monkeypatch)
+    monkeypatch.delattr(app, "_show_message")  # the real one: no box once the quit is confirmed
+    shown, answers = [], [False, False, True]
+    for kind in ("showinfo", "showwarning", "showerror"):
+        monkeypatch.setattr(f"operaxn.gui.messagebox.{kind}", lambda *a, **k: shown.append(a))
+    monkeypatch.setattr("operaxn.gui.messagebox.askyesno", lambda *a, **k: answers.pop(0))
+    monkeypatch.setattr("operaxn.gui.filedialog.askdirectory", lambda **k: str(tmp_path))
+    monkeypatch.setattr("operaxn.gui.filedialog.asksaveasfilename",
+                        lambda **k: str(tmp_path / "movie.gif"))
+
+    def run(open_dialog, attr, start, settings):
+        open_dialog()
+        dialog = getattr(app, attr)
+        original = dialog.update_progress
+
+        def update_progress(value, text):  # the close button, clicked as the export pumps events
+            if value == 1:
+                app._on_closing()
+            return original(value, text)
+
+        dialog.update_progress = update_progress
+        start(settings, dialog)
+
+    scans = ExportOptions("multiple", 40, {"oned": True}, [1, 2, 3])
+    pngs = lambda: glob.glob(str(tmp_path / "*.png"))  # noqa: E731
+    try:
+        _load_inhouse(win, app, inhouse_dir)
+        app._plot_data()
+        run(app._export_data, "_export_options_dialog", app._perform_export, scans)
+        assert win.winfo_exists() and len(answers) == 2, "a quit during a range export must ask"
+        run(app._create_gif, "_gif_dialog", app._run_gif,
+            GIFSettings(fps=2, dpi=30, loop=0, scan_list=[1, 2, 3]))
+        assert win.winfo_exists() and len(answers) == 1, "a quit during a GIF must ask"
+        assert len(pngs()) == 3 and os.path.isfile(tmp_path / "movie.gif"), "No lets both finish"
+        for png in pngs():
+            os.remove(png)
+        boxes = len(shown)
+        run(app._export_data, "_export_options_dialog", app._perform_export, scans)
+        _pump_until_closed(win)
+        assert not win.winfo_exists() and not answers
+        assert len(pngs()) == 1 and not glob.glob(str(tmp_path / "*.part")), "stopped after scan 1"
+        assert len(shown) == boxes, "no box after a confirmed quit"
     finally:
         if win.winfo_exists():
             win.destroy()
@@ -1215,3 +2049,255 @@ def test_upload_dialog_takes_source_from_nxs(tk_root, neutron_dir, inhouse_dir, 
     finally:
         if dlg.winfo_exists():
             dlg.destroy()
+
+
+@pytest.mark.display
+def test_upload_dialog_takes_time_method_from_nxs(tk_root, inhouse_dir, tmp_path):
+    """Picking a relative-recorded .nxs shows and locks Relative; raw data restores the choice."""
+    nxs = str(tmp_path / "rel.nxs")
+    ok, msgs = core.generate([inhouse_dir], nxs, core.DataSourceType.INHOUSE,
+                             time_method=core.TimeMethod.RELATIVE)
+    assert ok, msgs
+    dlg = UploadOptionsDialog(tk_root)
+    try:
+        dlg._paths = [nxs]
+        dlg._update_option_states()
+        assert dlg.time_var.get() == "relative"
+        assert all(str(r.cget("state")) == "disabled" for r in dlg._time_radios)
+        dlg._paths = [inhouse_dir]
+        dlg._update_option_states()
+        assert dlg.time_var.get() == "absolute"
+        assert all(str(r.cget("state")) == "normal" for r in dlg._time_radios)
+    finally:
+        if dlg.winfo_exists():
+            dlg.destroy()
+
+
+@pytest.mark.display
+def test_upload_dialog_wheel_scrolls_on_every_platform_and_unbinds_on_close(tk_root):
+    """The wheel scrolls on every platform, a zero delta does not, and closing inside unbinds it."""
+    sequences = ("<MouseWheel>", "<Button-4>", "<Button-5>")
+    dlg = UploadOptionsDialog(tk_root)
+    try:
+        dlg._canvas.event_generate("<Enter>")
+        assert all(tk_root.bind_all(s) for s in sequences)
+        steps = []
+        dlg._scrollbar.winfo_ismapped = lambda: True
+        dlg._canvas.yview_scroll = lambda n, _what: steps.append(n)
+        for delta, num in ((120, "??"), (-240, "??"), (1, "??"), (-1, "??"), (0, "??"), (0, 4), (0, 5)):
+            dlg._on_wheel(SimpleNamespace(delta=delta, num=num))
+        assert steps == [-1, 2, -1, 1, -1, 1]
+        dlg.cancel()  # what <Escape> runs
+    finally:
+        if dlg.winfo_exists():
+            dlg.destroy()
+    assert not any(tk_root.bind_all(s) for s in sequences)
+
+
+@pytest.mark.display
+def test_upload_file_picker_separates_patterns_by_spaces(tk_root, monkeypatch):
+    """The 'All Supported' filter lists its patterns with spaces, as Tk's Linux file dialog needs."""
+    asked = []
+    monkeypatch.setattr("operaxn.dialog.filedialog.askopenfilenames",
+                        lambda **kwargs: asked.append(kwargs["filetypes"]) or ())
+    dlg = UploadOptionsDialog(tk_root)
+    try:
+        dlg._select_files()
+    finally:
+        dlg.destroy()
+    patterns = dict(asked[0])["All Supported"]
+    assert patterns == "*.zip *.dat *.edf *.txt *.xlsx *.csv *.hdf *.nxs *.xy", patterns
+
+
+@pytest.mark.display
+def test_upload_standard_echem_count_reads_singular(tk_root, monkeypatch):
+    """The standard echem field reads '1 file' for one file and '2 files' for two."""
+    picks = [("a.txt",), ("a.txt", "b.txt")]
+    monkeypatch.setattr("operaxn.dialog.filedialog.askopenfilenames",
+                        lambda **kwargs: picks.pop(0))
+    dlg = UploadOptionsDialog(tk_root)
+    try:
+        shown = []
+        for _ in range(2):
+            dlg._select_std_echem()
+            shown.append(dlg.std_echem_var.get())
+    finally:
+        dlg.destroy()
+    assert shown == ["1 file", "2 files"], shown
+
+
+# ============================================================================
+# GIF export
+# ============================================================================
+
+def test_gif_export_needs_no_imageio_and_keeps_its_bytes(tmp_path, monkeypatch):
+    """With imageio unavailable a GIF still exports, byte for byte the GIF Pillow writes from the
+    frames' RGB pixels at 1000 / fps ms per frame and the chosen loop count."""
+    import sys
+    from PIL import Image
+    rng = np.random.default_rng(0)
+    files = []
+    for i in range(4):
+        rgba = rng.integers(0, 256, (30, 40, 4), dtype=np.uint8)
+        rgba[..., 3] = 255 if i % 2 else rng.integers(0, 256, (30, 40), dtype=np.uint8)
+        files.append(str(tmp_path / f"f{i}.png"))
+        Image.fromarray(rgba).save(files[-1])
+    files.append(files[3])  # the writer merges a repeated frame
+    expected = str(tmp_path / "expected.gif")
+    pixels = [Image.fromarray(np.asarray(Image.open(f))[..., :3]) for f in files]
+    pixels[0].save(expected, format="GIF", save_all=True, append_images=pixels[1:],
+                   duration=1000 / 3, loop=2)
+
+    monkeypatch.setitem(sys.modules, "imageio", None)  # any import of imageio now fails
+    assert not hasattr(operaxn.gui, "imageio"), "the GIF writer must not hold imageio"
+    messages = []
+
+    def frame(temp_dir, index, scan, dpi, layout=None):
+        path = os.path.join(temp_dir, f"frame_{index:04d}.png")
+        shutil.copyfile(files[index], path)
+        return path
+    fake = SimpleNamespace(state=SimpleNamespace(scans=[{"scan_num": i + 1} for i in range(5)]),
+                           _gif_layout=lambda nums: (True, False, False, False),
+                           _create_gif_frame=frame, _show_message=lambda *a: messages.append(a),
+                           _close_dialog=lambda dialog: None)
+    dialog = SimpleNamespace(begin_progress=lambda *a: None, update_progress=lambda *a: True)
+    out = str(tmp_path / "anim.gif")
+    OPERAXN._generate_gif(fake, out, GIFSettings(fps=3, dpi=100, loop=2, scan_list=[1, 2, 3, 4, 5]),
+                          dialog)
+    assert messages and messages[-1][0] == "Export complete", messages
+    with open(out, "rb") as written, open(expected, "rb") as reference:
+        assert written.read() == reference.read()
+
+
+def _gif_app(monkeypatch, n):
+    """Return a stand-in app with n scans of distinct 1D data and a message log."""
+    import operaxn.gui as gui_module
+    x = np.linspace(10, 80, 50)
+
+    def correlated(scans, scan_num, state=None):
+        return {"scan_num": scan_num, "oned": {"x": x, "y": np.arange(50.0) * scan_num}}
+
+    monkeypatch.setattr(gui_module, "get_correlated_data", correlated)
+    source = gui_module.DataSourceType.INHOUSE
+    fake = SimpleNamespace(
+        state=SimpleNamespace(data_source=source, scans=[{"scan_num": i} for i in range(1, n + 1)],
+                              echem_df=pd.DataFrame(), echem_arrays={"x": np.array([])},
+                              intensity_limits={}, time_method="absolute",
+                              oned_arrays={i: {} for i in range(1, n + 1)}, twod_arrays={},
+                              neutron_arrays={}),
+        config=operaxn.VisualiserConfig(data_source=source),
+        _gif_placeholder=OPERAXN._gif_placeholder,
+    )
+    fake._gif_layout = lambda nums: OPERAXN._gif_layout(fake, nums)
+    fake._create_gif_frame = lambda *a: OPERAXN._create_gif_frame(fake, *a)
+    fake.messages = []
+    fake._show_message = lambda *a: fake.messages.append(a)
+    fake._close_dialog = lambda dialog: None
+    return fake
+
+
+DIALOG = SimpleNamespace(begin_progress=lambda *a: None, update_progress=lambda *a: True)
+
+
+def test_generate_gif_keeps_frame_timing_without_fps_keyword(monkeypatch, tmp_path):
+    """Each frame lasts 1000 / fps ms and the loop count is kept, with no fps deprecation."""
+    from PIL import Image
+    fake = _gif_app(monkeypatch, 3)
+    out = str(tmp_path / "timed.gif")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        OPERAXN._generate_gif(fake, out, GIFSettings(fps=4, dpi=40, loop=2, scan_list=[1, 2, 3]),
+                              DIALOG)
+    assert fake.messages and fake.messages[-1][0] == "Export complete", fake.messages
+    assert not [w for w in caught if "fps" in str(w.message)], [str(w.message) for w in caught]
+    with Image.open(out) as gif:
+        durations = []
+        for index in range(gif.n_frames):
+            gif.seek(index)
+            durations.append(gif.info["duration"])
+        assert gif.info["loop"] == 2
+    assert durations == [250, 250, 250], durations
+
+
+def test_generate_gif_streams_frames_to_the_writer(monkeypatch, tmp_path):
+    """The writer holds a fixed few full-colour frames (first, previous, next), not one per scan."""
+    from PIL import Image
+    refs = []
+    peak = [0]
+    original = Image.Image.save
+
+    def counting(self, fp, format=None, **params):
+        # Count the frames handed to the GIF writer that are still alive as each new one
+        # arrives; PIL images are unhashable, so by weak reference
+        if not params.get("save_all"):  # the PNG frames matplotlib writes
+            return original(self, fp, format, **params)
+        refs.append(weakref.ref(self))
+
+        def frames(source):
+            for image in source:
+                refs.append(weakref.ref(image))
+                peak[0] = max(peak[0], sum(ref() is not None for ref in refs))
+                yield image
+        params["append_images"] = frames(params.get("append_images", []))
+        return original(self, fp, format, **params)
+
+    monkeypatch.setattr(Image.Image, "save", counting)
+    fake = _gif_app(monkeypatch, 8)
+    out = str(tmp_path / "long.gif")
+    OPERAXN._generate_gif(fake, out, GIFSettings(fps=5, dpi=40, loop=0,
+                                                 scan_list=list(range(1, 9))), DIALOG)
+    assert fake.messages and fake.messages[-1][0] == "Export complete", fake.messages
+    with Image.open(out) as gif:
+        assert gif.n_frames == 8
+    assert peak[0] <= 3, peak[0]
+
+
+def _frames(tmp_path, n=3):
+    """Write n distinct opaque PNG frames and return their paths."""
+    from PIL import Image
+    paths = []
+    for i in range(n):
+        p = str(tmp_path / f"f{i}.png")
+        Image.fromarray(np.full((40, 60, 4), (40 * i, 80, 120, 255), np.uint8)).save(p)
+        paths.append(p)
+    return paths
+
+
+def _gif(out, files, monkeypatch=None, fail_on=None):
+    """Run the real _generate_gif on prepared frames; return the last message."""
+    from PIL import Image
+    if fail_on is not None:
+        real, calls = Image.open, [0]
+
+        def flaky(path, *a, **k):
+            calls[0] += 1
+            if calls[0] == fail_on:
+                raise OSError("disk full")
+            return real(path, *a, **k)
+        monkeypatch.setattr(Image, "open", flaky)
+    msgs = []
+
+    def frame(temp_dir, idx, scan, dpi, layout=None):
+        dst = os.path.join(temp_dir, f"frame_{idx:04d}.png")
+        shutil.copyfile(files[idx], dst)
+        return dst
+    fake = SimpleNamespace(state=SimpleNamespace(scans=[{"scan_num": i + 1} for i in range(len(files))]),
+                           _gif_layout=lambda nums: (True, False, False, False),
+                           _create_gif_frame=frame, _show_message=lambda *a: msgs.append(a),
+                           _close_dialog=lambda d: None)
+    dialog = SimpleNamespace(begin_progress=lambda *a: None, update_progress=lambda *a: True)
+    OPERAXN._generate_gif(fake, out, GIFSettings(fps=2, dpi=100, loop=0,
+                                                 scan_list=list(range(1, len(files) + 1))), dialog)
+    return msgs[-1]
+
+
+def test_failed_gif_write_keeps_the_previous_gif(tmp_path, monkeypatch):
+    """A write that fails part-way shows the error, leaves the old GIF byte for byte and no .part."""
+    files = _frames(tmp_path)
+    out = str(tmp_path / "anim.gif")
+    assert _gif(out, files)[0] == "Export complete"
+    before = open(out, "rb").read()
+    title, text, _ = _gif(out, files[::-1], monkeypatch, fail_on=2)
+    assert (title, text) == ("Export failed", "GIF could not be exported: disk full")
+    assert open(out, "rb").read() == before
+    assert not os.path.exists(out + ".part")

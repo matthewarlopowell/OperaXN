@@ -1,5 +1,5 @@
 """
-Themed Tkinter dialogs for upload options, plot settings, exports, GIFs and progress.
+Themed Tkinter dialogs for upload options, plot settings, image exports and GIFs.
 
 BaseDialog provides the house style: non-modal, shrink-to-fit sizing, surface-matched
 widget helpers, Upload Data style sections, one shared width for the Image, GIF and Plot
@@ -14,30 +14,28 @@ import tkinter as tk
 import tkinter.ttk as ttk
 from dataclasses import dataclass, field
 from tkinter import filedialog, messagebox
-from typing import Dict, List, Callable, Optional, Tuple, Any
+from typing import Dict, List, Callable, Optional, Set, Tuple, Any
 
 import numpy as np
 import pandas as pd
 
-from core import ECHEM_TIME_TOLERANCE, TimeMethod, is_canonical_nxs, read_data_source
+from core import (ECHEM_TIME_TOLERANCE, TimeMethod, is_canonical_nxs,
+                  read_correlation_method, read_data_source)
 from core.config import MAX_ECHEM_TIME_TOLERANCE
 
 from .output import clear_plot_cache
 from .config import (
     DataSourceType,
-    DSPACING_LABEL,
-    TOF_LABEL,
+    DSPACING_TEXT,
+    TOF_TEXT,
     DEFAULT_GIF_DPI,
     DEFAULT_GIF_FPS,
     DEFAULT_GIF_LOOP,
-    DEFAULT_TWOD_XMAX_PERCENT,
-    DEFAULT_TWOD_XMIN_PERCENT,
     EXPORT_DPI,
     OPERAXNTheme,
     SETTINGS_DIALOG_WIDTH_IN,
     SYNCHROTRON_MAX_DISPLAY_SIZE,
     SYNCHROTRON_WAVELENGTH,
-    WINDOW_SIZES,
     XRAY_WAVELENGTH,
 )
 
@@ -567,7 +565,7 @@ class PlotSettingsDialog(BaseDialog):
 
     def _validate_entry(self, key: str, var: tk.StringVar) -> None:
         """Store an entry's limit in config; blank or 'auto' means None (auto-scale).
-        Anything else unparseable is cleared to blank and stored as None."""
+        Anything else unparseable or not finite is cleared to blank and stored as None."""
         try:
             value_str = var.get().strip()
 
@@ -576,7 +574,10 @@ class PlotSettingsDialog(BaseDialog):
                 if not value_str:
                     var.set("")
             else:
-                self._set_config_value(key, float(value_str))
+                value = float(value_str)
+                if not np.isfinite(value):
+                    raise ValueError(value_str)  # inf, nan and 1e999 would break the redraw
+                self._set_config_value(key, value)
 
         except (ValueError, tk.TclError):
             var.set("")
@@ -604,7 +605,7 @@ class PlotSettingsDialog(BaseDialog):
         """Build the display-mode choice and the X and intensity ranges."""
         mode = self.create_section(body, "Display mode:")
         self.neutron_display_var = tk.BooleanVar(value=self.config.show_neutron_dspacing)
-        for text, value in ((TOF_LABEL, False), (DSPACING_LABEL, True)):
+        for text, value in ((TOF_TEXT, False), (DSPACING_TEXT, True)):
             self.create_themed_radiobutton(
                 mode, text, self.neutron_display_var, value,
                 self._on_neutron_mode_change).pack(anchor="w", pady=1)
@@ -632,18 +633,15 @@ class PlotSettingsDialog(BaseDialog):
 
     def _apply_neutron_settings(self) -> None:
         """Validate neutron fields into config, clear plot cache, redraw."""
-        if hasattr(self, 'neutron_display_var'):
-            self.config.show_neutron_dspacing = self.neutron_display_var.get()
+        self.config.show_neutron_dspacing = self.neutron_display_var.get()
 
-            for key in ['neutron_xmin', 'neutron_xmax', 'neutron_ymin', 'neutron_ymax']:
-                var_name = f"{key}_var"
-                if hasattr(self, var_name):
-                    self._validate_entry(key, getattr(self, var_name))
+        for key in ['neutron_xmin', 'neutron_xmax', 'neutron_ymin', 'neutron_ymax']:
+            self._validate_entry(key, getattr(self, f"{key}_var"))
 
-            clear_plot_cache()
+        clear_plot_cache()
 
-            if self.on_update:
-                self.on_update()
+        if self.on_update:
+            self.on_update()
 
     # --- X-ray 1D and 2D ---
 
@@ -676,10 +674,8 @@ class PlotSettingsDialog(BaseDialog):
         rows = [
             ("Y min:", 'ymin_2d_var', self.config.twod_ymin_percent),
             ("Y max:", 'ymax_2d_var', self.config.twod_ymax_percent),
-            ("X min:", 'xmin_2d_var',
-             getattr(self.config, 'twod_xmin_percent', DEFAULT_TWOD_XMIN_PERCENT)),
-            ("X max:", 'xmax_2d_var',
-             getattr(self.config, 'twod_xmax_percent', DEFAULT_TWOD_XMAX_PERCENT)),
+            ("X min:", 'xmin_2d_var', self.config.twod_xmin_percent),
+            ("X max:", 'xmax_2d_var', self.config.twod_xmax_percent),
         ]
         for row, (label, var_name, value) in enumerate(rows):
             var = tk.DoubleVar(value=value)
@@ -747,40 +743,37 @@ class PlotSettingsDialog(BaseDialog):
     def _apply_settings(self) -> None:
         """Validate every field into config and redraw; a d-spacing toggle clears the plot cache."""
         try:
-            old_dspacing = self.config.show_dspacing if hasattr(self, 'dspacing_var') else False
-            if hasattr(self, 'dspacing_var'):
-                self.config.show_dspacing = self.dspacing_var.get()
+            old_dspacing = self.config.show_dspacing
+            self.config.show_dspacing = self.dspacing_var.get()
 
             # Validate all 1D fields
             for key in ['xmin', 'xmax', 'ymin', 'ymax']:
-                var_name = f"{key}_var"
-                if hasattr(self, var_name):
-                    self._validate_entry(key, getattr(self, var_name))
+                self._validate_entry(key, getattr(self, f"{key}_var"))
 
             # Update 2D settings
             for key, var_name in [('twod_ymin_percent', 'ymin_2d_var'),
                                   ('twod_ymax_percent', 'ymax_2d_var'),
                                   ('twod_xmin_percent', 'xmin_2d_var'),
                                   ('twod_xmax_percent', 'xmax_2d_var')]:
-                if hasattr(self, var_name):
-                    setattr(self.config, key, getattr(self, var_name).get())
+                setattr(self.config, key, getattr(self, var_name).get())
 
             if self.on_update:
                 self.on_update()
 
             # Clear cache if d-spacing changed
-            if old_dspacing != getattr(self.config, 'show_dspacing', False):
+            if old_dspacing != self.config.show_dspacing:
                 clear_plot_cache()
 
         except ValueError as e:
-            messagebox.showerror("Invalid Input", str(e), parent=self)
+            messagebox.showerror("Invalid input", str(e), parent=self)
 
 
 # ============================================================================
 # Scan Ranges
 # ============================================================================
 
-# Scan-range grammar shared by the Image and GIF pages (see parse_scan_range)
+# Scan-range grammar shared by the Image and GIF pages and the heatmap's Exclude entry
+# (see parse_scan_range)
 SCAN_RANGE_HINT = "e.g. 1-5, 1,3,5 or 1-5,10-15"
 
 
@@ -802,12 +795,14 @@ def _scan_range_row(dialog: BaseDialog, parent: tk.Widget, var: tk.StringVar,
 
 def parse_scan_range(text: str, max_scan: Optional[int] = None) -> List[int]:
     """Parse "1-5", "1,3,5" or "1-5,10-15" into sorted unique scan numbers from 1
-    (up to max_scan when given); malformed input yields []."""
+    (up to max_scan when given); malformed input, "1 3" included (never 13), yields []."""
     try:
         scans = set()
-        for part in text.replace(" ", "").split(","):
+        for part in text.split(","):  # int() strips the spaces around each number
             if part.count("-") == 1:
                 start, end = map(int, part.split("-"))
+                if max_scan is not None:
+                    end = min(end, max_scan)  # "1-100000000" must not build the whole range
                 scans.update(range(start, end + 1))
             else:
                 scans.add(int(part))
@@ -881,9 +876,10 @@ class ExportOptionsDialog(BaseDialog):
     def _do_export(self) -> None:
         """Validate the choices, then hand them to on_export (or store them and close)."""
         plot_types = {k: v.get() for k, v in self.plot_vars.items()}
-        if not any(plot_types.values()) and not self.is_neutron:
-            messagebox.showwarning("No Selection",
-                                   "Please select at least one plot type to export",
+        # "Echem values" only adds V and I to the title; X-ray needs a 1D or 2D panel
+        if not self.is_neutron and not (plot_types.get("oned") or plot_types.get("twod")):
+            messagebox.showwarning("No selection",
+                                   "Please select 1D or 2D XRD data to export",
                                    parent=self)
             return
 
@@ -891,7 +887,7 @@ class ExportOptionsDialog(BaseDialog):
         if self.export_var.get() == "multiple":
             scan_list = parse_scan_range(self.range_var.get(), self.num_scans)
             if not scan_list:
-                messagebox.showwarning("Invalid Range",
+                messagebox.showwarning("Invalid range",
                                        "Please enter a valid scan range",
                                        parent=self)
                 return
@@ -950,7 +946,7 @@ class GIFSettingsDialog(BaseDialog):
         """Validate the range, then hand the settings to on_create (or store them and close)."""
         scan_list = parse_scan_range(self.range_var.get(), self.num_scans)
         if not scan_list:
-            messagebox.showwarning("Invalid Range",
+            messagebox.showwarning("Invalid range",
                                    "Please enter a valid scan range",
                                    parent=self)
             return
@@ -973,7 +969,7 @@ class GIFSettingsDialog(BaseDialog):
 
 class UploadOptionsDialog(BaseDialog):
     """Single upload window for every load and generation option. A directly opened .nxs
-    locks the source to the one it records and greys out generation-only options."""
+    locks the source and time method it records and greys out generation-only options."""
 
     DISPLAY_OPTIONS = ["No downsampling", "4096", "2048", "1024", "512"]
 
@@ -989,10 +985,12 @@ class UploadOptionsDialog(BaseDialog):
         self._paths: List[str] = []
         self._std_echem: List[str] = []
         self._metadata_open = False
-        # (path, is canonical, recorded data source) for the last single .nxs checked
-        self._canonical_cache: Tuple[str, bool, Optional[str]] = ("", False, None)
-        # The user's source choice, held while a .nxs's recorded source overrides it
-        self._source_before_nxs: Optional[str] = None
+        # (path, is canonical, recorded data source, recorded correlation method)
+        # for the last single .nxs checked
+        self._canonical_cache: Tuple[str, bool, Optional[str], Optional[str]] = (
+            "", False, None, None)
+        # The user's source and time choices, held while a .nxs's records override them
+        self._before_nxs: Dict[str, str] = {}
         self._create_widgets()
         self._update_option_states()
         self._resize_to_content()
@@ -1017,10 +1015,19 @@ class UploadOptionsDialog(BaseDialog):
                                                        anchor="n")
         body.bind("<Configure>", lambda e: self._on_body_configure())
         self._canvas.bind("<Configure>", self._on_canvas_configure)
-        self._canvas.bind("<Enter>", lambda e: self.bind_all("<MouseWheel>",
-                                                             self._on_wheel))
-        self._canvas.bind("<Leave>", lambda e: self.unbind_all("<MouseWheel>"))
+        self._canvas.bind("<Enter>", lambda e: self._bind_wheel(True))
+        self._canvas.bind("<Leave>", lambda e: self._bind_wheel(False))
+        # Closing with the pointer inside (Escape, Alt+F4) sends no <Leave>
+        self._canvas.bind("<Destroy>", lambda e: self._bind_wheel(False))
         return body
+
+    def _bind_wheel(self, on: bool) -> None:
+        """Route the wheel (Windows/macOS <MouseWheel>, X11 buttons 4/5) to the content."""
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            if on:
+                self.bind_all(sequence, self._on_wheel)
+            else:
+                self.unbind_all(sequence)
 
     def _on_body_configure(self) -> None:
         """Keep the scroll region and scrollbar in step with the content."""
@@ -1041,7 +1048,13 @@ class UploadOptionsDialog(BaseDialog):
     def _on_wheel(self, event: tk.Event) -> None:
         """Scroll the content on the mouse wheel, only while it overflows."""
         if self._scrollbar.winfo_ismapped():
-            self._canvas.yview_scroll(int(-event.delta / 120), "units")
+            if event.num in (4, 5):  # X11 buttons
+                steps = -1 if event.num == 4 else 1
+            elif not event.delta:  # a zero touchpad delta is no step
+                return
+            else:  # Windows 120 per notch, macOS about 1
+                steps = int(-event.delta / 120) or (-1 if event.delta > 0 else 1)
+            self._canvas.yview_scroll(steps, "units")
 
     def _resize_to_content(self) -> None:
         """Resize to the content, clamped to the work area by shrink_to_fit."""
@@ -1097,12 +1110,14 @@ class UploadOptionsDialog(BaseDialog):
                                  font_type="heading", pady=(14, 4))
         time_frame = self._block()
         self.time_var = tk.StringVar(value=TimeMethod.ABSOLUTE.value)
+        self._time_radios: List[tk.Widget] = []
         for value, label in [
             (TimeMethod.ABSOLUTE.value, "Absolute time (use actual timestamps)"),
             (TimeMethod.RELATIVE.value, "Relative time (re-zero unsynchronised clocks)"),
         ]:
-            self.create_themed_radiobutton(
-                time_frame, label, self.time_var, value).pack(anchor="w", pady=1)
+            radio = self.create_themed_radiobutton(time_frame, label, self.time_var, value)
+            radio.pack(anchor="w", pady=1)
+            self._time_radios.append(radio)
 
         # Nearest-neighbour match bound, applied on both sides of the echem
         # record; generation-only and recorded in the file
@@ -1292,7 +1307,7 @@ class UploadOptionsDialog(BaseDialog):
             parent=self, title="Select Files",
             filetypes=[
                 ("All Supported",
-                 "*.zip;*.dat;*.edf;*.txt;*.xlsx;*.csv;*.hdf;*.nxs;*.xy"),
+                 "*.zip *.dat *.edf *.txt *.xlsx *.csv *.hdf *.nxs *.xy"),
                 ("NeXus files", "*.nxs"),
                 ("ZIP files", "*.zip"),
                 ("All files", "*.*"),
@@ -1321,7 +1336,7 @@ class UploadOptionsDialog(BaseDialog):
                        ("All files", "*.*")])
         if files:
             self._std_echem = list(files)
-            self.std_echem_var.set(f"{len(files)} file(s)")
+            self.std_echem_var.set(f"{len(files)} file{'s' if len(files) != 1 else ''}")
 
     def _clear_std_echem(self) -> None:
         """Drop the selected standard echem files."""
@@ -1339,30 +1354,36 @@ class UploadOptionsDialog(BaseDialog):
         path = self._paths[0]
         if self._canonical_cache[0] != path:
             canonical = is_canonical_nxs(path)
-            self._canonical_cache = (path, canonical,
-                                     read_data_source(path) if canonical else None)
+            self._canonical_cache = (
+                path, canonical,
+                read_data_source(path) if canonical else None,
+                read_correlation_method(path) if canonical else None)
         return self._canonical_cache[1]
 
-    def _sync_source_with_file(self, direct_nxs: bool) -> bool:
-        """Show and lock a directly opened .nxs's recorded source, restoring the user's choice
-        after. True while the file sets it; an unrecorded or unknown source stays selectable."""
-        recorded = self._canonical_cache[2] if direct_nxs else None
-        from_file = recorded in {value for value, _ in self.SOURCES}
+    def _lock_to_file(self, var: tk.StringVar, radios: List[tk.Widget],
+                      recorded: Optional[str], valid: Set[str]) -> bool:
+        """Show and lock a .nxs's recorded value (True), else give back the user's own choice."""
+        from_file = recorded in valid
+        key = str(var)
         if from_file:
-            if self._source_before_nxs is None:
-                self._source_before_nxs = self.source_var.get()
-            self.source_var.set(recorded)
-        elif self._source_before_nxs is not None:
-            self.source_var.set(self._source_before_nxs)
-            self._source_before_nxs = None
-        for radio in self._source_radios:
+            self._before_nxs.setdefault(key, var.get())
+            var.set(recorded)
+        elif key in self._before_nxs:
+            var.set(self._before_nxs.pop(key))
+        for radio in radios:
             radio.config(state="disabled" if from_file else "normal")
         return from_file
 
     def _update_option_states(self) -> None:
-        """Enable/disable generation-only options and lock the source to match the selection."""
+        """Enable/disable generation-only options; a chosen .nxs locks its source and time method."""
         direct_nxs = self._is_direct_nxs()
-        source_from_file = self._sync_source_with_file(direct_nxs)
+        # An unrecorded or unknown source or time method stays selectable
+        _, _, recorded_source, recorded_method = (self._canonical_cache if direct_nxs
+                                                  else (None,) * 4)
+        source_from_file = self._lock_to_file(self.source_var, self._source_radios,
+                                              recorded_source, {v for v, _ in self.SOURCES})
+        self._lock_to_file(self.time_var, self._time_radios, recorded_method,
+                           {m.value for m in TimeMethod})
         source = self.source_var.get()
 
         # Size applies to synchrotron HDF data (display, and storage if included)
@@ -1507,56 +1528,23 @@ class UploadOptionsDialog(BaseDialog):
                            ("voltage_window_upper", "upper")):
             if key in values:
                 try:
-                    values[key] = float(values[key])
+                    number = float(values[key])
                 except ValueError:
+                    number = None
+                if number is None or not np.isfinite(number):
                     messagebox.showerror(
                         "Cycling protocol",
                         f"Voltage window {label} bound '{values[key]}' "
-                        "is not a number",
+                        "is not a finite number",
                         parent=self)
                     return False
-        return values
-
-
-# ============================================================================
-# Progress Dialog
-# ============================================================================
-
-class ProgressDialog(BaseDialog):
-    """Progress bar dialog for long-running operations."""
-
-    def __init__(self, master: tk.Misc, title: str, maximum: int) -> None:
-        super().__init__(master, title, WINDOW_SIZES['progress'])
-        self.maximum = maximum
-        self._create_widgets()
-        self.shrink_to_fit()
-
-    def _create_widgets(self) -> None:
-        """Build the determinate bar and status label, forcing a paint."""
-        self.label = self.create_themed_label(
-            text="Processing...",
-            font_type="body",
-            pady=10
-        )
-
-        _style_progressbar()
-
-        self.bar = ttk.Progressbar(
-            self,
-            length=250,
-            mode='determinate',
-            maximum=self.maximum,
-            style="TProgressbar"
-        )
-        self.bar.pack(pady=10)
-        self.update()
-
-    def update_progress(self, value: int, text: str) -> bool:
-        """Set the bar value and label text and repaint; return False once the dialog is closed."""
-        if not self.winfo_exists():
+                values[key] = number
+        lower = values.get("voltage_window_lower")
+        upper = values.get("voltage_window_upper")
+        if lower is not None and upper is not None and not lower < upper:
+            messagebox.showerror(
+                "Cycling protocol",
+                "The voltage window lower bound must be below the upper bound",
+                parent=self)
             return False
-
-        self.label.config(text=text)
-        self.bar['value'] = value
-        self.update()
-        return True
+        return values

@@ -39,7 +39,7 @@ def make_laboratory(dirpath):
 
 
 def make_neutron(dirpath):
-    """Write logbook scan 123456 (10:00-10:30), 2 banks x (TOF, d) and the echem log."""
+    """Write logbook run 123456 (10:00-10:30), 2 banks x (TOF, d) and the echem log."""
     os.makedirs(dirpath, exist_ok=True)
     logbook = ("123456\tuser\tsample title\tMon Feb 05 10:00:00 2024\t"
                "Mon Feb 05 10:30:00 2024\t1800\tok\textra")
@@ -68,7 +68,7 @@ def main():
     print(f"Example data written to {OUT}")
     print("  laboratory/  3 XRD scans (10:05, 10:10, 10:15) + echem")
     print("               expected correlation: scan 1 -> 3.76 V")
-    print("  neutron/     scan 123456 (10:00-10:30), banks 1-2, TOF + d + echem")
+    print("  neutron/     run 123456 (10:00-10:30), banks 1-2, TOF + d + echem")
     print("               expected correlation: midpoint 10:15 -> 3.85 V")
     print("Launch `operaxn` and load either folder from the upload dialog.")
 

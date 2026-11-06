@@ -26,6 +26,8 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: pip install .[test]
+      # Smoke-test the installed console script: entry point and package import
+      - run: operaxn --version
       # OPERAXN_REQUIRE_VALIDATION turns "pynxtools validation unavailable"
       # from a silent skip into a failure, so the NeXus schema checks can
       # never quietly drop out of a run.
@@ -50,4 +52,3 @@ jobs:
       - run: xvfb-run -a bash -c 'python -c "import tkinter; tkinter.Tk().destroy()" && pytest -m "not realdata"'
         env:
           OPERAXN_REQUIRE_VALIDATION: "1"
-

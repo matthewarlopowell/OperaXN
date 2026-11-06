@@ -87,7 +87,10 @@
             </field>
             <field name="date" type="NX_DATE_TIME" optional="true"/>
             <field name="data_source" optional="true">
-                <doc>Origin of the diffraction data.</doc>
+                <doc>
+                    Origin of the diffraction data: inhouse (a laboratory
+                    X-ray diffractometer), synchrotron or neutron.
+                </doc>
                 <enumeration>
                     <item value="inhouse"/>
                     <item value="synchrotron"/>
@@ -100,11 +103,11 @@
                     synchronised and matched on absolute timestamps.
                     relative: streams are aligned on elapsed time
                     (unsynchronised clocks): the first electrochemistry point
-                    is taken as simultaneous with the first scan's correlation
+                    is taken as simultaneous with the earliest scan correlation
                     timestamp (midpoint_adjusted_timestamp, the exposure
-                    midpoint) and every scan is matched at its elapsed time
-                    from that origin; voltage_timestamp then stays in the
-                    electrochemistry clock.
+                    midpoint; normally the first scan's) and every scan is
+                    matched at its elapsed time from that origin;
+                    voltage_timestamp then stays in the electrochemistry clock.
                 </doc>
                 <enumeration>
                     <item value="absolute"/>
@@ -209,13 +212,13 @@
                 Beam monitor record of the experiment, as in NXmonopd, held
                 once at entry level because it is invariant over the
                 experiment. Required in NXmonopd and Figure 4; optional here
-                because only in-house acquisitions record one: they count to
-                a time preset, so mode is timer and preset is the exposure
-                every acquisition shares (absent when acquisitions differ;
-                each acquisition's exposure is SCAN/environment/exposure_time).
-                integral is per acquisition, in SCAN/monitor, and only on
-                instruments with a beam monitor. Synchrotron sources record
-                none.
+                because only inhouse (a laboratory X-ray diffractometer)
+                acquisitions record one: they count to a time preset, so mode
+                is timer and preset is the exposure every acquisition shares
+                (absent when acquisitions differ; each acquisition's exposure
+                is SCAN/environment/exposure_time). integral is per
+                acquisition, in SCAN/monitor, and only on instruments with a
+                beam monitor. Synchrotron sources record none.
             </doc>
             <field name="mode">
                 <doc>
@@ -258,6 +261,19 @@
             </attribute>
             <attribute name="auxiliary_signals" optional="true"/>
             <field name="time" type="NX_FLOAT" units="NX_TIME">
+                <doc>
+                    Elapsed time of each point in seconds from start.
+                    OperaXN keeps electrochemistry times as the local
+                    wall-clock times the potentiostat logged, so these are
+                    wall-clock differences. start is the first point's time,
+                    with the UTC offset of the generating computer's time
+                    zone at that moment. Across a daylight-saving change,
+                    start plus time taken in UTC is therefore one clock shift
+                    (normally one hour) off for the points after the change.
+                    To recover the logged times, drop the offset from start
+                    and add time; these match the local times of the scan
+                    timestamps, and OperaXN reads the record this way.
+                </doc>
                 <dimensions rank="1">
                     <dim index="1" value="nE"/>
                 </dimensions>
@@ -284,7 +300,7 @@
                     than the tolerance before the first point or after the last point
                     of the record is matched to that end point, and a scan
                     at least the tolerance from every point stays
-                    uncorrelated. Set per run at generation (OperaXN default
+                    uncorrelated. Set at generation (OperaXN default
                     300 s; a file without this field was matched with 300 s);
                     recommended because an OperaXN file always carries
                     it and a file holding only the Figure 4 content does not.
@@ -304,6 +320,7 @@
                 <doc>One source file, named file_NNN (file_001, file_002, ...).</doc>
                 <attribute name="source_file" optional="true"/>
                 <field name="time" type="NX_FLOAT" units="NX_TIME">
+                    <doc>Elapsed seconds from start, on the same local wall-clock convention as operando_electrochemistry/time.</doc>
                     <attribute name="start" type="NX_DATE_TIME"/>
                 </field>
                 <field name="voltage" type="NX_FLOAT" units="NX_VOLTAGE"/>
@@ -317,9 +334,9 @@
                 zero-padded sequence number (scan_000001, scan_000002, ...).
                 It holds what varies per acquisition: the environment group
                 (acquisition window and electrochemical state of the cell),
-                the diffraction data and, for in-house acquisitions, the
-                beam-monitor record from the EDF header. The measurement
-                setup is invariant
+                the diffraction data and, for inhouse (a laboratory X-ray
+                diffractometer) acquisitions, the beam-monitor record from the
+                EDF header. The measurement setup is invariant
                 during the experiment and is described once at entry level;
                 by convention each subentry carries an HDF5 soft link named
                 "instrument" (with a target attribute) to /entry/instrument
@@ -398,11 +415,12 @@
                     <doc>
                         Length of the acquisition in seconds: the exposure the
                         source records for the scan (an EDF ExposureTime
-                        header, a .dat ExposureTime line), else the scan
-                        window the instrument recorded, end minus start (for
-                        Diamond i11-1 the GDA scan window, readout and
-                        processing included). end_time is start_time plus
-                        this value.
+                        header, a .dat ExposureTime line, or a scan .nxs
+                        instrument/detector exposure_time, count_time or
+                        preset), else the scan window the instrument recorded,
+                        end minus start (for Diamond i11-1 the GDA scan
+                        window, readout and processing included). end_time is
+                        start_time plus this value.
                     </doc>
                 </field>
                 <field name="logbook_entry" optional="true"/>
@@ -423,12 +441,15 @@
 
             <group name="data" type="NXdata" optional="true">
                 <doc>
-                    The azimuthally averaged 1D pattern. Required whenever a
-                    1D pattern exists for the acquisition; scans recorded as
-                    2D images only carry an image_source reference (and
-                    optionally image_data) instead. Each subentry must hold
-                    at least one of data / image_source (not expressible in
-                    NXDL; enforced by the writer).
+                    The azimuthally averaged 1D pattern, written whenever
+                    the acquisition's 1D pattern could be read. Scans
+                    recorded as 2D images only carry an image_source
+                    reference (and optionally image_data) instead, and a scan
+                    with both carries both. When a 1D pattern cannot be read
+                    the writer leaves this group out and logs an error
+                    rather than writing an empty group, so the subentry of an
+                    acquisition without a 2D image then holds only instrument
+                    and environment.
                 </doc>
                 <attribute name="signal">
                     <enumeration>
@@ -489,7 +510,12 @@
                 </field>
             </group>
             <group name="image_data" type="NXdata" optional="true">
-                <doc>Embedded (possibly downsampled) copy of the 2D detector image.</doc>
+                <doc>
+                    Embedded (possibly downsampled) copy of the 2D detector
+                    image in the source's data type; non-positive pixels
+                    (detector gaps and masks) are raised to the image's
+                    smallest positive value.
+                </doc>
                 <attribute name="signal">
                     <enumeration>
                         <item value="data"/>

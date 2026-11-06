@@ -1,8 +1,8 @@
 """
 GUI-side configuration: theme, fonts, plot appearance, and window defaults.
 
-Pipeline constants (correlation tolerance, definition version, performance
-limits) live in core.config; the ones the GUI also uses are re-exported here.
+Pipeline constants live in core.config; a few the GUI shares (data source
+enum, cache, worker and 2D display limits, version) are re-exported here.
 """
 
 import logging
@@ -44,7 +44,6 @@ class OPERAXNTheme:
         'accent_hover': '#00a8cc',
         'danger': '#ff6b6b',
         'success': '#51cf66',
-        'warning': '#ffd43b',
         'text_primary': '#ffffff',
         'text_secondary': '#a0a8b8',
         'text_dim': '#6c7583',
@@ -54,7 +53,6 @@ class OPERAXNTheme:
         'button_bg': '#00d4ff',
         'button_text': '#1a1f2e',
         'button_hover': '#00a8cc',
-        'disabled_bg': '#3a4556',
         'disabled_text': '#6c7583'
     }
 
@@ -64,25 +62,17 @@ class OPERAXNTheme:
         else 'Helvetica Neue' if _PLATFORM == 'Darwin'
         else 'DejaVu Sans'
     )
-    _MONO = (
-        'Consolas' if _PLATFORM == 'Windows'
-        else 'Menlo' if _PLATFORM == 'Darwin'
-        else 'DejaVu Sans Mono'
-    )
 
     FONTS = {
-        'title': (_SANS, 12, 'bold'),
         'heading': (_SANS, 11, 'bold'),
         'body': (_SANS, 10),
         'small': (_SANS, 9),
-        'button': (_SANS, 10, 'bold'),
-        'mono': (_MONO, 10)
+        'button': (_SANS, 10, 'bold')
     }
 
     PADDING = {
         'small': 5,
-        'medium': 10,
-        'large': 15
+        'medium': 10
     }
 
 
@@ -96,7 +86,6 @@ from core.config import (  # noqa: E402,F401
     CACHE_ENABLED,
     MAX_CACHE_SIZE_MB,
     MAX_WORKERS,
-    PARALLEL_PROCESSING,
     SYNCHROTRON_MAX_DISPLAY_SIZE,
 )
 
@@ -109,24 +98,29 @@ INTERPOLATION_METHOD = "bilinear"
 LARGE_IMAGE_THRESHOLD = 2_000_000
 INTENSITY_SAMPLE_SIZE = 1_000_000  # pixels sampled for a large image's auto range
 INTENSITY_LOG_STEP = 0.01  # 2D intensity slider step, in decades (images are log-scaled)
-LRU_CACHE_MAXSIZE = 128
 SECONDS_PER_HOUR = 3600.0
+QUIT_WAIT_S = 60  # longest a confirmed quit waits for running work to stop and clean up
 
 # Plot Layout
 VMIN_FLOOR = 1e-10  # floor value to avoid log(0) in logarithmic plots
 DEFAULT_AXIS_PADDING_PERCENT = 5.0
 
-# Axis labels shared by every window and export
-TOF_LABEL = "Time of flight (μs)"
-DSPACING_LABEL = "d-spacing (Å)"
-TWOTHETA_LABEL = "2θ (°)"
-TIME_HOURS_LABEL = "Time (h)"
+# Axis labels shared by every figure and export: units in square brackets, the d of
+# d-spacing and the θ of 2θ italic (mathtext)
+TOF_LABEL = "Time of flight [μs]"
+DSPACING_LABEL = "$d$-spacing [Å]"
+TWOTHETA_LABEL = r"2$\theta$ [°]"
+TIME_HOURS_LABEL = "Time [h]"
+# The same choices as Tk widget text (plain text, units in parentheses)
+TOF_TEXT = "Time of flight (μs)"
+DSPACING_TEXT = "d-spacing (Å)"
 
 # Plot Appearance
 COLORMAP = "YlGnBu_r"
 LINE_WIDTH = 1.5
 GRID_ALPHA = 0.3
 PLOT_UPDATE_DELAY_MS = 50
+MAX_LEGEND_CYCLES = 10  # analysis legends name every cycle up to this many (tab10's size)
 
 # Plot Font Sizes (points)
 TITLE_FONT_SIZE = 12
@@ -148,10 +142,6 @@ DEFAULT_GIF_LOOP = 0
 # Window Sizes
 # ============================================================================
 
-# Initial dialog sizes only; BaseDialog.shrink_to_fit resizes to content
-WINDOW_SIZES = {
-    'progress': "300x100"
-}
 # Width (inches, so it holds at any display scaling) shared by the Image, GIF and
 # Plot Settings dialogs; each height fits its content
 SETTINGS_DIALOG_WIDTH_IN = 5.1
@@ -182,7 +172,6 @@ from core import GENERATOR_VERSION as APP_VERSION  # noqa: E402,F401
 
 APP_AUTHOR = "Matthew Powell"
 APP_COPYRIGHT = "2025-2026"
-DOCUMENTATION_URL = "https://github.com/matthewarlopowell/OperaXN"
 SUPPORT_EMAIL = "Matt.Powell@warwick.ac.uk"
 
 # ============================================================================
