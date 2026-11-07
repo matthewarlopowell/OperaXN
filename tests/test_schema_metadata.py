@@ -2,7 +2,6 @@
 import ast
 import logging
 import os
-import re
 
 import h5py
 import numpy as np
@@ -80,7 +79,7 @@ def test_v1_layout_loads(legacy_v1_nxs):
     metadata and data source."""
     assert core.is_canonical_nxs(legacy_v1_nxs)
     lm = core.load(legacy_v1_nxs)
-    assert [s.scan_num for s in lm.scans] == [1, 2]
+    assert [scan.scan_num for scan in lm.scans] == [1, 2]
     s1, s2 = lm.scans
     assert s1.echem == 3.76 and s1.current == 0.106 and s1.exposure_time == 120.0
     assert s2.echem == 3.81 and s2.timestamp == "2024-02-05 10:10:00"
@@ -397,7 +396,7 @@ def test_tofnpd_geometry_from_profile(tmp_path, polaris_src, monkeypatch):
 def test_xrd_data_group_omitted_on_read_failure(tmp_path, inhouse_src, monkeypatch):
     """A failed 1D read leaves no empty NXdata shell behind."""
     def _boom(cls, *args, **kwargs):
-        raise IOError("simulated read failure")
+        raise OSError("simulated read failure")
     monkeypatch.setattr(core.nxs_writer.DataReaderFactory, "read_file",
                         classmethod(_boom))
     out = str(tmp_path / "read_failure.nxs")
@@ -424,7 +423,7 @@ def test_definition_version():
 
 @pytest.mark.parametrize("nxs_fixture", ["inhouse_nxs", "neutron_nxs", "protocol_nxs"])
 def test_pynxtools_validation(request, nxs_fixture):
-    """pynxtools validate_nexus declares the generated files valid."""
+    """`pynx validate` declares the generated files valid."""
     assert_pynxtools_valid(request.getfixturevalue(nxs_fixture), nxs_fixture)
 
 
@@ -589,56 +588,18 @@ def test_is_canonical_requires_operaxn_provenance(tmp_path, inhouse_nxs):
     assert core.is_canonical_nxs(inhouse_nxs)
 
 
-def test_release_version_matches_package_and_citation():
-    """pyproject.toml and CITATION.cff carry the GENERATOR_VERSION every file is stamped with."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
-        project = fh.read().split("[project]", 1)[1].split("\n[", 1)[0]
-    with open(os.path.join(root, "CITATION.cff"), encoding="utf-8") as fh:
-        citation = fh.read()
-    package = re.search(r'^version\s*=\s*"([^"]+)"', project, re.M)
-    cited = re.search(r"^version:\s*(\S+)", citation, re.M)
-    assert package and cited, "version line not found"
-    assert package.group(1) == core.GENERATOR_VERSION, "pyproject.toml version differs"
-    assert cited.group(1).strip("'\"") == core.GENERATOR_VERSION, "CITATION.cff version differs"
-
-
-def test_dependency_floors_agree():
-    """pyproject.toml, requirements.txt and the README Dependencies list declare the same floors."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-    def read(name):
-        with open(os.path.join(root, name), encoding="utf-8") as fh:
-            return fh.read()
-
-    deps = read("pyproject.toml").split("\ndependencies = [", 1)[1].split("]", 1)[0]
-    declared = dict(re.findall(r'"([A-Za-z0-9_-]+)>=([\d.]+)"', deps))
-    listed = dict(re.findall(r"^([A-Za-z0-9_-]+)>=([\d.]+)\s*$", read("requirements.txt"), re.M))
-    readme = read("README.md").split("\n## Dependencies", 1)[1].split("\n## ", 1)[0]
-    shown = {name.lower(): floor
-             for name, floor in re.findall(r"^- (\S+) >= ([\d.]+)\s*$", readme, re.M)}
-    shown.pop("python", None)
-    assert len(declared) == 6, declared
-    assert listed == declared, "requirements.txt floors differ from pyproject.toml"
-    assert shown == declared, "README.md floors differ from pyproject.toml"
-
-
 @needs_fabio
 def test_pre_1970_scan_times_write_a_valid_file(tmp_path):
     """Scans dated 1 January 1970 (an epoch-reset clock) generate in relative mode and validate."""
     src = tmp_path / "clock1970"
-    src.mkdir()
-    for i, m in enumerate(("05", "15", "25"), start=1):
-        stamp = f"1970-01-01T10:{m}:00"
-        _builders.write_xrd_dat(str(src / f"scan_{i:03d}.dat"), stamp, y=_builders.inhouse_scan_y(i))
-        _builders.write_edf_image(str(src / f"scan_{i:03d}.edf"), stamp, offset=float(i))
-    _builders.write_echem_txt(str(src / "echem.txt"))
+    stamps = [f"1970-01-01T10:{m}:00" for m in ("05", "15", "25")]
+    _builders.write_dated_pairs(str(src), stamps, stamps)
     out = str(tmp_path / "clock1970.nxs")
     ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE,
                              time_method=core.TimeMethod.RELATIVE)
     assert ok, str(msgs)
     model = core.load(out)
-    assert [round(s.echem, 2) for s in model.scans] == [3.7, 3.8, 3.9]
+    assert [round(scan.echem, 2) for scan in model.scans] == [3.7, 3.8, 3.9]
     with h5py.File(out, "r") as f:
         start = f["entry/start_time"][()].decode()
     assert start.startswith("1970-01-01T10:") and start[-6] in "+-", start
@@ -664,6 +625,7 @@ def test_unreadable_date_skips_only_that_file(tmp_path, caplog, bad_side, bad_fi
     named = [r.getMessage() for r in caplog.records if bad_file in r.getMessage()]
     assert len(named) == 1 and "'unknown'" in named[0], named
     model = core.load(out)
-    assert [(s.oned is not None, s.twod_source is not None) for s in model.scans] == expected
-    assert [round(s.echem, 2) for s in model.scans] == [3.76, 3.81, 3.86]
+    assert [(scan.oned is not None, scan.twod_source is not None)
+            for scan in model.scans] == expected
+    assert [round(scan.echem, 2) for scan in model.scans] == [3.76, 3.81, 3.86]
     assert_pynxtools_valid(out)

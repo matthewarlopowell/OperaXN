@@ -1,4 +1,6 @@
-"""End-to-end pipeline: ingest, timestamps, echem, correlation, readers, round-trip, examples."""
+"""End-to-end pipeline, by section: correlation, scan timestamps, echem parsing, input files,
+readers, round-trip, project files, real datasets."""
+import builtins
 import ctypes
 import filecmp
 import glob
@@ -7,6 +9,7 @@ import importlib.util
 import io
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -25,7 +28,12 @@ import core.readers as readers
 from core import nxs_writer
 
 import _builders
-from _helpers import assert_pynxtools_valid, need_dataset, needs_fabio
+from _helpers import assert_pynxtools_valid, need_dataset, needs_fabio, wall
+
+
+def _warning_messages(caplog):
+    """Return the WARNING and higher messages caplog holds."""
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 # ============================================================================
@@ -44,6 +52,45 @@ def test_process_raw_correlates_the_inhouse_dir(pipeline):
     assert len(scans) == 3, f"got {len(scans)}"
     assert len(echem) == 40, f"got {len(echem)}"
     assert abs(scans[0].echem - 3.76) < 1e-9, f"got {scans[0].echem}"
+
+
+def test_window_extrema_span_the_window(pipeline):
+    """Voltage/current extrema cover every echem point in the window, both bounds inclusive:
+    scan 1 (10:05, 120 s) sees 10:05 to 10:07 and its matched value lies within the range."""
+    scans, _ = pipeline
+    s1 = scans[0]
+    assert (s1.voltage_min, s1.voltage_max) == (3.75, 3.77)
+    assert (s1.current_min, s1.current_max) == (0.105, 0.107)
+    assert s1.voltage_min <= s1.echem <= s1.voltage_max
+
+
+def test_window_extrema_absent_without_exposure(tmp_path):
+    """A scan with no header exposure has no extrema but keeps its nearest-point voltage."""
+    src = str(tmp_path / "no_exposure")
+    os.makedirs(src)
+    lines = ["# Date 2024-02-05T10:05:00", "# tth Intensity"]
+    lines += [f"{x:.4f} {v:.4f}"
+              for x, v in zip(_builders.ONED_X, _builders.inhouse_scan_y(1))]
+    with open(os.path.join(src, "scan_001.dat"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
+    scans, _ = core.process_raw([src], core.DataSourceType.INHOUSE)
+    assert len(scans) == 1 and scans[0].exposure_time is None
+    assert scans[0].echem == 3.75
+    assert scans[0].voltage_min is None and scans[0].voltage_max is None
+
+
+def test_window_extrema_follow_relative_alignment(tmp_path, inhouse_dir):
+    """Relative-mode extrema use the correlation's clock shift: the earliest midpoint maps onto
+    the first echem point, so scan 1 matches 3.70 V inside a 3.70 to 3.71 V window."""
+    out = str(tmp_path / "relative.nxs")
+    ok, msgs = core.generate([inhouse_dir], out, core.DataSourceType.INHOUSE,
+                             time_method=core.TimeMethod.RELATIVE)
+    assert ok, str(msgs)
+    s1 = core.load(out).scans[0]
+    assert s1.echem == 3.70
+    assert (s1.voltage_min, s1.voltage_max) == (3.70, 3.71)
+    assert s1.voltage_min <= s1.echem <= s1.voltage_max
 
 
 def test_partial_echem_match_is_counted(tmp_path, caplog):
@@ -99,6 +146,28 @@ def test_tolerance_bounds_the_match_past_the_record_end(tmp_path):
         assert loaded.global_metadata.get("echem_time_tolerance") == float(tolerance)
         got = loaded.scans[0].echem
         assert got is None if expected is None else abs(got - expected) < 1e-9, got
+
+
+def test_generate_rejects_an_unusable_tolerance(tmp_path, caplog):
+    """Direct API callers get a clear error, not a logged traceback, for a tolerance the
+    correlator cannot use."""
+    src = str(tmp_path / "inhouse")
+    _builders.write_inhouse_dir(src)
+    for bad in (None, "300", 0, -5, float("nan"), float("inf"), True, 300j, 1e10, 10**400):
+        caplog.clear()
+        ok, msgs = core.generate([src], str(tmp_path / "bad.nxs"),
+                                 core.DataSourceType.INHOUSE, echem_time_tolerance=bad)
+        assert not ok and "echem_time_tolerance" in msgs[0], (bad, msgs)
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], bad
+        with pytest.raises(ValueError, match="echem_time_tolerance"):
+            core.process_raw([src], core.DataSourceType.INHOUSE, echem_time_tolerance=bad)
+    assert not os.path.exists(tmp_path / "bad.nxs")
+    ok, msgs = core.generate([src], str(tmp_path / "over.nxs"), core.DataSourceType.INHOUSE,
+                             echem_time_tolerance=1e10)
+    assert "up to 1,000,000,000" in msgs[0], "the message names the limit"
+    ok, msgs = core.generate([src], str(tmp_path / "limit.nxs"), core.DataSourceType.INHOUSE,
+                             echem_time_tolerance=1e9)
+    assert ok, "the limit itself is usable"
 
 
 def test_echem_that_matches_no_scan_is_reported_once(tmp_path, caplog):
@@ -184,96 +253,36 @@ def test_negative_offset_synchrotron_times_correlate(tmp_path):
     assert core.load(out).scans[0].echem is not None
 
 
-def _warning_messages(caplog):
-    """Return the WARNING and higher messages caplog holds."""
-    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-
-
-def test_synchrotron_scan_without_start_time_is_dropped(tmp_path, caplog):
-    """A scan .nxs with no start_time is left out with a warning naming it, and the file validates."""
-    src = tmp_path / "syn"
+def test_neutron_midpoint_not_floored(tmp_path):
+    """An odd-length run correlates at its exact half-second midpoint, not the floored one."""
+    src = str(tmp_path / "odd_run")
     os.makedirs(src)
-    _builders.write_synchrotron_scan(str(src), "000001", "2024-02-05T10:05:00",
-                                     "2024-02-05T10:05:39")
-    _builders.write_synchrotron_scan(str(src), "000002", "2024-02-05T10:10:00",
-                                     "2024-02-05T10:10:39")
-    with h5py.File(src / "i11-1-000002.nxs", "a") as f:
-        # end_time alone would still time the scan (it is a timestamp fallback), so both go
-        del f["entry1/start_time"]
-        del f["entry1/end_time"]
-    _builders.write_eclab_echem(str(src / "echem.txt"))
-    out = str(tmp_path / "syn.nxs")
-    with caplog.at_level(logging.WARNING, logger="core"):
-        ok, msgs = core.generate([str(src)], out, core.DataSourceType.SYNCHROTRON)
-    assert ok, msgs
-    assert len(core.load(out).scans) == 1
-    messages = _warning_messages(caplog)
-    assert "1 scan has no start time and was skipped: i11-1-000002.nxs" in messages, messages
-    assert_pynxtools_valid(out, "synchrotron without start_time")
-
-
-@pytest.mark.parametrize("change", ["unreadable-end-time", "start-time-as-array"])
-def test_synchrotron_scan_with_a_readable_start_time_is_kept(tmp_path, change):
-    """An unreadable end_time costs only the exposure; a 1-element start_time array is decoded."""
-    src = str(tmp_path / "syn")
-    os.makedirs(src)
-    _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00", "2024-02-05T10:05:39")
-    _builders.write_synchrotron_scan(src, "000002", "2024-02-05T10:10:00", "2024-02-05T10:10:39")
-    with h5py.File(os.path.join(src, "i11-1-000002.nxs"), "a") as f:
-        if change == "unreadable-end-time":
-            del f["entry1/end_time"]
-            f["entry1/end_time"] = b"not recorded"
-        else:
-            del f["entry1/start_time"]
-            f["entry1/start_time"] = np.array([b"2024-02-05T10:10:00"])
-    scans, _ = core.process_raw([src], core.DataSourceType.SYNCHROTRON)
-    assert [pd.Timestamp(s.timestamp) for s in scans] == [
-        pd.Timestamp("2024-02-05 10:05:00"), pd.Timestamp("2024-02-05 10:10:00")]
-    assert scans[1].exposure_time == (None if change == "unreadable-end-time" else 39.0)
-
-
-def test_synchrotron_inf_exposure_dataset_counts_as_none(tmp_path):
-    """An exposure_time dataset of inf is no exposure: end_time minus start_time gives it."""
-    src = str(tmp_path / "syn")
-    os.makedirs(src)
-    _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00", "2024-02-05T10:05:39")
-    with h5py.File(os.path.join(src, "i11-1-000001.nxs"), "a") as f:
-        f["entry1/instrument/detector/exposure_time"] = np.inf
-    scans, _ = core.process_raw([src], core.DataSourceType.SYNCHROTRON)
-    assert [s.exposure_time for s in scans] == [39.0]
-
-
-def test_synchrotron_scan_with_an_unreadable_start_time_is_timed_from_its_end_time(tmp_path):
-    """A start_time that does not read as a date falls back to end_time; the load goes on."""
-    src = str(tmp_path / "syn")
-    os.makedirs(src)
-    _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00", "2024-02-05T10:05:39")
-    _builders.write_synchrotron_scan(src, "000002", "2024-02-05T10:10:00", "2024-02-05T10:10:39")
-    with h5py.File(os.path.join(src, "i11-1-000002.nxs"), "a") as f:
-        del f["entry1/start_time"]
-        f["entry1/start_time"] = b"not recorded"
-    scans, _ = core.process_raw([src], core.DataSourceType.SYNCHROTRON)
-    assert [pd.Timestamp(s.timestamp) for s in scans] == [
-        pd.Timestamp("2024-02-05 10:05:00"), pd.Timestamp("2024-02-05 10:10:39")]
-    assert scans[1].exposure_time is None
-
-
-@pytest.mark.parametrize("dat_exposure, edf_exposure", [
-    pytest.param("inf", None, id="dat-inf"), pytest.param("-120", None, id="dat-negative"),
-    pytest.param("120.0", "inf", id="edf-inf", marks=needs_fabio)])
-def test_unusable_header_exposure_counts_as_none(tmp_path, dat_exposure, edf_exposure):
-    """A non-finite or non-positive header exposure is no exposure: the scan correlates at its start."""
-    src = tmp_path / "lab"
-    src.mkdir()
-    _builders.write_xrd_dat(str(src / "scan_001.dat"), _builders.SCAN_TIMES[0], exposure=dat_exposure)
-    if edf_exposure is not None:
-        _builders.write_edf_image(str(src / "image_001.edf"), _builders.SCAN_TIMES[0],
-                                  ExposureTime=edf_exposure)
-    _builders.write_echem_txt(str(src / "echem.txt"))
-    out = str(tmp_path / "lab.nxs")
-    ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE)
-    assert ok, msgs
-    assert abs(core.load(out).scans[0].echem - 3.75) < 1e-9, core.load(out).scans[0].echem
+    # 7 s run: exact midpoint 10:00:03.5, floored 10:00:03
+    with open(os.path.join(src, "logbook.txt"), "w") as f:
+        f.write("123456\tuser\tsample title\tMon Feb 05 10:00:00 2024\t"
+                "Mon Feb 05 10:00:07 2024\t7\tok\textra\n")
+    _builders.write_neutron_banks(src)
+    # Points at 03.0 s and 03.9 s: the exact midpoint is nearer 03.9
+    with open(os.path.join(src, "echem.txt"), "w") as f:
+        f.write("Time\tEwe/V\tI/mA\n"
+                "05/02/2024 09:59:00.0\t3.0000\t0.1000\n"
+                "05/02/2024 10:00:03.0\t3.0000\t0.1000\n"
+                "05/02/2024 10:00:03.9\t3.9000\t0.1000\n"
+                "05/02/2024 10:01:00.0\t3.0000\t0.1000\n")
+    scans, _ = core.process_raw([src], core.DataSourceType.NEUTRON)
+    assert len(scans) == 1
+    assert scans[0].timestamp_for_correlation == pd.Timestamp("2024-02-05 10:00:03.5")
+    assert scans[0].echem == 3.9, f"correlated at the floored midpoint: {scans[0].echem}"
+    out = str(tmp_path / "odd_run.nxs")
+    ok, msgs = core.generate([src], out, core.DataSourceType.NEUTRON)
+    assert ok, str(msgs)
+    with h5py.File(out) as f:
+        env = f["entry/scan_000001/environment"]
+        stored = {k: pd.to_datetime(env[k][()].decode()).tz_localize(None)
+                  for k in ("scan_timestamp", "midpoint_adjusted_timestamp")}
+        assert stored["scan_timestamp"] == stored["midpoint_adjusted_timestamp"]
+        assert stored["scan_timestamp"] == pd.Timestamp("2024-02-05 10:00:03.5")
+        assert abs(env["voltage"][()] - 3.9) < 1e-9
 
 
 # ============================================================================
@@ -368,6 +377,111 @@ def test_single_timestamps_skip_format_guessing(monkeypatch):
     assert core.nxs_writer._ts_sort_key("Date") == (1, pd.Timestamp.max)
     scan = core.Scan(scan_num=1, timestamp="2024-02-05 10:05:00", exposure_time=120.0)
     assert core.nxs_writer._scan_window(scan)[1] == pd.Timestamp("2024-02-05 10:07:00")
+
+
+def test_synchrotron_scan_without_start_time_is_dropped(tmp_path, caplog):
+    """A scan .nxs with no start_time is left out with a warning naming it, and the file validates."""
+    src = tmp_path / "syn"
+    os.makedirs(src)
+    _builders.write_synchrotron_scan(str(src), "000001", "2024-02-05T10:05:00",
+                                     "2024-02-05T10:05:39")
+    _builders.write_synchrotron_scan(str(src), "000002", "2024-02-05T10:10:00",
+                                     "2024-02-05T10:10:39")
+    with h5py.File(src / "i11-1-000002.nxs", "a") as f:
+        # end_time alone would still time the scan (it is a timestamp fallback), so both go
+        del f["entry1/start_time"]
+        del f["entry1/end_time"]
+    _builders.write_eclab_echem(str(src / "echem.txt"))
+    out = str(tmp_path / "syn.nxs")
+    with caplog.at_level(logging.WARNING, logger="core"):
+        ok, msgs = core.generate([str(src)], out, core.DataSourceType.SYNCHROTRON)
+    assert ok, msgs
+    assert len(core.load(out).scans) == 1
+    messages = _warning_messages(caplog)
+    assert "1 scan has no start time and was skipped: i11-1-000002.nxs" in messages, messages
+    assert_pynxtools_valid(out, "synchrotron without start_time")
+
+
+@pytest.mark.parametrize("change", ["unreadable-end-time", "start-time-as-array"])
+def test_synchrotron_scan_with_a_readable_start_time_is_kept(tmp_path, change):
+    """An unreadable end_time costs only the exposure; a 1-element start_time array is decoded."""
+    src = str(tmp_path / "syn")
+    os.makedirs(src)
+    _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00", "2024-02-05T10:05:39")
+    _builders.write_synchrotron_scan(src, "000002", "2024-02-05T10:10:00", "2024-02-05T10:10:39")
+    with h5py.File(os.path.join(src, "i11-1-000002.nxs"), "a") as f:
+        if change == "unreadable-end-time":
+            del f["entry1/end_time"]
+            f["entry1/end_time"] = b"not recorded"
+        else:
+            del f["entry1/start_time"]
+            f["entry1/start_time"] = np.array([b"2024-02-05T10:10:00"])
+    scans, _ = core.process_raw([src], core.DataSourceType.SYNCHROTRON)
+    assert [pd.Timestamp(s.timestamp) for s in scans] == [
+        pd.Timestamp("2024-02-05 10:05:00"), pd.Timestamp("2024-02-05 10:10:00")]
+    assert scans[1].exposure_time == (None if change == "unreadable-end-time" else 39.0)
+
+
+@pytest.mark.parametrize("start_time", [b"not recorded", b"", b"nan"],
+                         ids=["unreadable", "empty", "nan"])
+def test_synchrotron_scan_with_an_unreadable_start_time_is_timed_from_its_end_time(
+        tmp_path, start_time):
+    """A start_time that does not read as a date, NaT included, falls back to end_time."""
+    src = str(tmp_path / "syn")
+    os.makedirs(src)
+    _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00", "2024-02-05T10:05:39")
+    _builders.write_synchrotron_scan(src, "000002", "2024-02-05T10:10:00", "2024-02-05T10:10:39")
+    with h5py.File(os.path.join(src, "i11-1-000002.nxs"), "a") as f:
+        del f["entry1/start_time"]
+        f["entry1/start_time"] = start_time
+    scans, _ = core.process_raw([src], core.DataSourceType.SYNCHROTRON)
+    assert [pd.Timestamp(s.timestamp) for s in scans] == [
+        pd.Timestamp("2024-02-05 10:05:00"), pd.Timestamp("2024-02-05 10:10:39")]
+    assert scans[1].exposure_time is None
+
+
+def test_synchrotron_inf_exposure_dataset_counts_as_none(tmp_path):
+    """An exposure_time dataset of inf is no exposure: end_time minus start_time gives it."""
+    src = str(tmp_path / "syn")
+    os.makedirs(src)
+    _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00", "2024-02-05T10:05:39")
+    with h5py.File(os.path.join(src, "i11-1-000001.nxs"), "a") as f:
+        f["entry1/instrument/detector/exposure_time"] = np.inf
+    scans, _ = core.process_raw([src], core.DataSourceType.SYNCHROTRON)
+    assert [s.exposure_time for s in scans] == [39.0]
+
+
+def test_synchrotron_exposure_is_the_scan_window(tmp_path):
+    """A synchrotron scan's exposure is its recorded end minus start, never a device-named
+    NXdetector's count_time (i11-1: pixium_hdf), so the midpoint centres the recorded window."""
+    src = str(tmp_path / "synchrotron")
+    os.makedirs(src)
+    _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00",
+                                     "2024-02-05T10:05:39", count_time=30.0)
+    _builders.write_synchrotron_scan(src, "000002", "2024-02-05T10:10:00",
+                                     "2024-02-05T10:10:39")
+    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
+    scans, _ = core.process_raw([src], core.DataSourceType.SYNCHROTRON)
+    assert [sc.exposure_time for sc in scans] == [39.0, 39.0], \
+        [sc.exposure_time for sc in scans]
+
+
+@pytest.mark.parametrize("dat_exposure, edf_exposure", [
+    pytest.param("inf", None, id="dat-inf"), pytest.param("-120", None, id="dat-negative"),
+    pytest.param("120.0", "inf", id="edf-inf", marks=needs_fabio)])
+def test_unusable_header_exposure_counts_as_none(tmp_path, dat_exposure, edf_exposure):
+    """A non-finite or non-positive header exposure is no exposure: the scan correlates at its start."""
+    src = tmp_path / "lab"
+    src.mkdir()
+    _builders.write_xrd_dat(str(src / "scan_001.dat"), _builders.SCAN_TIMES[0], exposure=dat_exposure)
+    if edf_exposure is not None:
+        _builders.write_edf_image(str(src / "image_001.edf"), _builders.SCAN_TIMES[0],
+                                  ExposureTime=edf_exposure)
+    _builders.write_echem_txt(str(src / "echem.txt"))
+    out = str(tmp_path / "lab.nxs")
+    ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE)
+    assert ok, msgs
+    assert abs(core.load(out).scans[0].echem - 3.75) < 1e-9, core.load(out).scans[0].echem
 
 
 # ============================================================================
@@ -527,9 +641,8 @@ def _arbin_rows(ts_list):
 ], ids=["blank-line-after-header", "blank-timestamp-cell", "slash-year-first",
         "constant-metadata-datetime", "malformed-first-cell"])
 def test_parse_timestamp_edge_cases(tmp_path, rows, n, first_ts):
-    """Blank lines and cells drop, slash year-first dates are not day/month-swapped, a constant
-    metadata datetime loses to the per-row column, and a malformed first cell recovers;
-    every surviving timestamp is real and unique."""
+    """Blank lines and cells drop, slash year-first dates are not swapped, a constant metadata
+    datetime loses to the per-row column, a malformed first cell recovers; all are real, unique."""
     path = tmp_path / "echem.txt"
     path.write_text("\n".join(rows) + "\n")
     df = core.EchemParser().parse(str(path))
@@ -610,7 +723,7 @@ def test_echem_elapsed_seconds_file_is_skipped(tmp_path, caplog, first_cell, ste
     with caplog.at_level(logging.WARNING, logger="core"):
         assert core.EchemParser().parse(str(path)) is None
     assert any("elapsed.txt" in r.getMessage() and "plain numbers" in r.getMessage()
-               for r in caplog.records), [r.getMessage() for r in caplog.records]
+               for r in caplog.records), caplog.messages
 
 
 @pytest.mark.parametrize("placeholder", ["30/12/1899 00:00:00", "01/01/0001 00:00:00"])
@@ -666,7 +779,7 @@ def test_positional_column_without_its_unit_skips_the_file(tmp_path, caplog, hea
     path.write_text("\n".join(rows) + "\n")
     with caplog.at_level(logging.WARNING, logger="core"):
         assert core.EchemParser().parse(str(path)) is None
-    assert [r.getMessage() for r in caplog.records] == [f"Skipping log.txt: {reason}"]
+    assert caplog.messages == [f"Skipping log.txt: {reason}"]
 
 
 @pytest.mark.parametrize("header", [
@@ -694,7 +807,7 @@ def test_temperature_log_beside_the_echem_is_left_out(tmp_path, caplog):
     assert len(echem) == 40 and {os.path.basename(f) for f in echem["source_file"]} == {"echem.txt"}
     assert scans[0].voltage_max < 4 and abs(scans[0].echem - 3.76) < 1e-9, scans[0].voltage_max
     assert ("Skipping cell_temperature.txt: column 'Temperature 1 (C)' is not a voltage column"
-            in [r.getMessage() for r in caplog.records])
+            in caplog.messages)
 
 
 def test_combined_echem_files_are_named(tmp_path, caplog):
@@ -970,7 +1083,7 @@ def test_skipped_standard_echem_files_are_named(tmp_path, caplog):
                                  standard_echem_files=[str(tmp_path / "gone.txt"),
                                                        str(tmp_path / "notes.txt")])
     assert ok, msgs
-    messages = [r.getMessage() for r in caplog.records]
+    messages = caplog.messages
     assert "Standard electrochemistry file gone.txt not found; skipped" in messages, messages
     assert "No electrochemistry data found in notes.txt; not stored" in messages, messages
 
@@ -988,6 +1101,24 @@ def test_unconverted_standard_table_is_named_once(tmp_path, caplog):
     for name in ("gone.csv", "broken.xlsx"):
         named = [r.getMessage() for r in caplog.records if name in r.getMessage()]
         assert len(named) == 1 and named[0].startswith("Error converting tabular file "), named
+
+
+def test_writer_names_a_standard_table_given_unconverted(tmp_path, caplog):
+    """NXSWriter.write called directly with a standard .csv/.xlsx warns once and stores none."""
+    src = str(tmp_path / "inhouse")
+    _builders.write_inhouse_dir(src)
+    scans, echem_df = core.process_raw([src], core.DataSourceType.INHOUSE)
+    tables = [str(tmp_path / "std.csv"), str(tmp_path / "std.xlsx")]
+    _builders.write_arbin_xlsx(tables[1])
+    pd.read_excel(tables[1]).to_csv(tables[0], index=False)
+    out = str(tmp_path / "std.nxs")
+    with caplog.at_level(logging.WARNING, logger="core"):
+        core.NXSWriter(core.DataSourceType.INHOUSE).write(out, scans, echem_df, tables)
+    named = [r.getMessage() for r in caplog.records if "std." in r.getMessage()]
+    assert named == [f"Standard electrochemistry file {name} is not converted to text; skipped"
+                     for name in ("std.csv", "std.xlsx")], named
+    with h5py.File(out) as f:
+        assert "standard_electrochemistry" not in f["entry"]
 
 
 def _parse(path, tmp_path):
@@ -1054,22 +1185,6 @@ def test_convert_tabular_dest_dir(tmp_path):
     assert df is not None and len(df) == 40
 
 
-@needs_fabio
-def test_zip_twod_references_survive(tmp_path):
-    """ZIP-extracted 2D sources persist beside the .nxs, not in the deleted extraction tempdir."""
-    zpath = _builders.write_twod_zip(str(tmp_path / "cell.zip"), tmp_path)
-    out = str(tmp_path / "zipped.nxs")
-    ok, msgs = core.generate([zpath], out, core.DataSourceType.INHOUSE)
-    assert ok, str(msgs)
-    m = core.load(out)
-    source = str(m.scans[0].twod_source)
-    assert os.path.isfile(source), f"2D reference is a dead path: {source}"
-    assert source.startswith(str(tmp_path / "zipped_images")), source
-    # The sidecar is the normal outcome, so it is no warning
-    assert os.path.isfile(tmp_path / "zipped_images" / ".operaxn_images")
-    assert not any("2D images copied" in msg for msg in msgs), msgs
-
-
 def test_missing_echem_warning_is_logged(tmp_path, caplog):
     """A run without echem still generates and logs the no-echem warning to the terminal."""
     src = tmp_path / "xrd_only"
@@ -1081,21 +1196,7 @@ def test_missing_echem_warning_is_logged(tmp_path, caplog):
     assert ok, str(msgs)
     assert "Warning: No echem data available" in msgs
     assert any(r.levelno == logging.WARNING and r.getMessage() == "No echem data available"
-               for r in caplog.records), [r.getMessage() for r in caplog.records]
-
-
-@needs_fabio
-def test_folder_twod_references_untouched(tmp_path):
-    """Folder inputs keep referencing the user's own files; no images dir."""
-    src = str(tmp_path / "src")
-    _builders.write_twod_dir(src)
-    out = str(tmp_path / "plain.nxs")
-    ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
-    assert ok, str(msgs)
-    m = core.load(out)
-    assert os.path.samefile(str(m.scans[0].twod_source),
-                            os.path.join(src, "image_001.edf"))
-    assert not os.path.isdir(str(tmp_path / "plain_images"))
+               for r in caplog.records), caplog.messages
 
 
 def test_xlsx_conversion_leaves_no_temp_files(tmp_path):
@@ -1108,80 +1209,6 @@ def test_xlsx_conversion_leaves_no_temp_files(tmp_path):
     core.process_raw([str(data_dir)], core.DataSourceType.INHOUSE)
     pattern = os.path.join(tempfile.gettempdir(), f"{stem}_*.txt")
     assert glob.glob(pattern) == [], "conversion leaked a temp file"
-
-
-def test_collection_warms_every_file_up_front(neutron_dir, monkeypatch):
-    """Every collected file is opened once across the worker pool before classification."""
-    import builtins
-    monkeypatch.setattr(importlib.import_module("core.generate"),
-                        "PARALLEL_PROCESSING_THRESHOLD", 0)
-    opened = []
-    real_open = builtins.open
-
-    def recording_open(file, mode="r", *args, **kwargs):
-        if mode == "rb":
-            opened.append(os.path.normpath(str(file)))
-        return real_open(file, mode, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", recording_open)
-    with core.FileProcessor(core.DataSourceType.NEUTRON) as processor:
-        records = processor.process_paths([neutron_dir])
-    collected = {os.path.normpath(r.path) for r in records}
-    assert collected and collected <= set(opened), sorted(collected - set(opened))
-
-
-def test_warm_up_skips_unreadable_paths(tmp_path, monkeypatch):
-    """A file gone since collection is skipped; warming never raises."""
-    monkeypatch.setattr(importlib.import_module("core.generate"),
-                        "PARALLEL_PROCESSING_THRESHOLD", 0)
-    present = tmp_path / "scan.dat"
-    present.write_text("1 2\n")
-    core.FileProcessor._warm_up([str(tmp_path / "gone.dat"), str(present)])
-
-
-def test_inhouse_dat_without_a_header_is_named(tmp_path, caplog):
-    """A header-stripped .dat is named in the one unrecognised-file line, never as an orphan."""
-    src = tmp_path / "lab"
-    _builders.write_inhouse_dir(str(src))
-    # As the real stripped copies of scan 00008: the data rows only
-    rows = [line for line in (src / "scan_002.dat").read_text().splitlines()
-            if not line.startswith("#")]
-    (src / "scan_004.dat").write_text("\n".join(rows) + "\n")
-    (src / "scan_005.xy").write_text("10.0 1.0\n")
-
-    def lines():
-        caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="core"):
-            scans, _ = core.process_raw([str(src)], core.DataSourceType.INHOUSE)
-        assert len(scans) == 3
-        return [r.getMessage() for r in caplog.records if "ignored" in r.getMessage()]
-
-    assert sorted(lines()) == [
-        "1 .dat/.edf file was not recognised as scan data and was ignored: scan_004.dat "
-        "(scans need a readable Date in their header)",
-        "1 file did not belong to any scan and was ignored (1 .xy)"]
-    (src / "notes.txt").write_text("calibration\t25.3\t40.1\n")
-    named = [m for m in lines() if "not recognised" in m]
-    assert len(named) == 1 and named[0].startswith(
-        "2 files were not recognised as scan, echem or logbook data and were ignored: "), named
-    assert "notes.txt" in named[0] and "scan_004.dat" in named[0]
-    assert named[0].endswith("(scans need a readable Date in their header; echem files need a "
-                             "header line naming time, voltage or current)")
-
-
-@needs_fabio
-def test_damaged_edf_is_named_once(tmp_path, caplog):
-    """An EDF fabio cannot read is named in its one ERROR line, not again as unrecognised."""
-    src = tmp_path / "lab"
-    _builders.write_inhouse_dir(str(src))
-    (src / "image_009.edf").write_bytes(b"not an edf image")
-    with caplog.at_level(logging.WARNING, logger="core"):
-        scans, _ = core.process_raw([str(src)], core.DataSourceType.INHOUSE)
-    assert len(scans) == 3
-    named = [(r.levelname, r.getMessage()) for r in caplog.records
-             if "image_009.edf" in r.getMessage()]
-    assert len(named) == 1 and named[0][0] == "ERROR" and \
-        named[0][1].startswith("Error classifying EDF file "), named
 
 
 # ============================================================================
@@ -1228,6 +1255,81 @@ def test_one_unmatched_file_reads_singular(tmp_path, caplog):
     assert ok, msgs
     messages = _warning_messages(caplog)
     assert "1 file did not belong to any scan and was ignored (1 .xy)" in messages, messages
+
+
+def test_inhouse_dat_without_a_header_is_named(tmp_path, caplog):
+    """A header-stripped .dat is named in the one unrecognised-file line, never as an orphan."""
+    src = tmp_path / "lab"
+    _builders.write_inhouse_dir(str(src))
+    # A header-stripped copy: the data rows only
+    rows = [line for line in (src / "scan_002.dat").read_text().splitlines()
+            if not line.startswith("#")]
+    (src / "scan_004.dat").write_text("\n".join(rows) + "\n")
+    (src / "scan_005.xy").write_text("10.0 1.0\n")
+
+    def lines():
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="core"):
+            scans, _ = core.process_raw([str(src)], core.DataSourceType.INHOUSE)
+        assert len(scans) == 3
+        return [r.getMessage() for r in caplog.records if "ignored" in r.getMessage()]
+
+    assert sorted(lines()) == [
+        "1 .dat/.edf file was not recognised as scan data and was ignored: scan_004.dat "
+        "(scans need a readable Date in their header)",
+        "1 file did not belong to any scan and was ignored (1 .xy)"]
+    (src / "notes.txt").write_text("calibration\t25.3\t40.1\n")
+    named = [m for m in lines() if "not recognised" in m]
+    assert len(named) == 1 and named[0].startswith(
+        "2 files were not recognised as scan, echem or logbook data and were ignored: "), named
+    assert "notes.txt" in named[0] and "scan_004.dat" in named[0]
+    assert named[0].endswith("(scans need a readable Date in their header; echem files need a "
+                             "header line naming time, voltage or current)")
+
+
+@needs_fabio
+def test_damaged_edf_is_named_once(tmp_path, caplog):
+    """An EDF fabio cannot read is named in its one ERROR line, not again as unrecognised."""
+    src = tmp_path / "lab"
+    _builders.write_inhouse_dir(str(src))
+    (src / "image_009.edf").write_bytes(b"not an edf image")
+    with caplog.at_level(logging.WARNING, logger="core"):
+        scans, _ = core.process_raw([str(src)], core.DataSourceType.INHOUSE)
+    assert len(scans) == 3
+    named = [(r.levelname, r.getMessage()) for r in caplog.records
+             if "image_009.edf" in r.getMessage()]
+    assert len(named) == 1 and named[0][0] == "ERROR" and \
+        named[0][1].startswith("Error classifying EDF file "), named
+
+
+@needs_fabio
+def test_zip_twod_references_survive(tmp_path):
+    """ZIP-extracted 2D sources persist beside the .nxs, not in the deleted extraction tempdir."""
+    zpath = _builders.write_twod_zip(str(tmp_path / "cell.zip"), tmp_path)
+    out = str(tmp_path / "zipped.nxs")
+    ok, msgs = core.generate([zpath], out, core.DataSourceType.INHOUSE)
+    assert ok, str(msgs)
+    m = core.load(out)
+    source = str(m.scans[0].twod_source)
+    assert os.path.isfile(source), f"2D reference is a dead path: {source}"
+    assert source.startswith(str(tmp_path / "zipped_images")), source
+    # The sidecar is the normal outcome, so it is no warning
+    assert os.path.isfile(tmp_path / "zipped_images" / ".operaxn_images")
+    assert not any("2D images copied" in msg for msg in msgs), msgs
+
+
+@needs_fabio
+def test_folder_twod_references_untouched(tmp_path):
+    """Folder inputs keep referencing the user's own files; no images dir."""
+    src = str(tmp_path / "src")
+    _builders.write_twod_dir(src)
+    out = str(tmp_path / "plain.nxs")
+    ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
+    assert ok, str(msgs)
+    m = core.load(out)
+    assert os.path.samefile(str(m.scans[0].twod_source),
+                            os.path.join(src, "image_001.edf"))
+    assert not os.path.isdir(str(tmp_path / "plain_images"))
 
 
 def test_zip_with_dot_slash_members_loads(tmp_path):
@@ -1297,16 +1399,18 @@ def test_unextractable_zip_member_costs_only_that_file(tmp_path, caplog):
                for m in _warning_messages(caplog)), _warning_messages(caplog)
 
 
+def _pairs_zip(tmp_path, name, times=_builders.SCAN_TIMES, prefix=""):
+    """Zip scan_00i .dat/.edf pairs dated `times` with echem under prefix; return the ZIP's path."""
+    src = tmp_path / "pairs"
+    if not src.is_dir():
+        _builders.write_dated_pairs(str(src), times, times)
+    return _builders.zip_tree(str(src), str(tmp_path / name), prefix=prefix)
+
+
 @needs_fabio
 def test_zip_images_none_copied_reports_no_sidecar(tmp_path, monkeypatch, caplog):
     """If every ZIP image move fails: an 'N of N' warning, no 'Persisted' line, no sidecar left."""
-    src = tmp_path / "cell"
-    src.mkdir()
-    for i, ts in enumerate(_builders.SCAN_TIMES[:2], start=1):
-        _builders.write_xrd_dat(str(src / f"scan_{i:03d}.dat"), ts)
-        _builders.write_edf_image(str(src / f"image_{i:03d}.edf"), ts)
-    _builders.write_echem_txt(str(src / "echem.txt"))
-    zip_path = _builders.zip_tree(str(src), str(tmp_path / "cell.zip"))
+    zip_path = _pairs_zip(tmp_path, "cell.zip", _builders.SCAN_TIMES[:2])
     generate_module = importlib.import_module("core.generate")
 
     def move(source, dest, *args, **kwargs):
@@ -1327,13 +1431,7 @@ def test_zip_images_none_copied_reports_no_sidecar(tmp_path, monkeypatch, caplog
 @needs_fabio
 def test_one_failed_zip_image_copy_costs_one_image(tmp_path, monkeypatch):
     """A ZIP image whose sidecar copy fails is reported by count; the other images stay viewable."""
-    src = tmp_path / "cell"
-    src.mkdir()
-    for i, ts in enumerate(_builders.SCAN_TIMES[:2], start=1):
-        _builders.write_xrd_dat(str(src / f"scan_{i:03d}.dat"), ts)
-        _builders.write_edf_image(str(src / f"image_{i:03d}.edf"), ts)
-    _builders.write_echem_txt(str(src / "echem.txt"))
-    zip_path = _builders.zip_tree(str(src), str(tmp_path / "cell.zip"))
+    zip_path = _pairs_zip(tmp_path, "cell.zip", _builders.SCAN_TIMES[:2])
 
     generate_module = importlib.import_module("core.generate")
     real_move = generate_module.shutil.move
@@ -1362,13 +1460,7 @@ def test_one_failed_zip_image_copy_costs_one_image(tmp_path, monkeypatch):
 def test_zip_image_held_open_elsewhere_keeps_its_copy(tmp_path, monkeypatch):
     """A move whose copy landed but whose source another program holds open (the unlink is
     refused) keeps the copy: every scan shows its persisted image and no failure is counted."""
-    src = tmp_path / "cell"
-    src.mkdir()
-    for i, ts in enumerate(_builders.SCAN_TIMES[:2], start=1):
-        _builders.write_xrd_dat(str(src / f"scan_{i:03d}.dat"), ts)
-        _builders.write_edf_image(str(src / f"image_{i:03d}.edf"), ts)
-    _builders.write_echem_txt(str(src / "echem.txt"))
-    zip_path = _builders.zip_tree(str(src), str(tmp_path / "cell.zip"))
+    zip_path = _pairs_zip(tmp_path, "cell.zip", _builders.SCAN_TIMES[:2])
     generate_module = importlib.import_module("core.generate")
 
     def move(source, dest, *args, **kwargs):
@@ -1456,7 +1548,7 @@ def test_table_selected_with_its_folder_is_converted_once(tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger="core"):
         _, echem = core.process_raw([str(src), str(src / "echem.xlsx")],
                                     core.DataSourceType.INHOUSE)
-    messages = [r.getMessage() for r in caplog.records]
+    messages = caplog.messages
     assert len(echem) == 40, len(echem)
     assert messages.count("Converted echem.xlsx to txt format") == 1, messages
     assert "1 file was found more than once and is read once: echem.xlsx" in messages, messages
@@ -1479,6 +1571,45 @@ def test_a_file_reached_three_times_is_counted_and_named_once(tmp_path, caplog):
         "1 file was found more than once and is read once: echem.txt"]
     assert repeats([d, echem, dat, echem, dat]) == [
         "2 files were found more than once and are read once: echem.txt, scan_001.dat"]
+
+
+def _binary_opens(monkeypatch):
+    """Record each path opened for binary reading; return the list it fills."""
+    opened = []
+    real_open = builtins.open
+
+    def recording_open(file, mode="r", *args, **kwargs):
+        if mode == "rb":
+            opened.append(os.path.normpath(str(file)))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", recording_open)
+    return opened
+
+
+def test_collection_warms_every_file_up_front(neutron_dir, monkeypatch):
+    """Every collected file is opened once across the worker pool before classification."""
+    monkeypatch.setattr(importlib.import_module("core.generate"),
+                        "PARALLEL_PROCESSING_THRESHOLD", 0)
+    opened = _binary_opens(monkeypatch)
+    with core.FileProcessor(core.DataSourceType.NEUTRON) as processor:
+        records = processor.process_paths([neutron_dir])
+    collected = {os.path.normpath(r.path) for r in records}
+    assert collected and collected <= set(opened), sorted(collected - set(opened))
+
+
+def test_warm_up_skips_unreadable_paths(tmp_path, monkeypatch, caplog):
+    """A file gone since collection costs one DEBUG line; the files after it are still warmed."""
+    monkeypatch.setattr(importlib.import_module("core.generate"),
+                        "PARALLEL_PROCESSING_THRESHOLD", 0)
+    gone, present = tmp_path / "gone.dat", tmp_path / "scan.dat"
+    present.write_text("1 2\n")
+    opened = _binary_opens(monkeypatch)
+    with caplog.at_level(logging.DEBUG, logger="core"):
+        core.FileProcessor._warm_up([str(gone), str(present)])
+    assert os.path.normpath(str(present)) in opened, opened
+    warned = [m for m in caplog.messages if m.startswith(f"Could not warm {gone}: ")]
+    assert len(warned) == 1, caplog.messages
 
 
 def test_one_logbook_entry_without_data_reads_singular(tmp_path, caplog):
@@ -1555,7 +1686,7 @@ def test_neutron_set_whose_only_logbook_has_a_li_title_generates(tmp_path):
 
 
 def test_neutron_run_whose_logbook_line_lost_a_tab_generates(tmp_path, caplog):
-    """End to end: a duration that fills its column (real SC1 line 540) still gives the scan."""
+    """End to end: a duration that fills its column (one space, no tab, after it) gives the scan."""
     src = str(tmp_path / "n")
     _builders.write_detailed_neutron_dir(src)
     path = os.path.join(src, "SC1_log_book.txt")
@@ -1572,7 +1703,7 @@ def test_neutron_run_whose_logbook_line_lost_a_tab_generates(tmp_path, caplog):
 
 
 def _lab_pairs(src):
-    """Three azimAvg .dat files with their EDF images (the 4225 shape) plus echem."""
+    """Three azimAvg .dat files with their EDF images (the laboratory export shape) plus echem."""
     _builders.write_lab_dir(str(src))
     for i, ts in enumerate(_builders.SCAN_TIMES, start=1):
         _builders.write_edf_image(str(src / f"image_{i:03d}.edf"), ts)
@@ -1592,7 +1723,7 @@ def test_laboratory_pairs_loaded_as_synchrotron_are_refused(tmp_path, caplog):
 
 @needs_fabio
 def test_laboratory_pairs_beside_a_synchrotron_scan_are_refused(tmp_path):
-    """One scan .nxs in the selection does not switch the guard off (mixed 4225 + HM28 folder)."""
+    """One scan .nxs in the selection does not switch the guard off (a lab folder plus an i11 scan)."""
     src = tmp_path / "mixed"
     _lab_pairs(src)
     _builders.write_synchrotron_scan(str(src), "000001", "2024-02-05T10:05:00", "2024-02-05T10:05:39")
@@ -1631,12 +1762,12 @@ def test_synchrotron_scans_still_load(tmp_path):
     ("scan.xy", "# only a comment\n"),
 ])
 def test_one_d_file_without_data_rows_is_unreadable(tmp_path, name, text):
-    """An empty or header-only 1D file raises one IOError naming the path once, with no numpy warning."""
+    """An empty or header-only 1D file raises one OSError naming the path once, with no numpy warning."""
     path = tmp_path / name
     path.write_text(text)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        with pytest.raises(IOError, match="no data rows$") as err:
+        with pytest.raises(OSError, match="no data rows$") as err:
             core.DataReaderFactory.read_file(str(path), use_cache=False)
     assert str(err.value).count(str(path)) == 1, str(err.value)
     assert not caught, [str(w.message) for w in caught]
@@ -1647,7 +1778,7 @@ def test_header_only_dat_is_unreadable_through_the_single_pass_reader(tmp_path):
     path = tmp_path / "123456-1_10raw-0.dat"
     path.write_text("# Mantid-like comment\n# X Y E\n")
     reader = core.DataReaderFactory.get_reader(str(path), is_neutron=True)
-    with pytest.raises(IOError):
+    with pytest.raises(OSError):
         reader.read_with_lines(str(path))
 
 
@@ -1707,7 +1838,7 @@ def test_real_dat_shapes_read_in_one_pass(tmp_path, monkeypatch, shape):
 
 
 def test_bare_table_dat_is_opened_once(tmp_path, monkeypatch):
-    """A header-less bank table (Run1's layout) is opened once: numpy parses the bytes already read."""
+    """A header-less bank table is opened once: numpy parses the bytes already read."""
     path = str(tmp_path / "123456-1_10raw-0.dat")
     with open(path, "w") as f:
         f.write("0.94279 75.47654295 2.26047823\n0.94379 76.1 2.3\n")
@@ -1780,9 +1911,9 @@ def test_hdf_group_at_a_known_path_is_refused_not_guessed(tmp_path):
         grp = f.create_group("entry/data")
         grp.attrs["NX_class"], grp.attrs["signal"] = "NXdata", "image"
         grp["image"] = frame
-    with pytest.raises(IOError, match="No suitable data found"):
+    with pytest.raises(OSError, match="No suitable data found"):
         reader.read(eiger, use_cache=False)
-    # HM28 layout: the frame at the first known path and /entry/data/data; /entry/data is a group
+    # Pixium layout: the frame at the first known path and /entry/data/data; /entry/data is a group
     pixium = str(tmp_path / "pixium.hdf")
     with h5py.File(pixium, "w") as f:
         f["entry/instrument/detector/data"] = frame
@@ -1837,6 +1968,24 @@ def test_file_cache_evicts_least_recently_used():
     assert sorted(cache.cache) == ["b", "d"]
 
 
+def test_file_cache_replacing_a_key_counts_it_once():
+    """Re-putting a key (two threads reading one file) keeps the byte count to what is held."""
+    cache = readers.FileCache(max_size_mb=1)
+    for _ in range(3):
+        cache.put("same", np.zeros(50_000))
+    assert cache.current_size == cache.cache["same"].nbytes
+    cache.put("other", np.zeros(80_000))
+    assert sorted(cache.cache) == ["other", "same"], "phantom bytes must not force an eviction"
+    # A larger replacement evicts the least recently used entry; a stale tick must not stall it
+    cache.get("other")
+    cache.get("other")
+    worker = threading.Thread(target=cache.put, args=("same", np.zeros(100_000)), daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "put must not spin on a stale tick"
+    assert sorted(cache.cache) == ["same"], "the least recently used entry gives way"
+
+
 @needs_fabio
 def test_generate_leaves_the_reader_cache_empty(tmp_path, polaris_src):
     """1D, embedded EDF and neutron bank reads by the writer bypass the cache."""
@@ -1886,6 +2035,23 @@ def test_inhouse_scan_fields_roundtrip(inhouse_rt):
             f"scan {loaded.scan_num}: file={loaded.timestamp} pipeline={pipeline_scan.timestamp}"
         assert loaded.exposure_time == pipeline_scan.exposure_time, \
             f"scan {loaded.scan_num}: exposure"
+
+
+def test_entry_window_reaches_a_last_scan_without_exposure(tmp_path):
+    """A last scan with no exposure has no end_time; the entry window still ends at its start."""
+    src = tmp_path / "lab"
+    src.mkdir()
+    _builders.write_xrd_dat(str(src / "scan_001.dat"), _builders.SCAN_TIMES[0])
+    _builders.write_xrd_dat(str(src / "scan_002.dat"), _builders.SCAN_TIMES[1], exposure="inf")
+    _builders.write_echem_txt(str(src / "echem.txt"))
+    out = str(tmp_path / "lab.nxs")
+    ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE)
+    assert ok, msgs
+    with h5py.File(out) as f:
+        env = f["entry/scan_000002/environment"]
+        assert "end_time" not in env
+        assert wall(f["entry/end_time"]) == wall(env["start_time"]) == "2024-02-05T10:10:00", \
+            "the entry ends before its last scan starts"
 
 
 def test_neutron_banks_roundtrip(neutron_rt):
@@ -1975,7 +2141,7 @@ def test_neutron_scan_with_no_readable_bank_is_written_with_a_warning(tmp_path, 
         ok, msgs = core.generate([src], out, core.DataSourceType.NEUTRON)
     assert ok, msgs
     assert ("Scan 2 (run 123457): no bank file could be read; written without data"
-            in [r.getMessage() for r in caplog.records]), [r.getMessage() for r in caplog.records]
+            in caplog.messages), caplog.messages
     with h5py.File(out) as f:
         assert "bank_1" in f["entry/scan_000001"]
         assert not any(name.startswith("bank_") for name in f["entry/scan_000002"])
@@ -2043,6 +2209,27 @@ def test_embedded_edf_frame_keeps_its_dtype(tmp_path):
     assert_pynxtools_valid(out)
     model = core.load(out)
     assert np.array_equal(model.scans[0].twod, expected.astype(float))
+
+
+def test_regenerating_keeps_the_embedded_image_shape(tmp_path):
+    """A second generate of one synchrotron image in a session still records original_shape
+    (a cached read skips the step that measures it)."""
+    src = str(tmp_path / "synchrotron")
+    os.makedirs(src)
+    _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00",
+                                     "2024-02-05T10:05:39")
+    with h5py.File(os.path.join(src, "pixium-000001.hdf"), "w") as f:
+        f["entry/instrument/detector/data"] = np.ones((16, 16), dtype=np.float32)
+    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
+    for run in range(2):
+        out = str(tmp_path / f"run{run}.nxs")
+        ok, msgs = core.generate([src], out, core.DataSourceType.SYNCHROTRON,
+                                 include_2d_images=True)
+        assert ok, str(msgs)
+        with h5py.File(out) as f:
+            note = f["entry/scan_000001/image_source"]
+            assert "original_shape" in note, f"run {run} lost original_shape"
+            assert list(note["original_shape"][()]) == [16, 16]
 
 
 @needs_fabio
@@ -2118,14 +2305,6 @@ def test_failed_first_write_leaves_no_file(inhouse_dir, tmp_path, monkeypatch):
     ok, _ = core.generate([inhouse_dir], out, core.DataSourceType.INHOUSE)
     assert not ok
     assert not os.path.exists(out) and not os.path.exists(out + ".part")
-
-
-def _pairs_zip(tmp_path, name, prefix=""):
-    """Zip three scan_00i .dat/.edf pairs with echem under prefix and return the ZIP's path."""
-    src = tmp_path / "pairs"
-    if not src.is_dir():
-        _builders.write_dated_pairs(str(src), _builders.SCAN_TIMES, _builders.SCAN_TIMES)
-    return _builders.zip_tree(str(src), str(tmp_path / name), prefix=prefix)
 
 
 def _interrupt(monkeypatch, stage):
@@ -2206,24 +2385,8 @@ def test_default_cache_path_outside_data_dir(inhouse_dir):
     assert not cache.startswith(inhouse_dir) and cache.endswith(".nxs"), cache
 
 
-def test_no_undefined_names_in_packages():
-    """Pyflakes finds no undefined names in core or operaxn, so a definition removed while still
-    referenced fails loudly (the dialog.py logger regression)."""
-    pyflakes_api = pytest.importorskip("pyflakes.api")
-    from pyflakes.reporter import Reporter
-    root = os.path.dirname(os.path.dirname(os.path.abspath(core.__file__)))
-    issues = []
-    for pkg in ("core", "operaxn"):
-        for path in glob.glob(os.path.join(root, pkg, "*.py")):
-            out, err = io.StringIO(), io.StringIO()
-            pyflakes_api.checkPath(path, Reporter(out, err))
-            issues += [line for line in out.getvalue().splitlines()
-                       if "undefined name" in line]
-    assert issues == [], "\n".join(issues)
-
-
 # ============================================================================
-# Example data
+# Project files
 # ============================================================================
 
 GENERATOR = Path(__file__).resolve().parents[1] / "examples" / "make_example_data.py"
@@ -2250,6 +2413,69 @@ def test_example_matches_builders(tmp_path):
         _, differ, errors = filecmp.cmpfiles(tmp_path / "ex" / sub, tmp_path / "b" / sub,
                                              cmp.common_files, shallow=False)
         assert not differ and not errors, (sub, differ, errors)
+
+
+def test_release_version_matches_package_and_citation():
+    """pyproject.toml and CITATION.cff carry the GENERATOR_VERSION every file is stamped with."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
+        project = fh.read().split("[project]", 1)[1].split("\n[", 1)[0]
+    with open(os.path.join(root, "CITATION.cff"), encoding="utf-8") as fh:
+        citation = fh.read()
+    package = re.search(r'^version\s*=\s*"([^"]+)"', project, re.M)
+    cited = re.search(r"^version:\s*(\S+)", citation, re.M)
+    assert package and cited, "version line not found"
+    assert package.group(1) == core.GENERATOR_VERSION, "pyproject.toml version differs"
+    assert cited.group(1).strip("'\"") == core.GENERATOR_VERSION, "CITATION.cff version differs"
+
+
+def test_dependency_floors_agree():
+    """pyproject.toml, requirements.txt and the README Dependencies list declare the same floors."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def read(name):
+        with open(os.path.join(root, name), encoding="utf-8") as fh:
+            return fh.read()
+
+    deps = read("pyproject.toml").split("\ndependencies = [", 1)[1].split("]", 1)[0]
+    declared = dict(re.findall(r'"([A-Za-z0-9_-]+)>=([\d.]+)"', deps))
+    listed = dict(re.findall(r"^([A-Za-z0-9_-]+)>=([\d.]+)\s*$", read("requirements.txt"), re.M))
+    readme = read("README.md").split("\n## Dependencies", 1)[1].split("\n## ", 1)[0]
+    shown = {name.lower(): floor
+             for name, floor in re.findall(r"^- (\S+) >= ([\d.]+)\s*$", readme, re.M)}
+    shown.pop("python", None)
+    assert len(declared) == 6, declared
+    assert listed == declared, "requirements.txt floors differ from pyproject.toml"
+    assert shown == declared, "README.md floors differ from pyproject.toml"
+
+
+def test_no_undefined_names_in_packages():
+    """Pyflakes finds no undefined names in core or operaxn, so a definition removed while still
+    referenced fails loudly."""
+    pyflakes_api = pytest.importorskip("pyflakes.api")
+    from pyflakes.reporter import Reporter
+    root = os.path.dirname(os.path.dirname(os.path.abspath(core.__file__)))
+    issues = []
+    for pkg in ("core", "operaxn"):
+        for path in glob.glob(os.path.join(root, pkg, "*.py")):
+            out, err = io.StringIO(), io.StringIO()
+            pyflakes_api.checkPath(path, Reporter(out, err))
+            issues += [line for line in out.getvalue().splitlines()
+                       if "undefined name" in line]
+    assert issues == [], "\n".join(issues)
+
+
+BIN = Path(__file__).resolve().parents[1] / "bin"
+EXEMPT = {"ici.py"}  # until its three long lines are rewrapped
+
+
+def test_no_production_line_over_100_characters():
+    """Every line under bin/ is at most 100 characters long."""
+    long_lines = [f"{path.relative_to(BIN).as_posix()}:{n} ({len(line)})"
+                  for path in sorted(BIN.rglob("*.py")) if path.name not in EXEMPT
+                  for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+                  if len(line) > 100]
+    assert not long_lines, long_lines
 
 
 # ============================================================================
@@ -2341,152 +2567,3 @@ def test_polaris_profile_matches_mantid_file():
         assert abs(got["polar_angle_deg"] - spec["polar_angle_deg"]) <= 0.06, (bank, got)
         assert got["azimuthal_angle_deg"] is None, (bank, got)
     assert derived["info"]["idf_name"] == "Polaris_upgrade"
-
-
-def test_neutron_midpoint_not_floored(tmp_path):
-    """An odd-length run correlates at its exact half-second midpoint, not the floored one
-    (flooring picked the wrong echem point for 75 of 108 POLARIS runs)."""
-    src = str(tmp_path / "odd_run")
-    os.makedirs(src)
-    # 7 s run: exact midpoint 10:00:03.5, floored 10:00:03
-    with open(os.path.join(src, "logbook.txt"), "w") as f:
-        f.write("123456\tuser\tsample title\tMon Feb 05 10:00:00 2024\t"
-                "Mon Feb 05 10:00:07 2024\t7\tok\textra\n")
-    _builders.write_neutron_banks(src)
-    # Points at 03.0 s and 03.9 s: the exact midpoint is nearer 03.9
-    with open(os.path.join(src, "echem.txt"), "w") as f:
-        f.write("Time\tEwe/V\tI/mA\n"
-                "05/02/2024 09:59:00.0\t3.0000\t0.1000\n"
-                "05/02/2024 10:00:03.0\t3.0000\t0.1000\n"
-                "05/02/2024 10:00:03.9\t3.9000\t0.1000\n"
-                "05/02/2024 10:01:00.0\t3.0000\t0.1000\n")
-    scans, _ = core.process_raw([src], core.DataSourceType.NEUTRON)
-    assert len(scans) == 1
-    assert scans[0].timestamp_for_correlation == pd.Timestamp("2024-02-05 10:00:03.5")
-    assert scans[0].echem == 3.9, f"correlated at the floored midpoint: {scans[0].echem}"
-    out = str(tmp_path / "odd_run.nxs")
-    ok, msgs = core.generate([src], out, core.DataSourceType.NEUTRON)
-    assert ok, str(msgs)
-    with h5py.File(out) as f:
-        env = f["entry/scan_000001/environment"]
-        stored = {k: pd.to_datetime(env[k][()].decode()).tz_localize(None)
-                  for k in ("scan_timestamp", "midpoint_adjusted_timestamp")}
-        assert stored["scan_timestamp"] == stored["midpoint_adjusted_timestamp"]
-        assert stored["scan_timestamp"] == pd.Timestamp("2024-02-05 10:00:03.5")
-        assert abs(env["voltage"][()] - 3.9) < 1e-9
-
-
-def test_window_extrema_span_the_window(pipeline):
-    """Voltage/current extrema cover every echem point in the window, both bounds inclusive:
-    scan 1 (10:05, 120 s) sees 10:05 to 10:07 and its matched value lies within the range."""
-    scans, _ = pipeline
-    s1 = scans[0]
-    assert (s1.voltage_min, s1.voltage_max) == (3.75, 3.77)
-    assert (s1.current_min, s1.current_max) == (0.105, 0.107)
-    assert s1.voltage_min <= s1.echem <= s1.voltage_max
-
-
-def test_window_extrema_absent_without_exposure(tmp_path):
-    """A scan with no header exposure has no extrema but keeps its nearest-point voltage."""
-    src = str(tmp_path / "no_exposure")
-    os.makedirs(src)
-    lines = ["# Date 2024-02-05T10:05:00", "# tth Intensity"]
-    lines += [f"{x:.4f} {v:.4f}"
-              for x, v in zip(_builders.ONED_X, _builders.inhouse_scan_y(1))]
-    with open(os.path.join(src, "scan_001.dat"), "w") as f:
-        f.write("\n".join(lines) + "\n")
-    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
-    scans, _ = core.process_raw([src], core.DataSourceType.INHOUSE)
-    assert len(scans) == 1 and scans[0].exposure_time is None
-    assert scans[0].echem == 3.75
-    assert scans[0].voltage_min is None and scans[0].voltage_max is None
-
-
-def test_window_extrema_follow_relative_alignment(tmp_path, inhouse_dir):
-    """Relative-mode extrema use the correlation's clock shift: the earliest midpoint maps onto
-    the first echem point, so scan 1 matches 3.70 V inside a 3.70 to 3.71 V window."""
-    out = str(tmp_path / "relative.nxs")
-    ok, msgs = core.generate([inhouse_dir], out, core.DataSourceType.INHOUSE,
-                             time_method=core.TimeMethod.RELATIVE)
-    assert ok, str(msgs)
-    s1 = core.load(out).scans[0]
-    assert s1.echem == 3.70
-    assert (s1.voltage_min, s1.voltage_max) == (3.70, 3.71)
-    assert s1.voltage_min <= s1.echem <= s1.voltage_max
-
-
-def test_synchrotron_exposure_is_the_scan_window(tmp_path):
-    """A synchrotron scan's exposure is its recorded end minus start (readout and processing
-    included), never a device-named NXdetector's count_time (i11-1: pixium_hdf), so the
-    correlation midpoint stays centred on the recorded window."""
-    src = str(tmp_path / "synchrotron")
-    os.makedirs(src)
-    _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00",
-                                     "2024-02-05T10:05:39", count_time=30.0)
-    _builders.write_synchrotron_scan(src, "000002", "2024-02-05T10:10:00",
-                                     "2024-02-05T10:10:39")
-    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
-    scans, _ = core.process_raw([src], core.DataSourceType.SYNCHROTRON)
-    assert [sc.exposure_time for sc in scans] == [39.0, 39.0], \
-        [sc.exposure_time for sc in scans]
-
-
-def test_file_cache_replacing_a_key_counts_it_once():
-    """Re-putting a key (two threads reading one file) keeps the byte count to what is held."""
-    cache = readers.FileCache(max_size_mb=1)
-    for _ in range(3):
-        cache.put("same", np.zeros(50_000))
-    assert cache.current_size == cache.cache["same"].nbytes
-    cache.put("other", np.zeros(80_000))
-    assert sorted(cache.cache) == ["other", "same"], "phantom bytes must not force an eviction"
-    # A larger replacement evicts the least recently used entry; a stale tick must not stall it
-    cache.get("other")
-    cache.get("other")
-    worker = threading.Thread(target=cache.put, args=("same", np.zeros(100_000)), daemon=True)
-    worker.start()
-    worker.join(timeout=10)
-    assert not worker.is_alive(), "put must not spin on a stale tick"
-    assert sorted(cache.cache) == ["same"], "the least recently used entry gives way"
-
-
-def test_generate_rejects_an_unusable_tolerance(tmp_path, caplog):
-    """Direct API callers get a clear error, not a logged traceback, for a tolerance the
-    correlator cannot use."""
-    src = str(tmp_path / "inhouse")
-    _builders.write_inhouse_dir(src)
-    for bad in (None, "300", 0, -5, float("nan"), float("inf"), True, 300j, 1e10, 10**400):
-        caplog.clear()
-        ok, msgs = core.generate([src], str(tmp_path / "bad.nxs"),
-                                 core.DataSourceType.INHOUSE, echem_time_tolerance=bad)
-        assert not ok and "echem_time_tolerance" in msgs[0], (bad, msgs)
-        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], bad
-        with pytest.raises(ValueError, match="echem_time_tolerance"):
-            core.process_raw([src], core.DataSourceType.INHOUSE, echem_time_tolerance=bad)
-    assert not os.path.exists(tmp_path / "bad.nxs")
-    ok, msgs = core.generate([src], str(tmp_path / "over.nxs"), core.DataSourceType.INHOUSE,
-                             echem_time_tolerance=1e10)
-    assert "up to 1,000,000,000" in msgs[0], "the message names the limit"
-    ok, msgs = core.generate([src], str(tmp_path / "limit.nxs"), core.DataSourceType.INHOUSE,
-                             echem_time_tolerance=1e9)
-    assert ok, "the limit itself is usable"
-
-
-def test_regenerating_keeps_the_embedded_image_shape(tmp_path):
-    """A second generate of one synchrotron image in a session still records original_shape
-    (a cached read skips the step that measures it)."""
-    src = str(tmp_path / "synchrotron")
-    os.makedirs(src)
-    _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00",
-                                     "2024-02-05T10:05:39")
-    with h5py.File(os.path.join(src, "pixium-000001.hdf"), "w") as f:
-        f["entry/instrument/detector/data"] = np.ones((16, 16), dtype=np.float32)
-    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
-    for run in range(2):
-        out = str(tmp_path / f"run{run}.nxs")
-        ok, msgs = core.generate([src], out, core.DataSourceType.SYNCHROTRON,
-                                 include_2d_images=True)
-        assert ok, str(msgs)
-        with h5py.File(out) as f:
-            note = f["entry/scan_000001/image_source"]
-            assert "original_shape" in note, f"run {run} lost original_shape"
-            assert list(note["original_shape"][()]) == [16, 16]

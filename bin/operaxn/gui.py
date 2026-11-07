@@ -240,7 +240,8 @@ class StyledButton(tk.Button):
         }
     }
 
-    def __init__(self, master: tk.Widget, text: str = "", command: Optional[Callable] = None, style: str = "primary", **kwargs: Any) -> None:
+    def __init__(self, master: tk.Widget, text: str = "", command: Optional[Callable] = None,
+                 style: str = "primary", **kwargs: Any) -> None:
         style_config = self.STYLES.get(style, self.STYLES["secondary"])
 
         super().__init__(
@@ -460,7 +461,8 @@ class ScanSelector(BaseUIComponent):
             highlightthickness=0,
             font=OPERAXNTheme.FONTS['small']
         )
-        self.slider.pack(side="left", padx=(OPERAXNTheme.PADDING['small'], OPERAXNTheme.PADDING['small'] + 3),
+        self.slider.pack(side="left",
+                         padx=(OPERAXNTheme.PADDING['small'], OPERAXNTheme.PADDING['small'] + 3),
                          fill="x", expand=True)
 
     def _on_change(self, value: str) -> None:
@@ -517,7 +519,8 @@ class PlotControls(BaseUIComponent):
             pady=1
         )
         self.settings_btn.pack(side="left",
-                               padx=(OPERAXNTheme.PADDING['medium'] + 2, OPERAXNTheme.PADDING['medium']),
+                               padx=(OPERAXNTheme.PADDING['medium'] + 2,
+                                     OPERAXNTheme.PADDING['medium']),
                                pady=(0, 3))
 
         self._create_echem_controls()
@@ -743,16 +746,20 @@ class PlotControls(BaseUIComponent):
         current_max = self.intensity_max_var.get()
 
         if messagebox.askyesno("Confirm",
-                               f"Apply intensity range {current_min:.4g} - {current_max:.4g} to all scans?",
+                               f"Apply intensity range {current_min:.4g} - {current_max:.4g} "
+                               "to all scans?",
                                parent=self.master):
             self.on_intensity_apply(current_min, current_max)
 
     def update_data_source(self, source_type: DataSourceType) -> None:
         """Update the data source indicator and source-dependent controls."""
         source_map = {
-            DataSourceType.INHOUSE: ("Laboratory X-ray diffraction", OPERAXNTheme.COLORS['text_primary']),
-            DataSourceType.SYNCHROTRON: ("Synchrotron X-ray diffraction", OPERAXNTheme.COLORS['accent_primary']),
-            DataSourceType.NEUTRON: ("Time-of-flight neutron diffraction", OPERAXNTheme.COLORS['danger'])
+            DataSourceType.INHOUSE: ("Laboratory X-ray diffraction",
+                                     OPERAXNTheme.COLORS['text_primary']),
+            DataSourceType.SYNCHROTRON: ("Synchrotron X-ray diffraction",
+                                         OPERAXNTheme.COLORS['accent_primary']),
+            DataSourceType.NEUTRON: ("Time-of-flight neutron diffraction",
+                                     OPERAXNTheme.COLORS['danger'])
         }
         text, color = source_map.get(source_type, ("Unknown", OPERAXNTheme.COLORS['text_primary']))
         self.source_label.config(text=text, fg=color)
@@ -764,7 +771,8 @@ class PlotControls(BaseUIComponent):
             self.intensity_frame.pack(
                 side="right", padx=OPERAXNTheme.PADDING['medium'] + 2)
 
-    def update_intensity_range(self, vmin: float, vmax: float, current_min: float, current_max: float) -> None:
+    def update_intensity_range(self, vmin: float, vmax: float,
+                               current_min: float, current_max: float) -> None:
         """Span the sliders over [vmin, vmax], widened to the current limits, and show those."""
         # The sliders are logarithmic, so every limit they show must be positive
         low = vmin if vmin > 0 else VMIN_FLOOR
@@ -1294,7 +1302,7 @@ class OPERAXN(tk.Frame):
         self._show_message("Success", message, "info")
 
     def _abandon_load(self, title: str, message: str, msg_type: str) -> None:
-        """Drop a failed load's scans, view settings, session file and progress row, then say why."""
+        """Drop a failed load's scans, view settings, session and progress row, then say why."""
         dialogs = self.state.dialog_windows
         self.state.reset()
         self.state.dialog_windows = dialogs
@@ -1530,7 +1538,8 @@ class OPERAXN(tk.Frame):
         for widget in self.plot_container.winfo_children():
             widget.destroy()
 
-    def _create_figure(self, has_oned: bool, has_twod: bool, has_echem: bool, has_neutron: bool) -> None:
+    def _create_figure(self, has_oned: bool, has_twod: bool, has_echem: bool,
+                       has_neutron: bool) -> None:
         """Build figure and axes, embed the Tk canvas, reveal controls."""
         scan_num = self.scan_selector.get_value()
         scan = self.state.scans[scan_num - 1]
@@ -1782,7 +1791,8 @@ class OPERAXN(tk.Frame):
 
         self._update_plots()
         self._show_message("Success",
-                           f"Applied intensity range {current_min:.4g} - {current_max:.4g} to all scans",
+                           f"Applied intensity range {current_min:.4g} - {current_max:.4g} "
+                           "to all scans",
                            "info")
 
     def _lift_existing_dialog(self, attr: str) -> bool:
@@ -2404,7 +2414,8 @@ class OPERAXN(tk.Frame):
 
             base_data["neutron_start"] = scan.get("neutron_start", "")
             base_data["neutron_end"] = scan.get("neutron_end", "")
-            base_data["neutron_timestamp"] = (original_timestamp if self.state.time_method == "absolute"
+            base_data["neutron_timestamp"] = (original_timestamp
+                                              if self.state.time_method == "absolute"
                                               else scan.get("timestamp", ""))
 
             if scan.get("neutron_files"):
@@ -2419,7 +2430,8 @@ class OPERAXN(tk.Frame):
                             base_data["scan ID"] = NeutronFileGrouper.extract_scan_id(
                                 os.path.basename(any_file)) or ""
 
-            base_data["neutron_metadata"] = os.path.basename(scan["neutron_meta"]) if scan.get("neutron_meta") else ""
+            base_data["neutron_metadata"] = (os.path.basename(scan["neutron_meta"])
+                                             if scan.get("neutron_meta") else "")
         else:
             # XRD data
             base_data["oned"] = os.path.basename(scan["oned"]) if scan.get("oned") else ""

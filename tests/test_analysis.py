@@ -1113,6 +1113,17 @@ def test_title_text_keeps_mathtext_and_shows_invalid_math_as_typed():
     fig.canvas.draw()  # the text as typed raises ValueError here
 
 
+def test_title_text_checks_each_line_as_drawn():
+    """A pasted multi-line title is checked line by line, as matplotlib parses it, and draws."""
+    assert title_text("LiNiO$_2$\ncycle 1") == "LiNiO$_2$\ncycle 1"
+    shown = title_text("x$$\n$ cell")
+    assert shown == "x\\$\\$\n\\$ cell", "three $ in all, but the first line is invalid math"
+    fig = Figure()
+    FigureCanvasAgg(fig)
+    fig.add_subplot().set_title(shown)
+    fig.canvas.draw()
+
+
 def _export_title(fig):
     """Return a rendered heatmap figure's map title (the colour bar is its last axes)."""
     return fig.axes[-2].get_title()

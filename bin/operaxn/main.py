@@ -91,7 +91,8 @@ class WindowManager:
     """Shared window positioning and configuration utilities."""
 
     @staticmethod
-    def center_window(window: tk.Misc, width: Optional[int] = None, height: Optional[int] = None) -> None:
+    def center_window(window: tk.Misc, width: Optional[int] = None,
+                      height: Optional[int] = None) -> None:
         """Centre a window on the screen, also setting its size when width is given."""
         window.update_idletasks()
 
@@ -435,7 +436,8 @@ class EnhancedSplashScreen(WindowManager):
         for delay, callback in animations:
             self._schedule_animation(delay, callback)
 
-    def _schedule_animation(self, delay: int, callback: Callable, key: Optional[str] = None) -> None:
+    def _schedule_animation(self, delay: int, callback: Callable,
+                            key: Optional[str] = None) -> None:
         """Queue a callback on the splash window, replacing that step's pending run."""
         key = key or callback.__name__
         if key in self._jobs:

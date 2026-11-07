@@ -69,9 +69,8 @@ def _same_bytes(a, b):
 
 
 def _register_definitions():
-    """Copy definitions/*.nxdl.xml into pynxtools; return False on failure.
-    Repo copies are authoritative and overwrite site-packages when bytes differ;
-    validate_nexus crashes on an unresolvable definition, so callers skip on False."""
+    """Copy definitions/*.nxdl.xml over pynxtools' copies when bytes differ; False on failure.
+    The validator crashes on an unresolvable definition, so callers skip on False."""
     try:
         import pynxtools
         dest = os.path.join(os.path.dirname(pynxtools.__file__),
@@ -91,17 +90,15 @@ def _register_definitions():
 
 
 def pynxtools_verdict(path):
-    """Return validate_nexus stdout+stderr for path, or None when unavailable.
-    None means no CLI, unregistrable definitions or a 300 s timeout. The CLI is
-    sought beside sys.executable first (unactivated venvs), then on PATH."""
-    exe = os.path.join(os.path.dirname(sys.executable),
-                       "validate_nexus.exe" if os.name == "nt" else "validate_nexus")
+    """Return `pynx validate` stdout+stderr for path; None without the CLI or the definitions,
+    or after 300 s. The CLI is sought beside sys.executable first (unactivated venvs), then PATH."""
+    exe = os.path.join(os.path.dirname(sys.executable), "pynx.exe" if os.name == "nt" else "pynx")
     if not os.path.isfile(exe):
-        exe = shutil.which("validate_nexus")
+        exe = shutil.which("pynx")
     if not exe or not _register_definitions():
         return None
     try:
-        result = subprocess.run([exe, path], capture_output=True, text=True,
+        result = subprocess.run([exe, "validate", path], capture_output=True, text=True,
                                 stdin=subprocess.DEVNULL, timeout=300)
     except subprocess.TimeoutExpired:
         return None
@@ -109,7 +106,7 @@ def pynxtools_verdict(path):
 
 
 def assert_pynxtools_valid(path, tag=""):
-    """Assert validate_nexus declares path valid; skip when validation is unavailable.
+    """Assert `pynx validate` declares path valid; skip when validation is unavailable.
     OPERAXN_REQUIRE_VALIDATION=1 (set on every CI leg) turns that skip into a failure."""
     out = pynxtools_verdict(path)
     if out is None:

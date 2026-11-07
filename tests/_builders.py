@@ -31,7 +31,7 @@ LOGBOOK_LINE = ("123456\tuser\tsample title\tMon Feb 05 10:00:00 2024\t"
 
 
 def inhouse_scan_y(i):
-    """Return the intensity array written for 1-based in-house scan number ``i``."""
+    """Return the intensity array written for 1-based in-house scan number `i`."""
     return 100 + 10 * i + np.arange(50, dtype=float)
 
 
@@ -129,7 +129,7 @@ CYCLING_PROTOCOL = {
 
 
 def write_edf_image(path, timestamp, offset=1.0, monitor="0", **header):
-    """Write an 8x8 EDF image with the harvested header fields (``header`` overrides any)."""
+    """Write an 8x8 EDF image with the harvested header fields (`header` overrides any)."""
     import fabio
     img = fabio.edfimage.EdfImage(
         data=np.arange(64, dtype=np.float32).reshape(8, 8) + offset,
@@ -160,10 +160,7 @@ def write_twod_zip(zip_path, workdir):
     """Write a ZIP of write_twod_dir's files, staged under workdir, and return its path."""
     src = os.path.join(str(workdir), "twod_src")
     write_twod_dir(src)
-    with zipfile.ZipFile(zip_path, "w") as z:
-        for name in os.listdir(src):
-            z.write(os.path.join(src, name), name)
-    return str(zip_path)
+    return zip_tree(src, zip_path)
 
 
 def write_detailed_inhouse_dir(dirpath):
@@ -346,7 +343,7 @@ MANTID_IDF = """<?xml version="1.0" encoding="UTF-8" ?>
 
 
 def _mantid_string(group, name, text):
-    """Write ``text`` as Mantid stores strings: a shape-(1,) fixed-length bytes dataset."""
+    """Write `text` as Mantid stores strings: a shape-(1,) fixed-length bytes dataset."""
     raw = text.encode()
     group.create_dataset(name, data=np.array([raw], dtype=f"S{len(raw)}"))
 

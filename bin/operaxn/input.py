@@ -31,7 +31,8 @@ from core import (
 from core import DataSourceType, ScanData, TimeMethod
 from core import is_canonical_nxs, load
 from core import write_standard_echem_group
-from core.nxs_writer import CYCLING_PROTOCOL_FIELDS, replace_when_done  # gui.py imports it from here
+# gui.py imports replace_when_done from here
+from core.nxs_writer import CYCLING_PROTOCOL_FIELDS, replace_when_done
 from core import DataReaderFactory, HDFReader, clear_global_cache
 
 logger = logging.getLogger(__name__)

@@ -176,7 +176,8 @@ class FileProcessor:
         if unused:
             kinds = ", ".join(f"{n} {ext}" for ext, n in sorted(unused.items()))
             n = sum(unused.values())
-            logger.warning(f"{n} files did not belong to any scan and were ignored ({kinds})" if n != 1
+            logger.warning(f"{n} files did not belong to any scan and were ignored ({kinds})"
+                           if n != 1
                            else f"1 file did not belong to any scan and was ignored ({kinds})")
 
         return records
@@ -296,9 +297,10 @@ class FileProcessor:
                         try:
                             extracted_path = archive.extract(member, dest)
                         except Exception as e:
-                            # One member that cannot be written (e.g. past MAX_PATH) costs that file only
+                            # An unwritable member (e.g. past MAX_PATH) costs that file only
                             logger.warning(f"Could not extract {member} from "
-                                           f"{os.path.basename(zip_path)}: {getattr(e, 'strerror', None) or e}")
+                                           f"{os.path.basename(zip_path)}: "
+                                           f"{getattr(e, 'strerror', None) or e}")
                             continue
                         original_path = os.path.join(zip_path, member)
                         extracted.append((extracted_path, original_path))

@@ -1375,7 +1375,7 @@ class UploadOptionsDialog(BaseDialog):
         return from_file
 
     def _update_option_states(self) -> None:
-        """Enable/disable generation-only options; a chosen .nxs locks its source and time method."""
+        """Enable/disable generation-only options; a chosen .nxs locks source and time method."""
         direct_nxs = self._is_direct_nxs()
         # An unrecorded or unknown source or time method stays selectable
         _, _, recorded_source, recorded_method = (self._canonical_cache if direct_nxs

@@ -67,7 +67,7 @@ def _is_logbook_time(text: str) -> bool:
 
 
 def _year_first(text: str) -> bool:
-    """True for a year-first date (2024-02-05, 2024/02/05, 2024.02.05, 2024 02 05, 20240205T1005)."""
+    """True for a year-first date: 2024-02-05, 2024/02/05, 2024.02.05, 2024 02 05, 20240205T1005."""
     return text[:4].isdigit() and (text[4:5] in ("-", "/", ".", " ") or text[4:8].isdigit())
 
 
@@ -736,10 +736,11 @@ class NexusMetadataExtractor:
             if ts_path in h5file:
                 timestamp = self._parse_nexus_timestamp(self._decode_value(h5file[ts_path][()]))
                 try:
-                    pd.to_datetime(timestamp)
+                    if not pd.isna(pd.to_datetime(timestamp)):  # '' and 'nan' read as NaT
+                        return timestamp
                 except (ValueError, TypeError):
-                    continue  # try the next path (end time); untimed only if none reads as a date
-                return timestamp
+                    pass
+                # Try the next path (end time); untimed only if none reads as a date
         return None
 
     def _extract_exposure_time(self, h5file: h5py.File) -> Optional[float]:

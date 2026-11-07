@@ -365,11 +365,12 @@ def _parse_float(text: str) -> Optional[float]:
 def title_text(text: str) -> str:
     """Return a typed figure title, stripped; $...$ that is not valid mathtext is shown as typed."""
     text = str(text).strip()
-    if cbook.is_math_text(text):
-        try:
-            MathTextParser('path').parse(text)
-        except ValueError:
-            return re.sub(r'(?<!\\)\$', r'\\$', text)
+    for line in text.split('\n'):  # matplotlib parses each line on its own
+        if cbook.is_math_text(line):
+            try:
+                MathTextParser('path').parse(line)
+            except ValueError:
+                return re.sub(r'(?<!\\)\$', r'\\$', text)
     return text
 
 
@@ -742,7 +743,7 @@ class HeatmapWindow(tk.Toplevel):
 
     def _apply_exclusions(self) -> None:
         """Re-read the Exclude entry and reload the rows when it changed.
-        Text that is no scan list keeps the previous exclusions and their text; blank clears them."""
+        Text naming no scan keeps the previous exclusions and their text; blank clears them."""
         text = self.exclude_var.get()
         excluded = set(parse_scan_range(text, self._max_scan))
         if text.strip() and not excluded:

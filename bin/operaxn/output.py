@@ -281,7 +281,6 @@ class BasePlotter(ABC):
     def __init__(self) -> None:
         self.formatter = PlotFormatter()
         self.transformer = DataTransformer()
-        self.cache_enabled = CACHE_ENABLED
         self._line_width = LINE_WIDTH
 
     @abstractmethod
@@ -382,7 +381,8 @@ class NeutronPlotter(BasePlotter):
         ax.plot(data['x'], data['y'], linewidth=self._line_width, color='blue')
 
         x_lim = self._get_axis_limits(data['x'], config.neutron_xmin, config.neutron_xmax)
-        y_lim = self._get_axis_limits(data['y'], config.neutron_ymin, config.neutron_ymax, is_y=True)
+        y_lim = self._get_axis_limits(data['y'], config.neutron_ymin, config.neutron_ymax,
+                                      is_y=True)
 
         self.formatter.format_axis(
             ax, xlabel=xlabel, ylabel="Intensity [arb. units]",
@@ -569,7 +569,8 @@ class TwoDPlotter(BasePlotter):
         return image_data[y_min_idx:y_max_idx, x_min_idx:x_max_idx]
 
     def _calculate_intensity_limits(self, image_data: np.ndarray,
-                                    intensity_limits: Optional[Tuple[float, float]]) -> Tuple[float, float]:
+                                    intensity_limits: Optional[Tuple[float, float]]
+                                    ) -> Tuple[float, float]:
         """Return (vmin, vmax) from valid given limits or the data, floored for LogNorm."""
         if intensity_limits and intensity_limits[0] < intensity_limits[1]:
             vmin, vmax = intensity_limits
@@ -875,7 +876,8 @@ class FigureLayoutManager:
     def create_layout(self, has_oned: bool, has_twod: bool, has_echem: bool,
                       has_neutron: bool = False, figure_dpi: int = FIGURE_DPI,
                       scan_num: int = 1, echem_value: Optional[float] = None,
-                      current_value: Optional[float] = None) -> Tuple[plt.Figure, Dict[str, plt.Axes]]:
+                      current_value: Optional[float] = None
+                      ) -> Tuple[plt.Figure, Dict[str, plt.Axes]]:
         """Build figure and axes dict for the available data types."""
         plt.rcParams["figure.autolayout"] = False
 
@@ -917,7 +919,8 @@ class FigureLayoutManager:
             return LayoutType.EMPTY
 
     def _create_figure_for_layout(self, layout_type: LayoutType,
-                                  dpi: int, has_echem: bool = False) -> Tuple[plt.Figure, Dict[str, plt.Axes]]:
+                                  dpi: int, has_echem: bool = False
+                                  ) -> Tuple[plt.Figure, Dict[str, plt.Axes]]:
         """Instantiate figure and subplot axes for the given layout type."""
         config = self.LAYOUT_CONFIGS[layout_type]
         fig = plt.figure(figsize=config.figure_size, dpi=dpi)
@@ -1042,7 +1045,8 @@ def create_figure_layout(has_oned: bool, has_twod: bool, has_echem: bool,
                          figure_dpi: int = FIGURE_DPI,
                          scan_num: int = 1,
                          echem_value: Optional[float] = None,
-                         current_value: Optional[float] = None) -> Tuple[plt.Figure, Dict[str, plt.Axes]]:
+                         current_value: Optional[float] = None
+                         ) -> Tuple[plt.Figure, Dict[str, plt.Axes]]:
     """Create figure and axes dict sized for the available data types."""
     fig, axes = _layout_manager.create_layout(
         has_oned, has_twod, has_echem, has_neutron,

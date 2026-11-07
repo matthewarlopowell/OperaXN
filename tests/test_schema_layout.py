@@ -179,6 +179,20 @@ def test_monopd_image_only_scans(tmp_path):
     assert_pynxtools_valid(out, "image-only")
 
 
+@needs_fabio
+def test_image_source_path_normalised(tmp_path):
+    """A forward-slash source folder (the Windows file dialog's form) records a normalised path."""
+    src = str(tmp_path / "twod_slash")
+    _builders.write_twod_dir(src)
+    nxs = str(tmp_path / "twod_slash.nxs")
+    ok, msgs = core.generate([src.replace(os.sep, "/")], nxs,
+                             core.DataSourceType.INHOUSE)
+    assert ok, msgs
+    with h5py.File(nxs) as f:
+        name = s(f["entry/scan_000001/image_source/file_name"])
+        assert name == os.path.normpath(name), name
+
+
 def test_tofnpd_entry_and_scan(neutron_nxs):
     """The entry declares NXoperando_tofnpd, scan windows come from the logbook, nothing repeats."""
     with h5py.File(neutron_nxs) as f:
@@ -242,6 +256,23 @@ def test_tofnpd_banks_without_mantid_header(tmp_path):
         assert "monitor" not in f["entry"], "unprofiled instrument must write no monitor"
         assert "detector" not in f["entry/instrument"], "empty detector group written"
     assert_pynxtools_valid(out, "neutron without Mantid header")
+
+
+def test_tofnpd_unreadable_bank_leaves_no_shell(tmp_path):
+    """An unreadable bank file leaves no data-less NXdata shell, and the other banks are intact."""
+    src = str(tmp_path / "neutron_bad_bank")
+    _builders.write_neutron_dir(src)
+    with open(os.path.join(src, "123456-2-0.dat"), "w") as f:
+        f.write("# Time-of-flight Y E\nnot numbers at all\n")
+    nxs = str(tmp_path / "bad_bank.nxs")
+    ok, msgs = core.generate([src], nxs, core.DataSourceType.NEUTRON)
+    assert ok, msgs
+    with h5py.File(nxs) as f:
+        s1 = f["entry/scan_000001"]
+        assert "bank_2" not in s1, "empty NXdata shell left for an unreadable bank"
+        assert "bank_2_d" in s1 and "bank_1" in s1 and "bank_1_d" in s1
+        assert s1["bank_2_d"].attrs.get("signal") == "data"
+    assert_pynxtools_valid(nxs, "unreadable bank")
 
 
 @pytest.mark.parametrize("fixture", ["inhouse_nxs", "neutron_nxs"])
@@ -414,37 +445,6 @@ def test_monopd_image_member_order(tmp_path):
             expected = [n for n in IMAGE_SOURCE_ORDER
                         if embed or n != "original_shape"]
             assert _members(sub["image_source"]) == expected
-
-
-def test_tofnpd_unreadable_bank_leaves_no_shell(tmp_path):
-    """An unreadable bank file leaves no data-less NXdata shell, and the other banks are intact."""
-    src = str(tmp_path / "neutron_bad_bank")
-    _builders.write_neutron_dir(src)
-    with open(os.path.join(src, "123456-2-0.dat"), "w") as f:
-        f.write("# Time-of-flight Y E\nnot numbers at all\n")
-    nxs = str(tmp_path / "bad_bank.nxs")
-    ok, msgs = core.generate([src], nxs, core.DataSourceType.NEUTRON)
-    assert ok, msgs
-    with h5py.File(nxs) as f:
-        s1 = f["entry/scan_000001"]
-        assert "bank_2" not in s1, "empty NXdata shell left for an unreadable bank"
-        assert "bank_2_d" in s1 and "bank_1" in s1 and "bank_1_d" in s1
-        assert s1["bank_2_d"].attrs.get("signal") == "data"
-    assert_pynxtools_valid(nxs, "unreadable bank")
-
-
-@needs_fabio
-def test_image_source_path_normalised(tmp_path):
-    """A forward-slash source folder (the Windows file dialog's form) records a normalised path."""
-    src = str(tmp_path / "twod_slash")
-    _builders.write_twod_dir(src)
-    nxs = str(tmp_path / "twod_slash.nxs")
-    ok, msgs = core.generate([src.replace(os.sep, "/")], nxs,
-                             core.DataSourceType.INHOUSE)
-    assert ok, msgs
-    with h5py.File(nxs) as f:
-        name = s(f["entry/scan_000001/image_source/file_name"])
-        assert name == os.path.normpath(name), name
 
 
 @needs_fabio

@@ -434,7 +434,7 @@ class NXSWriter:
         logger.info(f"NeXus file written to {output_path}")
 
     def _harvest_experiment_metadata(self, scans: List[Scan]) -> Dict[str, Any]:
-        """Harvest each source from the first scan that has it, merged over the instrument profile."""
+        """Harvest each source from the first scan with it, merged over the instrument profile."""
         harvested: Dict[str, Any] = {}
 
         # Laboratory: EDF header of the first 2D file
@@ -491,15 +491,15 @@ class NXSWriter:
                  or 'operando diffraction experiment')
         entry.create_dataset('title', data=str(title))
 
-        # The entry window spans every acquisition it holds: earliest
-        # subentry start to latest subentry end (see _scan_window).
+        # The entry window spans every acquisition it holds: earliest subentry
+        # start to latest subentry start or end (a scan may have no end, see _scan_window).
         windows = [_scan_window(s) for s in scans]
         starts = [w[0] for w in windows if w[0]]
         ends = [w[1] for w in windows if w[1] is not None]
         if starts:
             start = min(starts, key=_ts_sort_key)
             entry.create_dataset('start_time', data=_iso(start) or str(start))
-            end = max(ends, key=_ts_sort_key) if ends else max(starts, key=_ts_sort_key)
+            end = max(ends + starts, key=_ts_sort_key)
             entry.create_dataset('end_time', data=_iso(end) or str(end))
 
         definition = ('NXoperando_tofnpd'
@@ -985,7 +985,11 @@ class NXSWriter:
             parse_path, display_path = item if isinstance(item, tuple) else (item, item)
             name = os.path.basename(display_path)
             if parse_path.lower().endswith(('.xlsx', '.csv')):
-                continue  # conversion failed, already logged
+                # A generate pair holding a table is a failed conversion, already logged
+                if not isinstance(item, tuple):
+                    logger.warning(f"Standard electrochemistry file {name} is not converted"
+                                   f" to text; skipped")
+                continue
             if not os.path.isfile(parse_path):
                 logger.warning(f"Standard electrochemistry file {name} not found; skipped")
                 continue

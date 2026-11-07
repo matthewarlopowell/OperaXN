@@ -288,7 +288,8 @@ class EchemParser:
         column = f"Echem current column '{label}'" + (f" in {name}" if name else "")
         scale = _current_scale(label)
         if scale is None:
-            logger.warning(f"{column} has no recognised unit (A, mA, uA, nA, pA); values read as mA")
+            logger.warning(f"{column} has no recognised unit (A, mA, uA, nA, pA); "
+                           "values read as mA")
             return 1.0
         if scale != 1.0:
             logger.info(f"{column} converted to mA (x{scale:g})")
@@ -377,8 +378,8 @@ class EchemParser:
                            "with the wrong pass")
         early = sum(1 for row in data if row["timestamp"].year < 1900)
         if early:
-            logger.warning(f"{name}: {early} echem row{'s' if early != 1 else ''} dated before 1900 "
-                           f"(placeholders?) {'were' if early != 1 else 'was'} skipped")
+            logger.warning(f"{name}: {early} echem row{'s' if early != 1 else ''} dated before "
+                           f"1900 (placeholders?) {'were' if early != 1 else 'was'} skipped")
             data = [row for row in data if row["timestamp"].year >= 1900]
         return data
 
@@ -684,7 +685,8 @@ class ScanProcessor:
                     adjusted_ts = original_ts + pd.Timedelta(seconds=exposure_time / 2)
                     scan.timestamp_for_correlation = adjusted_ts
                 else:
-                    scan.timestamp_for_correlation = pd.to_datetime(scan.timestamp) if scan.timestamp else None
+                    scan.timestamp_for_correlation = (pd.to_datetime(scan.timestamp)
+                                                      if scan.timestamp else None)
 
     def _determine_exposure_time(self, scan: Scan) -> Optional[float]:
         """Return the exposure time in seconds (neutron: the logbook run length), or None.
@@ -729,7 +731,8 @@ class ScanProcessor:
                 scan.echem_timestamp = None
                 continue
 
-            scan_relative_seconds = (scan.timestamp_for_correlation - reference_time).total_seconds()
+            scan_relative_seconds = (scan.timestamp_for_correlation -
+                                     reference_time).total_seconds()
 
             time_diffs = np.abs(echem_relative_seconds.values - scan_relative_seconds)
             nearest_idx = int(np.argmin(time_diffs))
@@ -747,7 +750,7 @@ class ScanProcessor:
 
     @staticmethod
     def _parse_echem_timestamps(echem_df: pd.DataFrame) -> Optional[pd.Series]:
-        """Return the echem timestamps as datetime64; None, logged, when no one unit holds them all."""
+        """Return the echem timestamps as datetime64; None (logged) when they cannot be parsed."""
         try:
             return pd.to_datetime(echem_df["timestamp"])
         except (ValueError, TypeError):
