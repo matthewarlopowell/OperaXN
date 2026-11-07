@@ -1,4 +1,4 @@
-"""Assertion and skip helpers shared by the test suite.
+"""Assertion, skip and Tk event-loop helpers shared by the test suite.
 
 The writer stamps timestamps with the generating machine's local UTC
 offset; the reader returns naive local wall time. Assertions therefore
@@ -12,7 +12,7 @@ import sys
 import pandas as pd
 import pytest
 
-import core
+from operaxn import core
 
 
 def need_dataset(relpath):
@@ -116,3 +116,38 @@ def assert_pynxtools_valid(path, tag=""):
         pytest.skip("pynxtools validation unavailable")
     tail = out.strip().splitlines()[-1] if out.strip() else "no output"
     assert "is valid" in out, (f"{tag}: {tail}" if tag else tail)
+
+
+def modules_after(statement):
+    """Run `statement` in a fresh interpreter on this tree; return the names in its sys.modules."""
+    package_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(core.__file__))))
+    path = os.pathsep.join(filter(None, [package_root, os.environ.get("PYTHONPATH")]))
+    code = f"{statement}; import sys; print(' '.join(sys.modules))"
+    run = subprocess.run([sys.executable, "-c", code], env=dict(os.environ, PYTHONPATH=path),
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    return run.stdout.split()
+
+
+def pump(widget, ms):
+    """Run the Tk event loop for ms milliseconds, blocking the caller."""
+    widget.after(ms, widget.setvar, "pump_done", 1)
+    widget.wait_variable("pump_done")
+
+
+def pending_after_ids(root):
+    """Return the ids of the Tk timers still queued."""
+    return set(root.tk.splitlist(root.tk.call("after", "info")))
+
+
+def background_errors(root, run):
+    """Run run(), pump the event loop for 400 ms and return the Tcl background errors raised."""
+    errors = []
+    previous = root.tk.call("interp", "bgerror", "")
+    root.tk.call("interp", "bgerror", "", root.register(lambda *args: errors.append(args)))
+    try:
+        run()
+        pump(root, 400)
+    finally:
+        root.tk.call("interp", "bgerror", "", previous)
+    return errors

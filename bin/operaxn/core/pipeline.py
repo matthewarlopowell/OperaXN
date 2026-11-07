@@ -79,7 +79,7 @@ def convert_tabular_to_txt(path: str, dest_dir: Optional[str] = None) -> str:
         logger.info(f"Converted {os.path.basename(path)} to txt format")
         return txt_path
     except Exception as e:
-        logger.error(f"Error converting tabular file {path}: {e}")
+        logger.error(f"Error converting tabular file {os.path.basename(path)}: {e}")
         if txt_path is not None:
             try:
                 os.remove(txt_path)
@@ -146,7 +146,8 @@ class FileProcessor:
         if self.data_source == DataSourceType.NEUTRON:
             records = self._process_neutron_files(all_files)
         elif self.data_source == DataSourceType.SYNCHROTRON:
-            synchrotron_groups = self.synchrotron_grouper.group_files(dict(all_files))
+            synchrotron_groups = self.synchrotron_grouper.group_files(
+                [path for path, _ in all_files])
             records = self._process_synchrotron_groups(synchrotron_groups)
         else:
             records = []
@@ -169,16 +170,18 @@ class FileProcessor:
 
         # Files no record took (e.g. .xy without its scan .nxs) are reported, not lost silently;
         # an .xlsx/.csv left here failed conversion, which already named it
-        unused = Counter(ext for ext in (os.path.splitext(path)[1].lower()
-                                         for path, _ in all_files
-                                         if path not in self.processed_files)
-                         if ext not in (FileType.XLSX.value, FileType.CSV.value))
+        unused = [(os.path.splitext(path)[1].lower(), os.path.basename(original))
+                  for path, original in all_files if path not in self.processed_files]
+        unused = [(ext, name) for ext, name in unused
+                  if ext not in (FileType.XLSX.value, FileType.CSV.value)]
         if unused:
-            kinds = ", ".join(f"{n} {ext}" for ext, n in sorted(unused.items()))
-            n = sum(unused.values())
-            logger.warning(f"{n} files did not belong to any scan and were ignored ({kinds})"
-                           if n != 1
-                           else f"1 file did not belong to any scan and was ignored ({kinds})")
+            counts = Counter(ext for ext, _ in unused)
+            kinds = ", ".join(f"{n} {ext}" for ext, n in sorted(counts.items()))
+            names = [name for _, name in unused]
+            logger.warning(f"{len(names)} files did not belong to any scan and were ignored "
+                           f"({kinds}): {name_list(names)}" if len(names) != 1 else
+                           f"1 file did not belong to any scan and was ignored ({kinds}): "
+                           f"{names[0]}")
 
         return records
 
@@ -291,15 +294,14 @@ class FileProcessor:
                         # Validate path to prevent ZIP Slip (path traversal)
                         target = os.path.realpath(os.path.join(dest, member))
                         if not target.startswith(os.path.realpath(dest) + os.sep):
-                            logger.warning(f"Skipping ZIP entry with invalid path: {member} "
-                                           f"in {os.path.basename(zip_path)}")
+                            logger.warning(f"Skipping {member} in {os.path.basename(zip_path)}: "
+                                           "path leads outside the archive")
                             continue
                         try:
                             extracted_path = archive.extract(member, dest)
                         except Exception as e:
                             # An unwritable member (e.g. past MAX_PATH) costs that file only
-                            logger.warning(f"Could not extract {member} from "
-                                           f"{os.path.basename(zip_path)}: "
+                            logger.warning(f"Skipping {member} in {os.path.basename(zip_path)}: "
                                            f"{getattr(e, 'strerror', None) or e}")
                             continue
                         original_path = os.path.join(zip_path, member)
@@ -363,6 +365,10 @@ class FileProcessor:
             return None
 
         metadata = self.nexus_extractor.extract(nxs_path) or {}
+        # An unreadable .nxs is named once, by its ERROR line; its .xy/.hdf go with it
+        if nxs_path in self.nexus_extractor.reported:
+            self.processed_files.update(file_group.values())
+            return None
 
         return FileRecord(
             path=nxs_path,
@@ -436,11 +442,12 @@ def process_raw(input_paths: List[str],
                 data_source: DataSourceType = DataSourceType.INHOUSE,
                 progress_callback: ProgressCallback = None,
                 time_method: TimeMethod = TimeMethod.ABSOLUTE,
-                echem_time_tolerance: float = ECHEM_TIME_TOLERANCE
+                echem_time_tolerance: float = ECHEM_TIME_TOLERANCE,
+                cancel: Optional[threading.Event] = None
                 ) -> Tuple[List[Scan], pd.DataFrame]:
     """Collect, classify and correlate raw data; timestamps stay absolute whatever `time_method`.
     ZIP-extracted files the scans point to are deleted on return; use `generate` for the data."""
-    with FileProcessor(data_source) as processor:
+    with FileProcessor(data_source, cancel) as processor:
         return _run_pipeline(processor, input_paths, data_source,
                              progress_callback, time_method,
                              echem_time_tolerance)
@@ -568,7 +575,7 @@ def _persist_zip_twod_sources(scans: List[Scan], output_path: str,
     return None
 
 
-def validate(scans: List[Scan], echem_df: pd.DataFrame) -> List[str]:
+def check_scans(scans: List[Scan], echem_df: pd.DataFrame) -> List[str]:
     """Return validation messages; entries starting with 'Warning' are non-fatal."""
     errors: List[str] = []
 
@@ -617,7 +624,7 @@ def generate(input_paths: List[str],
                                             progress_callback, time_method,
                                             echem_time_tolerance)
 
-            messages = validate(scans, echem_df)
+            messages = check_scans(scans, echem_df)
             fatal = [m for m in messages if not m.startswith("Warning")]
             if fatal:
                 return False, messages
@@ -638,7 +645,7 @@ def generate(input_paths: List[str],
             writer = NXSWriter(data_source,
                                include_2d_images=include_2d_images,
                                max_display_size=max_display_size,
-                               correlation_method=time_method.value,
+                               time_method=time_method,
                                title=title,
                                sample_name=sample_name,
                                sample_description=sample_description,

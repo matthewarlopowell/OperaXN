@@ -7,7 +7,7 @@ import h5py
 import numpy as np
 import pytest
 
-import core
+from operaxn import core
 
 import _builders
 from _helpers import s, wall, tz_aware, assert_pynxtools_valid, needs_fabio
@@ -619,7 +619,7 @@ def test_unreadable_date_skips_only_that_file(tmp_path, caplog, bad_side, bad_fi
     _builders.write_dated_pairs(src, bad if bad_side == "dat" else _builders.SCAN_TIMES,
                                 bad if bad_side == "edf" else _builders.SCAN_TIMES)
     out = str(tmp_path / "skip.nxs")
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
     assert ok, str(msgs)
     named = [r.getMessage() for r in caplog.records if bad_file in r.getMessage()]

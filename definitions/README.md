@@ -144,8 +144,8 @@ Reduced data files carry no instrument geometry, so the NXtofnpd fields
 that describe it (`pre_sample_flightpath`, the per-bank `detector_number` /
 `distance` / `polar_angle` / `azimuthal_angle` arrays) and the beam monitor
 record (`monitor/mode` and the per-element monitor geometry arrays) come from a
-per-instrument profile (`INSTRUMENT_PROFILES` in `bin/core/config.py`), selected by the instrument
-name harvested from the Mantid `.dat` headers. Harvested values always win
+per-instrument profile (`INSTRUMENT_PROFILES` in `bin/operaxn/core/config.py`), selected by the
+instrument name harvested from the Mantid `.dat` headers. Harvested values always win
 over profile values; a profile only fills what the source files cannot.
 Each profile entry records in a comment where its numbers come from.
 

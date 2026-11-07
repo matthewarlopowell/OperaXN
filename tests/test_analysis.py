@@ -1,15 +1,22 @@
-"""Echem analysis: capacity/ICI/heatmap maths, GUI wiring and plot-cache staleness."""
+"""Echem analysis windows: Capacity, ICI and heatmap maths, their windows and main-window wiring."""
+import builtins
+import gc
+import glob
 import inspect
 import os
 import re
 import warnings
+import weakref
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
+from matplotlib import cm
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+from matplotlib.legend import Legend
+from matplotlib.patches import Polygon, Rectangle
 from matplotlib.text import Text
 
 pytestmark = pytest.mark.gui
@@ -18,14 +25,19 @@ tk = pytest.importorskip("tkinter")
 from tkinter import filedialog, messagebox  # noqa: E402
 
 import operaxn
+import operaxn.capacity as capacity_module
+import operaxn.config as cfg
+import operaxn.dialog as dialog_module
 import operaxn.gui as gui_module
-import operaxn.output as output_module
+import operaxn.heatmap as heatmap_module
+import operaxn.ici as ici_module
+from operaxn import core
 from operaxn.capacity import (
     _assign_time, assign_cycles, compute_capacity,
     plot_capacity_vs_voltage, plot_time_vs_voltage, CapacityWindow,
 )
 from operaxn.dialog import parse_scan_range
-from operaxn.gui import ButtonPanel, FileListPanel, OPERAXN
+from operaxn.gui import OPERAXN
 from operaxn.heatmap import (
     NEUTRON_AXES, XRD_AXES,
     HeatmapWindow, build_xrd_matrix, cell_edges, colormap_name, correlated_rows,
@@ -35,14 +47,23 @@ from operaxn.heatmap import (
 )
 from operaxn.ici import (
     ICIWindow, PLOT_BG, _RKAxisBar, _SelectorStrip, _compute_all_pulses, _compute_fit,
-    _detect_pulses, _style_ax,
+    _detect_pulses, _style_ax, embed_figure, watch_figure_sync,
 )
 from operaxn.input import get_standard_echem
-from operaxn.output import OneDPlotter, PlotConfig
+
+from _helpers import background_errors, pending_after_ids, pump
 
 R_TRUE, K_TRUE, I_MA = 50.0, 5.0, 2.0
 I_A = I_MA / 1000.0
 V0 = 3.8
+
+
+@pytest.fixture(autouse=True)
+def _clean_plot_cache():
+    """Clear the id(ax)-keyed plot cache around each test, as test axes are freed constantly."""
+    operaxn.clear_plot_cache()
+    yield
+    operaxn.clear_plot_cache()
 
 
 def build_cycling_df(n_cycles=2, active_s=10, rest_s=5):
@@ -176,7 +197,6 @@ def test_capacity_plots_draw_one_labelled_line_set_per_cycle():
 ])
 def test_capacity_legend_names_the_ends_past_ten_cycles(n_cycles, expected):
     """Up to ten cycles every cycle is named; past that only the first and last, all still drawn."""
-    from matplotlib import cm
     df = build_cycling_df(n_cycles=n_cycles)
     fig = Figure()
     ax_time, ax_cap = fig.subplots(1, 2)
@@ -341,8 +361,6 @@ def test_build_xrd_matrix_interpolates_a_descending_grid():
 
 def test_axis_labels_come_from_one_set():
     """Every window takes its TOF, d-spacing, 2θ and time labels from operaxn.config."""
-    import glob
-    import operaxn.config as cfg
     assert (cfg.TOF_LABEL, cfg.DSPACING_LABEL, cfg.TWOTHETA_LABEL, cfg.TIME_HOURS_LABEL) == (
         "Time of flight [μs]", "$d$-spacing [Å]", r"2$\theta$ [°]", "Time [h]")
     assert (cfg.TOF_TEXT, cfg.DSPACING_TEXT) == ("Time of flight (μs)", "d-spacing (Å)")
@@ -357,7 +375,6 @@ def test_axis_labels_come_from_one_set():
 
 def test_figure_text_puts_units_in_square_brackets():
     """Main-window panes, the heatmap export and Capacity write [units] and an italic θ."""
-    import operaxn.config as cfg
     t = np.linspace(0.0, 7200.0, 50)
     d = np.linspace(1.0, 5.0, 40)
     bank = {"tof": {"x": d * 5000.0, "y": d}, "d": {"x": d, "y": d}}
@@ -450,37 +467,24 @@ def test_echem_scan_curve_retains_full_resolution():
         and np.all(np.diff(curve_y) >= 0)
 
 
-def test_button_panel_configuration():
-    """Analysis and export buttons exist, analysis first, with plain-text labels."""
-    button_keys = [key for key, _, _, _ in ButtonPanel.BUTTON_CONFIGS]
-    assert "capacity_plot" in button_keys
-    assert "ici_analysis" in button_keys
-    assert "heatmap" in button_keys
-    assert "export_nxs" in button_keys
-    assert button_keys.index("capacity_plot") < button_keys.index("export_plots") \
-        and button_keys.index("ici_analysis") < button_keys.index("export_plots")
-    # An emoji costs seconds of Windows font lookup on the first button that shows one
-    assert all(text.isascii() for _, text, _, _ in ButtonPanel.BUTTON_CONFIGS)
-
-
-def test_app_handlers_exist():
-    """OPERAXN exposes the analysis, echem and export handlers its buttons rely on."""
-    handlers = ("_open_capacity_window", "_open_ici_window", "_append_standard_echem_async",
-                "_echem_sources", "_has_analysis_current", "_open_heatmap",
-                "_choose_additional_echem", "_export_nxs")
-    missing = [name for name in handlers if not callable(getattr(OPERAXN, name, None))]
-    assert missing == [], missing
-
-
-def test_standard_echem_accessor_and_package_export():
-    """get_standard_echem returns a list and ICIWindow is exported from the package."""
+def test_standard_echem_accessor_returns_a_list():
+    """get_standard_echem returns a list."""
     assert isinstance(get_standard_echem(), list)
-    assert hasattr(operaxn, "ICIWindow")
 
 
-def test_source_switches_wait_for_dropdown_close():
-    """Capacity's source switch is deferred through after_idle, so the dropdown closes first."""
-    assert "after_idle" in inspect.getsource(CapacityWindow._queue_source_change)
+@pytest.mark.display
+def test_capacity_source_switch_waits_for_the_dropdown_to_close(tk_root, monkeypatch):
+    """Picking a Capacity source swaps the dataset only once the dropdown has closed."""
+    monkeypatch.setattr(capacity_module, "maximise_window", lambda win: win.withdraw())
+    other = build_cycling_df(n_cycles=3)
+    win = CapacityWindow(tk_root, {"operando": build_cycling_df(), "other": other})
+    try:
+        win._queue_source_change("other")
+        assert win._df is not other, "the swap must wait for the dropdown to close"
+        win.update()
+        assert win._df is other and win._available == [1, 2, 3]
+    finally:
+        win.destroy()
 
 
 def _ici_df(n_cycles=1, pulses=3, rest_step=1.0, spread=0.0):
@@ -525,15 +529,14 @@ def _ici_stand_in(df, fitted=False):
 
 def _open_ici(tk_root, monkeypatch, sources, fitted=False):
     """Open a withdrawn ICI window past its first draw; fitted gives every pulse a 1-11 s window."""
-    import operaxn.ici as ici_module
     monkeypatch.setattr(ici_module, "maximise_window", lambda win: win.withdraw())
     win = ICIWindow(tk_root, echem_sources=sources)
-    _pump(win, 300)
+    pump(win, 300)
     if fitted:
         win.reg_bar.start_var.set(1.0)
         win.reg_bar.length_var.set(10.0)
         win._on_apply_all()
-        _pump(win, 300)
+        pump(win, 300)
     return win
 
 
@@ -547,14 +550,12 @@ def test_pulse_legend_moves_with_the_phase():
         ICIWindow._plot_pulse_zoom(fake, 1, 1, phase)
         legend = fake.ax_pulse.get_legend() or fake._ax_pulse_twin.get_legend()
         locs[phase] = legend._loc
-    from matplotlib.legend import Legend
     assert locs == {"charge": Legend.codes["lower center"],
                     "discharge": Legend.codes["upper center"]}, locs
 
 
 def test_ici_fit_plot_adds_no_twin_axis_or_span():
     """The ICI fit plot draws on its two panels only: no top time axis, no shaded span."""
-    from matplotlib.patches import Polygon, Rectangle
     fake = _ici_stand_in(_ici_df())
     fake._r1_phase_overrides["charge"] = (1.0, 10.0)  # a window the 1 Hz rests can fill
     fig = Figure()
@@ -568,12 +569,11 @@ def test_ici_fit_plot_adds_no_twin_axis_or_span():
 
 def test_ici_export_with_a_locked_file_replaces_neither(tmp_path, monkeypatch):
     """A discharge file held open elsewhere fails the export before either file is replaced."""
-    import operaxn.ici as ici
     errors = []
-    monkeypatch.setattr(ici.filedialog, "askdirectory", lambda **k: str(tmp_path))
-    monkeypatch.setattr(ici.messagebox, "askyesno", lambda *a, **k: True)
-    monkeypatch.setattr(ici.messagebox, "showinfo", lambda *a, **k: None)
-    monkeypatch.setattr(ici.messagebox, "showerror", lambda *a, **k: errors.append(a))
+    monkeypatch.setattr(ici_module.filedialog, "askdirectory", lambda **k: str(tmp_path))
+    monkeypatch.setattr(ici_module.messagebox, "askyesno", lambda *a, **k: True)
+    monkeypatch.setattr(ici_module.messagebox, "showinfo", lambda *a, **k: None)
+    monkeypatch.setattr(ici_module.messagebox, "showerror", lambda *a, **k: errors.append(a))
     for phase in ("charge", "discharge"):
         (tmp_path / f"cell_ici_{phase}.csv").write_text("old\n")
     real_open, real_to_csv = open, pd.DataFrame.to_csv
@@ -590,9 +590,9 @@ def test_ici_export_with_a_locked_file_replaces_neither(tmp_path, monkeypatch):
         refuse_locked(path)
         return real_to_csv(self, path, *a, **k)
 
-    monkeypatch.setattr(ici, "open", locked_open, raising=False)
+    monkeypatch.setattr(ici_module, "open", locked_open, raising=False)
     monkeypatch.setattr(pd.DataFrame, "to_csv", locked_to_csv)
-    ici.ICIWindow._export_csv(_ici_stand_in(_ici_df(), fitted=True))
+    ici_module.ICIWindow._export_csv(_ici_stand_in(_ici_df(), fitted=True))
     assert errors == [("Export failed",
                        "ICI results could not be exported: file is open in Excel")], errors
     assert (tmp_path / "cell_ici_charge.csv").read_text() == "old\n", "the charge file was replaced"
@@ -600,46 +600,44 @@ def test_ici_export_with_a_locked_file_replaces_neither(tmp_path, monkeypatch):
 
 def test_ici_export_refuses_when_no_pulse_is_fitted(tmp_path, monkeypatch):
     """With no fitted pulse (here no rests) Export CSV warns and writes nothing, like Capacity."""
-    import operaxn.ici as ici
     shown = []
-    monkeypatch.setattr(ici.filedialog, "askdirectory",
+    monkeypatch.setattr(ici_module.filedialog, "askdirectory",
                         lambda **k: shown.append("folder asked") or str(tmp_path))
-    monkeypatch.setattr(ici.messagebox, "showwarning", lambda *a, **k: shown.append(a))
-    monkeypatch.setattr(ici.messagebox, "showinfo", lambda *a, **k: shown.append(a))
+    monkeypatch.setattr(ici_module.messagebox, "showwarning", lambda *a, **k: shown.append(a))
+    monkeypatch.setattr(ici_module.messagebox, "showinfo", lambda *a, **k: shown.append(a))
     charge_only = pd.DataFrame({
         "timestamp": pd.Timestamp("2026-01-01") + pd.to_timedelta(range(60), unit="s"),
         "echem_data": np.linspace(3.0, 4.0, 60), "current": [1.0] * 60})
-    ici.ICIWindow._export_csv(_ici_stand_in(charge_only))
+    ici_module.ICIWindow._export_csv(_ici_stand_in(charge_only))
     assert shown == [("No data", "No fitted pulses to export")], shown
     assert list(tmp_path.iterdir()) == []
 
 
 def test_ici_export_asks_before_replacing_the_pair(tmp_path, monkeypatch):
     """A second export into the same folder asks once, naming both files; No leaves them alone."""
-    import operaxn.ici as ici
     asked, shown = [], []
-    monkeypatch.setattr(ici.filedialog, "askdirectory", lambda **k: str(tmp_path))
-    monkeypatch.setattr(ici.messagebox, "askyesno", lambda *a, **k: asked.append(a) and False)
-    monkeypatch.setattr(ici.messagebox, "showinfo", lambda *a, **k: shown.append(a))
+    monkeypatch.setattr(ici_module.filedialog, "askdirectory", lambda **k: str(tmp_path))
+    monkeypatch.setattr(ici_module.messagebox, "askyesno",
+                        lambda *a, **k: asked.append(a) and False)
+    monkeypatch.setattr(ici_module.messagebox, "showinfo", lambda *a, **k: shown.append(a))
     fake = _ici_stand_in(_ici_df(), fitted=True)
-    ici.ICIWindow._export_csv(fake)
+    ici_module.ICIWindow._export_csv(fake)
     paths = [str(tmp_path / f"cell_ici_{phase}.csv") for phase in ("charge", "discharge")]
     assert asked == [], asked
     assert shown == [("Export complete", "ICI results exported to:\n" + "\n".join(paths))], shown
     for path in paths:
         with open(path, "w") as fh:
             fh.write("kept\n")
-    ici.ICIWindow._export_csv(fake)
+    ici_module.ICIWindow._export_csv(fake)
     assert asked == [("Confirm", "Replace cell_ici_charge.csv and cell_ici_discharge.csv?")], asked
     assert len(shown) == 1 and all(open(path).read() == "kept\n" for path in paths)
 
 
 def _export_ici_csv(fake, tmp_path, monkeypatch):
     """Run ICIWindow's export on a stand-in into tmp_path; return the charge, discharge tables."""
-    import operaxn.ici as ici
-    monkeypatch.setattr(ici.filedialog, "askdirectory", lambda **k: str(tmp_path))
-    monkeypatch.setattr(ici.messagebox, "showinfo", lambda *a, **k: None)
-    ici.ICIWindow._export_csv(fake)
+    monkeypatch.setattr(ici_module.filedialog, "askdirectory", lambda **k: str(tmp_path))
+    monkeypatch.setattr(ici_module.messagebox, "showinfo", lambda *a, **k: None)
+    ici_module.ICIWindow._export_csv(fake)
     return [pd.read_csv(tmp_path / f"cell_ici_{phase}.csv", encoding="utf-8-sig")
             for phase in ("charge", "discharge")]
 
@@ -663,12 +661,11 @@ def test_ici_csv_numbers_each_fitted_pulse(tmp_path, monkeypatch):
 
 def test_ici_and_capacity_report_the_same_specific_capacity(tmp_path, monkeypatch):
     """Each ICI pulse's (specific) capacity is the Capacity CSV's value at that pulse's V0 point."""
-    import operaxn.capacity as capacity
     df = _ici_df(n_cycles=2)
     ici_tables = _export_ici_csv(_ici_stand_in(df, fitted=True), tmp_path, monkeypatch)
     out = tmp_path / "cell_capacity.csv"
-    monkeypatch.setattr(capacity.filedialog, "asksaveasfilename", lambda **k: str(out))
-    monkeypatch.setattr(capacity.messagebox, "showinfo", lambda *a, **k: None)
+    monkeypatch.setattr(capacity_module.filedialog, "asksaveasfilename", lambda **k: str(out))
+    monkeypatch.setattr(capacity_module.messagebox, "showinfo", lambda *a, **k: None)
     CapacityWindow._export_csv(SimpleNamespace(_df=df, _export_stem="cell",
                                                all_cycles_var=SimpleNamespace(get=lambda: True),
                                                _get_cycles=lambda: [1, 2],
@@ -685,25 +682,31 @@ def test_ici_and_capacity_report_the_same_specific_capacity(tmp_path, monkeypatc
                               row["Specific Capacity (mAh/g)"]), (phase, row)
 
 
-def test_capacity_window_controls():
-    """The capacity window auto-applies mass and steps cycles with no
-    Save/Apply buttons (pins the window source; rename-sensitive)."""
-    capacity_window_source = inspect.getsource(CapacityWindow)
-    assert "Save Plot" not in capacity_window_source
-    assert "'Apply'" not in capacity_window_source
-    assert "_queue_mass_replot" in capacity_window_source
-    assert "_step_cycle" in capacity_window_source \
-        and "All cycles" in capacity_window_source
+@pytest.mark.display
+def test_capacity_window_controls(tk_root, monkeypatch):
+    """Capacity redraws on a mass edit and steps cycles with its arrows; it has no Save or Apply."""
+    monkeypatch.setattr(capacity_module, "maximise_window", lambda win: win.withdraw())
+    win = CapacityWindow(tk_root, {"operando": build_cycling_df()})
+    try:
+        assert not {"Save Plot", "Apply"} & set(_buttons(win)), _buttons(win)
+        win.mass_var.set("10")
+        pump(win, capacity_module.MASS_REPLOT_DELAY_MS + 100)
+        assert win.ax_cap.get_xlabel() == "Specific capacity [mAh/g]", "a mass edit must redraw"
+        win.all_cycles_var.set(False)
+        win._toggle_all_cycles()
+        win._next_btn.invoke()
+        assert [t.get_text() for t in win.ax_time.get_legend().get_texts()] == ["Cycle 2"]
+    finally:
+        win.destroy()
 
 
 def test_capacity_export_reports_a_locked_file(tmp_path, monkeypatch):
     """A CSV export that cannot write shows 'Export failed' instead of raising."""
-    import operaxn.capacity as capacity
     errors = []
-    monkeypatch.setattr(capacity.filedialog, "asksaveasfilename",
+    monkeypatch.setattr(capacity_module.filedialog, "asksaveasfilename",
                         lambda **k: str(tmp_path / "locked.csv"))
-    monkeypatch.setattr(capacity.messagebox, "showerror", lambda *a, **k: errors.append(a))
-    monkeypatch.setattr(capacity.messagebox, "showinfo", lambda *a, **k: None)
+    monkeypatch.setattr(capacity_module.messagebox, "showerror", lambda *a, **k: errors.append(a))
+    monkeypatch.setattr(capacity_module.messagebox, "showinfo", lambda *a, **k: None)
 
     def locked(*a, **k):
         raise PermissionError("file is open in Excel")
@@ -724,13 +727,12 @@ def test_capacity_export_reports_a_locked_file(tmp_path, monkeypatch):
                          ids=["all cycles", "typed 7 of 2", "typed 2.6", "text"])
 def test_capacity_csv_has_the_documented_columns(tmp_path, monkeypatch, box, exported):
     """Export CSV writes README.md's columns for the cycles shown, committing the box first."""
-    import operaxn.capacity as capacity
     out = tmp_path / "cell_capacity.csv"
     errors = []
-    monkeypatch.setattr(capacity.filedialog, "asksaveasfilename", lambda **k: str(out))
+    monkeypatch.setattr(capacity_module.filedialog, "asksaveasfilename", lambda **k: str(out))
     for kind in ("showerror", "showwarning"):
-        monkeypatch.setattr(capacity.messagebox, kind, lambda *a, **k: errors.append(a))
-    monkeypatch.setattr(capacity.messagebox, "showinfo", lambda *a, **k: None)
+        monkeypatch.setattr(capacity_module.messagebox, kind, lambda *a, **k: errors.append(a))
+    monkeypatch.setattr(capacity_module.messagebox, "showinfo", lambda *a, **k: None)
     shown = {"cycle": box}  # the cycle box: what it reads as (None: text that is no number)
     fake = SimpleNamespace(_df=build_cycling_df(), _export_stem="cell", _available=[1, 2],
                            _shown_cycle=1, all_cycles_var=SimpleNamespace(get=lambda: box == "all"),
@@ -764,7 +766,8 @@ def test_failed_heatmap_export_says_what_could_not_be_exported(tmp_path, monkeyp
         raise OSError("disk full")
 
     fake = SimpleNamespace(_matrix=np.ones((2, 2)), _export_stem=lambda: "cell",
-                           _file_stem="cell", _banks=["1", "3"], save_figure=boom)
+                           _file_stem="cell", _banks=["1", "3"], save_figure=boom,
+                           _rows_for=lambda _bank: (None, np.ones((2, 2)), []))
     getattr(HeatmapWindow, export)(fake)
     assert errors == [("Export failed", f"{what} could not be exported: disk full")], errors
 
@@ -776,7 +779,9 @@ def test_export_all_banks_counts_the_files_written(tmp_path, monkeypatch, drawn,
     monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **_k: str(tmp_path / "maps.png"))
     monkeypatch.setattr(messagebox, "showinfo", lambda *a, **_k: shown.append(a))
     fake = SimpleNamespace(_file_stem="cell", _banks=["1", "3"],
-                           save_figure=lambda path, bank: bank in drawn)
+                           save_figure=lambda path, bank: bank in drawn,
+                           _rows_for=lambda bank: (None, np.ones((2, 2)) if bank in drawn else None,
+                                                   []))
     HeatmapWindow._export_all_banks(fake)
     paths = [str(tmp_path / f"maps_bank{bank}.png") for bank in drawn]
     assert shown == [("Export complete", f"{noun} exported to:\n" + "\n".join(paths))], shown
@@ -801,7 +806,6 @@ def test_capacity_and_ici_take_only_a_finite_positive_mass(text, mass):
 @pytest.mark.parametrize("label, scale", [("I/mA", 1.0), ("I/A", 1e-3)])
 def test_ici_fit_reads_the_current_unit_from_the_echem_header(tmp_path, fit_df, label, scale):
     """An echem file read by the app gives the same R and k (ohm) whatever current unit it names."""
-    import core
     t0 = pd.Timestamp("2026-06-01 10:00:00")
     rows = [f"{(t0 + pd.Timedelta(seconds=t)).strftime('%d/%m/%Y %H:%M:%S.%f')}"
             f"\t{float(v)!r}\t{float(i) * scale!r}"
@@ -831,60 +835,6 @@ def test_analysis_figures_use_light_palette():
         "heatmap must reserve a colourbar label gutter"
 
 
-class _FakeListbox:
-    """Minimal Tk Listbox stand-in backed by a plain items list."""
-
-    def __init__(self, items):
-        self.items = list(items)
-
-    def size(self):
-        """Return the item count."""
-        return len(self.items)
-
-    def delete(self, index):
-        """Remove the item at index."""
-        del self.items[index]
-
-    def insert(self, _index, item):
-        """Append item, ignoring the index."""
-        self.items.append(item)
-
-    def see(self, _index):
-        """Ignore scroll requests."""
-
-
-def test_progress_cannot_replace_loaded_scan_rows():
-    """show_progress leaves loaded scan rows untouched."""
-    fake_listbox = _FakeListbox(["Scan 1"])
-    fake_panel = SimpleNamespace(
-        _items_cache=["Scan 1"], listbox=fake_listbox,
-        update_idletasks=lambda: None,
-    )
-    FileListPanel.show_progress(fake_panel, "Processing echem data...")
-    assert fake_listbox.items == ["Scan 1"]
-
-
-def test_progress_remains_available_before_scans_load():
-    """show_progress replaces stale progress rows before any scans load."""
-    fake_listbox = _FakeListbox(["Old progress"])
-    fake_panel = SimpleNamespace(
-        _items_cache=[], listbox=fake_listbox,
-        update_idletasks=lambda: None,
-    )
-    FileListPanel.show_progress(fake_panel, "Loading scans")
-    assert fake_listbox.items == ["Loading scans"]
-
-
-def test_scan_list_wheel_steps_one_row_on_every_platform():
-    """A wheel notch or X11 button event scrolls the scan list one row, a zero delta none; each
-    returns "break", so the X11 Listbox class binding adds no rows of its own."""
-    steps = []
-    fake_panel = SimpleNamespace(listbox=SimpleNamespace(yview_scroll=lambda n, _what: steps.append(n)))
-    results = [FileListPanel._on_wheel(fake_panel, SimpleNamespace(delta=delta, num=num))
-               for delta, num in ((120, "??"), (-120, "??"), (0, "??"), (0, 4), (0, 5))]
-    assert steps == [-1, 1, -1, 1] and results == ["break"] * 5
-
-
 def test_echem_sources_offers_current_bearing_datasets(monkeypatch):
     """Analysis windows see operando plus current-bearing additional echem only."""
     operando = build_cycling_df(n_cycles=1)
@@ -903,13 +853,6 @@ def test_echem_sources_offers_current_bearing_datasets(monkeypatch):
         f"got {list(analysis_sources)}"
     assert analysis_sources.get("reference_echem.txt") is additional
     assert "voltage_only.txt" not in analysis_sources
-
-
-def _pump(win, ms):
-    """Pump the Tk event loop for ms milliseconds, blocking the caller."""
-    flag = tk.BooleanVar(win)
-    win.after(ms, lambda: flag.set(True))
-    win.wait_variable(flag)
 
 
 def _rest_lengths_df(rests=(10, 10, 400, 10, 20)):
@@ -940,33 +883,33 @@ def test_max_rest_edits_keep_windows_and_selection_on_their_pulses(tk_root, monk
         sel.pulse_var.set(3)  # the pulse starting at 510 s
         bar.start_var.set(2.0)
         bar.length_var.set(5.0)
-        _pump(win, 350)
+        pump(win, 350)
         sel.pulse_var.set(2)
-        _pump(win, 350)
+        pump(win, 350)
         bar.max_rest_var.set(310.0)  # the same four pulses
-        _pump(win, 350)
+        pump(win, 350)
         assert win._get_r1(1, "charge", 2) == (0.5, 1.0), "a Max rest edit set a pulse window"
         sel.pulse_var.set(3)
-        _pump(win, 350)
+        pump(win, 350)
         bar.max_rest_var.set(500.0)  # admits the 400 s rest as the new pulse 3
-        _pump(win, 350)
+        pump(win, 350)
         assert starts() == [0.0, 40.0, 80.0, 510.0, 550.0], starts()
         assert win._get_r1(1, "charge", 4) == (2.0, 5.0), "the tuned pulse lost its window"
         assert win._get_r1(1, "charge", 3) == (0.5, 1.0), "the new pulse took the tuned window"
         assert sel.pulse_var.get() == 4, "the selection did not follow its pulse"
         assert float(sel._pulse_spin.cget("to")) == 5, "the pulse range was not updated"
         bar.max_rest_var.set(300.0)
-        _pump(win, 350)
+        pump(win, 350)
         assert float(sel._pulse_spin.cget("to")) == 4
         assert sel.pulse_var.get() == 3 and win._get_r1(1, "charge", 3) == (2.0, 5.0)
         sel.pulse_var.set(4)  # the pulse with the 20 s rest
-        _pump(win, 50)
+        pump(win, 50)
         bar.max_rest_var.set(15.0)  # drops it: the selection moves to the last pulse left
-        _pump(win, 350)
+        pump(win, 350)
         assert starts() == [0.0, 40.0, 510.0] and sel.pulse_var.get() == 3
         assert float(sel._pulse_spin.cget("to")) == 3
         bar.max_rest_var.set(5.0)  # shorter than every rest
-        _pump(win, 350)
+        pump(win, 350)
         assert starts() == [], "lowering Max rest below every rest must reject every pulse"
     finally:
         win.destroy()
@@ -979,13 +922,13 @@ def test_regression_edits_land_on_their_own_pulse(tk_root, monkeypatch):
     try:
         win.reg_bar.length_var.set(5.0)
         win.selector.pulse_var.set(2)  # before the edit's debounce fires
-        _pump(win, 350)
+        pump(win, 350)
         windows = [win._get_r1(1, "charge", pulse) for pulse in (1, 2, 3)]
         shown = (win.reg_bar.start_var.get(), win.reg_bar.length_var.get())
         win.reg_bar.length_var.set(2.0)  # on pulse 2
         win.selector.pulse_var.set(3)
         win.reg_bar.length_var.set(3.0)  # on pulse 3, before pulse 2's edit settles
-        _pump(win, 350)
+        pump(win, 350)
         both = [win._get_r1(1, "charge", pulse) for pulse in (2, 3)]
     finally:
         win.destroy()
@@ -1029,37 +972,37 @@ def test_ici_regression_window_resolves_pulse_then_phase_then_default(tk_root, m
         win.selector._set_phase("charge")
         assert win.selector.pulse_var.get() == 3, "a phase toggle must keep the selected pulse"
         win.selector.pulse_var.set(2)
-        _pump(win, 400)
+        pump(win, 400)
         assert _fitted_windows(win, "charge") == everywhere, "browsing must set no window"
         win.reg_bar.start_var.set(1.0)
         win.reg_bar.length_var.set(2.0)
-        _pump(win, 400)  # applies after the bar's debounce, with no button
+        pump(win, 400)  # applies after the bar's debounce, with no button
         assert _fitted_windows(win, "charge") == {1: default, 2: edited, 3: default}
         assert _fitted_windows(win, "discharge") == everywhere
         win.selector.pulse_var.set(3)  # Apply All must also reach pulse 2's window
         win.reg_bar.start_var.set(2.0)
         win.reg_bar.length_var.set(4.0)
         win._on_apply_all()
-        _pump(win, 400)
+        pump(win, 400)
         for phase in ("charge", "discharge"):
             assert _fitted_windows(win, phase) == {1: applied, 2: applied, 3: applied}, phase
         win.selector.pulse_var.set(1)
         win.reg_bar.start_var.set(1.0)
         win.reg_bar.length_var.set(2.0)
-        _pump(win, 400)
+        pump(win, 400)
         assert _fitted_windows(win, "charge") == {1: edited, 2: applied, 3: applied}
         shown = {}
         for pulse in (2, 1):
             win.selector.pulse_var.set(pulse)
             shown[pulse] = (win.reg_bar.start_var.get(), win.reg_bar.length_var.get())
-        _pump(win, 400)
+        pump(win, 400)
         assert shown == {2: (2.0, 4.0), 1: (1.0, 2.0)}, "the bar shows the selected pulse's window"
         assert _fitted_windows(win, "charge") == {1: edited, 2: applied, 3: applied}, \
             "showing a window is no edit"
         loaded = win._df
         _choose_source(win, "other")
         assert win._df is loaded, "the switch must wait until the menu has closed"
-        _pump(win, 100)
+        pump(win, 100)
         assert win._df is not loaded
         for phase in ("charge", "discharge"):
             assert _fitted_windows(win, phase) == everywhere, phase
@@ -1112,7 +1055,7 @@ def test_ici_rk_panels_keep_even_bands_after_resize_and_redraw(tk_root, monkeypa
                 elif redraw == "source":
                     _choose_source(win, "wide" if win.selector.source_var.get() == "cell"
                                    else "cell")
-                    _pump(win, 100)
+                    pump(win, 100)
                 band, bands, overhang = _rk_bands(win)
                 assert np.allclose(bands, band, atol=1.5), (width, height, redraw, band, bands)
                 assert overhang <= 0, (width, height, redraw, overhang)
@@ -1135,16 +1078,16 @@ def test_ici_spinboxes_ignore_text_that_is_not_a_number(tk_root, monkeypatch):
             win.selector._next_cycle()
             win.selector._prev_pulse()
             win.rk_axis_bar.mass_var.set("5")
-            _pump(win, 300)
+            pump(win, 300)
         win.selector.cycle_var.set(1)
         win.selector.pulse_var.set(1)
-        _pump(win, 50)
+        pump(win, 50)
         full, rk = [], []
         live, right = win._update_live_plots, win._update_right_plots
         win._update_live_plots = lambda: (full.append(1), live())
         win._update_right_plots = lambda *a: (rk.append(1), right(*a))
         win.selector._pulse_spin.invoke("buttonup")
-        _pump(win, 50)
+        pump(win, 50)
         mass = next(w for w in win.rk_axis_bar.winfo_children()[0].winfo_children()
                     if isinstance(w, tk.Spinbox))
         counts = []
@@ -1153,7 +1096,7 @@ def test_ici_spinboxes_ignore_text_that_is_not_a_number(tk_root, monkeypatch):
                      lambda: (mass.insert("end", "1"), win._on_rk_axis_changed())):  # Return
             rk.clear()
             edit()
-            _pump(win, 300)
+            pump(win, 300)
             counts.append(len(rk))
     finally:
         win.destroy()
@@ -1284,10 +1227,45 @@ def test_heatmap_mistyped_exclude_keeps_the_previous_exclusions(caplog):
     assert hm._excluded == set()
 
 
+@pytest.mark.parametrize("typed, boxes, shown", [
+    (("zmin", "5"), {"zmin": "1", "zmax": "2"}, {"zmin": "5", "zmax": ""}),
+    (("zmax", "1"), {"zmin": "1", "zmax": "2"}, {"zmin": "", "zmax": "1"}),
+    (("zmax", "abc"), {"zmin": "1", "zmax": "2"}, {"zmin": "1", "zmax": ""}),
+    (("xmin", "inf"), {"xmax": "20"}, {"xmin": "", "xmax": "20"}),
+    (("xmin", "30"), {"xmax": "20"}, {"xmin": "30", "xmax": "20"}),
+    (("ceiling", "20"), {}, {"ceiling": 50.0}),
+    (("ceiling", "150"), {}, {"ceiling": 100.0}),
+    (("ceiling", "abc"), {}, {"ceiling": 100.0}),
+    (("scale", "log"), {"zmin": "0", "zmax": "40"}, {"zmin": "", "zmax": "40", "3": ("", "8")}),
+    (("zmin", "0"), {"scale": "log", "zmax": "40"}, {"zmin": "", "zmax": "40"}),
+], ids=["min-not-below-max", "max-not-above-min", "text", "inf", "x-order-free", "ceiling-low",
+        "ceiling-high", "ceiling-text", "log", "typed-in-log"])
+def test_heatmap_boxes_show_the_values_in_use(typed, boxes, shown):
+    """A committed heatmap box shows the value the map uses; Log clears every bank's bound <= 0."""
+    texts = {"xmin": "", "xmax": "", "zmin": "", "zmax": "", "ceiling": "100.0",
+             "scale": "linear", **boxes}
+    box = {name: SimpleNamespace(get=lambda n=name: texts[n],
+                                 set=lambda value, n=name: texts.update({n: value}))
+           for name in texts}
+    hm = SimpleNamespace(**{f"{name}_var": var for name, var in box.items()},
+                         bank_var=None, xaxis_var=None, scans_var=None,
+                         _bank_limits={"3": ("-2", "8")}, _replot=lambda: None,
+                         _forget_zoom_history=lambda: None)
+    name, text = typed
+    if name == "scale":
+        HeatmapWindow._set_toggle(hm, hm.scale_var, {}, text)
+    elif name == "ceiling":
+        texts[name] = text
+        HeatmapWindow._commit_ceiling(hm)
+    else:
+        texts[name] = text
+        HeatmapWindow._commit_range(hm, box[name])
+    observed = {**texts, "3": hm._bank_limits["3"]}
+    assert {key: observed[key] for key in shown} == shown
+
+
 def _refusing_range(limit):
     """Return a range stand-in that fails at once instead of building past `limit`."""
-    import builtins
-
     def refusing_range(*args):
         stop = args[-1] if len(args) > 1 else args[0]
         if stop > limit:
@@ -1298,7 +1276,6 @@ def _refusing_range(limit):
 
 def test_scan_range_is_clamped_before_it_is_built(monkeypatch):
     """'1-100000000' with 494 scans returns scans 1-494 without a range past 495."""
-    import operaxn.dialog as dialog_module
     monkeypatch.setattr(dialog_module, "range", _refusing_range(495), raising=False)
     assert dialog_module.parse_scan_range("1-100000000", max_scan=494) == list(range(1, 495))
 
@@ -1312,23 +1289,19 @@ def test_colormap_and_intensity_helpers():
     assert intensity_limits(m) == (1.0, 100.0)
     assert intensity_limits(m, ceiling=90.0)[1] == pytest.approx(90.1)
     assert intensity_limits(m, vmin=5.0, vmax=50.0) == (5.0, 50.0)
+    assert intensity_limits(m, vmin=50.0, vmax=50.0) == (50.0, 100.0), \
+        "a typed Max not above Min returns to automatic, never Min + 1"
     lo, hi = intensity_limits(np.zeros((2, 2)), log=True)
     assert lo > 0 and hi > lo
     lo, hi = intensity_limits(np.array([[0.0, -1.0, 1.0, 100.0]]), log=True)
     assert lo == pytest.approx(1.99) and hi == 100.0, \
         "log floor must come from the positive values, not the zeros"
+    lo, hi = intensity_limits(np.array([[0.0, -1.0, 1.0, 100.0]]), vmin=0.0, log=True)
+    assert lo == pytest.approx(1.99), "a typed bound <= 0 takes the log floor, never 1e-10"
     assert row_edges(np.array([1.0, 2.0, 3.0])) == (0.5, 3.5)
     assert cell_edges(np.array([1.0, 2.0, 4.0])).tolist() == [0.5, 1.5, 3.0, 5.0]
     assert cell_edges(np.array([5.0])).tolist() == [4.5, 5.5], \
         "a lone row needs a real height ('nearest' shading draws it zero high)"
-
-
-def test_log_limits_floors_and_orders():
-    """log_limits floors vmin at VMIN_FLOOR and lifts a vmax at or below it to ten times vmin."""
-    assert output_module.log_limits(0, 0) == (1e-10, 1e-9)
-    assert output_module.log_limits(5, 2) == (5, 50)
-    assert output_module.log_limits(-1, 3) == (1e-10, 3)
-    assert output_module.log_limits(2, 9) == (2, 9)
 
 
 def test_publication_figure_layout():
@@ -1504,6 +1477,23 @@ def test_heatmap_window_neutron_banks_and_export(tk_root, tmp_path, monkeypatch)
         hm.destroy()
 
 
+def _buttons(widget):
+    """Return the text of every Tk button inside widget, depth first."""
+    found = [w.cget("text") for w in widget.winfo_children() if isinstance(w, tk.Button)]
+    return found + [t for w in widget.winfo_children() for t in _buttons(w)]
+
+
+def _clim(hm, bank):
+    """Return the colour limits a heatmap window exports bank's map with."""
+    fig = hm.render_figure(bank)
+    return next(c for ax in fig.axes for c in ax.collections).get_clim()
+
+
+def _export_title(fig):
+    """Return a rendered heatmap figure's map title (the colour bar is its last axes)."""
+    return fig.axes[-2].get_title()
+
+
 @pytest.mark.display
 def test_heatmap_intensity_entries_follow_the_bank(tk_root):
     """Typed intensity limits stay with their bank, on screen and in Export all banks."""
@@ -1522,12 +1512,8 @@ def test_heatmap_intensity_entries_follow_the_bank(tk_root):
         hm.zmin_var.set("3")
         hm.zmax_var.set("4")
 
-        def clim(bank):
-            fig = hm.render_figure(bank)
-            return next(c for ax in fig.axes for c in ax.collections).get_clim()
-
-        assert clim("3") == (3.0, 4.0), "the shown bank exports with its typed range"
-        assert clim("1") == (1.0, 2.0), "another bank exports with the range typed on it"
+        assert _clim(hm, "3") == (3.0, 4.0), "the shown bank exports with its typed range"
+        assert _clim(hm, "1") == (1.0, 2.0), "another bank exports with the range typed on it"
         hm._set_toggle(hm.bank_var, hm._bank_btns, "1")
         assert (hm.zmin_var.get(), hm.zmax_var.get()) == ("1", "2"), "bank 1's range comes back"
         assert hm.ax_map.collections[-1].get_clim() == (1.0, 2.0)
@@ -1535,10 +1521,10 @@ def test_heatmap_intensity_entries_follow_the_bank(tk_root):
         assert (hm.zmin_var.get(), hm.zmax_var.get()) == ("1", "2"), "re-clicking the bank keeps it"
         hm._set_toggle(hm.xaxis_var, hm._x_btns, "d")
         assert (hm.zmin_var.get(), hm.zmax_var.get()) == ("1", "2"), "the x axis keeps it"
-        assert clim("3") == (3.0, 4.0)
+        assert _clim(hm, "3") == (3.0, 4.0)
         hm._reset_ranges()
         assert (hm.zmin_var.get(), hm.zmax_var.get()) == ("", "")
-        assert clim("3") == (20.0, 60.0), "Reset returns every bank to its auto range"
+        assert _clim(hm, "3") == (20.0, 60.0), "Reset returns every bank to its auto range"
     finally:
         hm.destroy()
 
@@ -1565,11 +1551,6 @@ def test_title_text_checks_each_line_as_drawn():
     FigureCanvasAgg(fig)
     fig.add_subplot().set_title(shown)
     fig.canvas.draw()
-
-
-def _export_title(fig):
-    """Return a rendered heatmap figure's map title (the colour bar is its last axes)."""
-    return fig.axes[-2].get_title()
 
 
 @pytest.mark.display
@@ -1643,21 +1624,17 @@ def test_heatmap_title_apply_all_gives_every_bank_the_shown_title(tk_root, monke
     monkeypatch.setattr(messagebox, "askyesno",
                         lambda *a, **_k: asked.append(a) or answer[0])
 
-    def buttons(widget):
-        found = [w.cget("text") for w in widget.winfo_children() if isinstance(w, tk.Button)]
-        return found + [t for w in widget.winfo_children() for t in buttons(w)]
-
     def title(bank):
         return _export_title(hm.render_figure(bank))
 
     hm = HeatmapWindow(tk_root, build_hm_scans(), neutron_arrays=build_neutron_arrays())
     try:
         hm.update()
-        assert buttons(hm).count("Apply All") == 2, "one for the intensity, one for the title"
+        assert _buttons(hm).count("Apply All") == 2, "one for the intensity, one for the title"
         hm.title_var.set(" LiNiO$_2$ cell ")
         hm._apply_title_to_all_banks()
         assert asked == [("Confirm", "Apply title 'LiNiO$_2$ cell' to all banks?")]
-        assert title("3") == "Bank 3", "No changes nothing"
+        assert title("3") == "Bank 3", "No must leave every title as it was"
         answer[0] = True
         hm._apply_title_to_all_banks()
         assert hm.ax_map.get_title() == title("1") == title("3") == "LiNiO$_2$ cell"
@@ -1676,7 +1653,7 @@ def test_heatmap_title_apply_all_gives_every_bank_the_shown_title(tk_root, monke
     xray = HeatmapWindow(tk_root, build_hm_scans(), oned_arrays=build_oned_arrays())
     try:
         xray.update()
-        assert "Apply All" not in buttons(xray), "X-ray has one map"
+        assert "Apply All" not in _buttons(xray), "X-ray has one map"
     finally:
         xray.destroy()
 
@@ -1719,39 +1696,32 @@ def test_heatmap_apply_all_shares_the_shown_banks_range(tk_root, monkeypatch):
     monkeypatch.setattr(messagebox, "askyesno",
                         lambda *a, **_k: asked.append(a) or answer[0])
 
-    def buttons(widget):
-        found = [w.cget("text") for w in widget.winfo_children() if isinstance(w, tk.Button)]
-        return found + [t for w in widget.winfo_children() for t in buttons(w)]
-
-    def clim(bank):
-        fig = hm.render_figure(bank)
-        return next(c for ax in fig.axes for c in ax.collections).get_clim()
-
     hm = HeatmapWindow(tk_root, build_hm_scans(), neutron_arrays=build_neutron_arrays())
     try:
         hm.update()
-        assert "Apply All" in buttons(hm)
+        assert "Apply All" in _buttons(hm)
         hm.zmax_var.set("2")
         hm._apply_to_all_banks()
         assert asked == [("Confirm", "Apply intensity range 1 - 2 to all banks?")], \
             "the shown map's range (typed Max, auto Min) is offered"
-        assert clim("3") == (2.0, 6.0), "No changes nothing"
+        assert _clim(hm, "3") == (2.0, 6.0), "No must leave every range as it was"
         answer[0] = True
         hm._apply_to_all_banks()
         assert (hm.zmin_var.get(), hm.zmax_var.get()) == ("1", "2"), "the entries show it"
-        assert clim("1") == clim("3") == (1.0, 2.0), "every bank shares one scale"
+        assert _clim(hm, "1") == _clim(hm, "3") == (1.0, 2.0), "every bank shares one scale"
         hm._set_toggle(hm.bank_var, hm._bank_btns, "3")
         assert (hm.zmin_var.get(), hm.zmax_var.get()) == ("1", "2")
         hm.zmax_var.set("5")
-        assert clim("3") == (1.0, 5.0) and clim("1") == (1.0, 2.0), \
+        assert _clim(hm, "3") == (1.0, 5.0) and _clim(hm, "1") == (1.0, 2.0), \
             "a later edit changes only its own bank"
         hm._reset_ranges()
-        assert clim("1") == (1.0, 3.0) and clim("3") == (2.0, 6.0), "Reset is the way back"
+        assert _clim(hm, "1") == (1.0, 3.0) and _clim(hm, "3") == (2.0, 6.0), \
+            "Reset is the way back"
     finally:
         hm.destroy()
     xray = HeatmapWindow(tk_root, build_hm_scans(), oned_arrays=build_oned_arrays())
     try:
-        assert "Apply All" not in buttons(xray), "X-ray maps have no banks to share a range"
+        assert "Apply All" not in _buttons(xray), "X-ray maps have no banks to share a range"
     finally:
         xray.destroy()
 
@@ -1759,8 +1729,6 @@ def test_heatmap_apply_all_shares_the_shown_banks_range(tk_root, monkeypatch):
 @pytest.mark.display
 def test_heatmap_redraws_free_the_maps_they_replace(tk_root, monkeypatch):
     """Every kind of heatmap redraw frees the map, and with it the colour bar, that it replaces."""
-    import gc
-    import weakref
     monkeypatch.setattr(messagebox, "askyesno", lambda *_a, **_k: True)
     hm = HeatmapWindow(tk_root, build_hm_scans(), neutron_arrays=build_neutron_arrays())
     # A colour bar holds its map, so a freed map means a freed colour bar
@@ -1789,7 +1757,6 @@ def test_heatmap_redraws_free_the_maps_they_replace(tk_root, monkeypatch):
 @pytest.mark.display
 def test_heatmap_exclude_box_is_clamped(tk_root, monkeypatch):
     """The heatmap's Exclude entry is clamped to the highest scan, so a typo returns at once."""
-    import operaxn.dialog as dialog_module
     top = max(s["scan_num"] for s in build_hm_scans())
     hm = HeatmapWindow(tk_root, build_hm_scans(), oned_arrays=build_oned_arrays())
     try:
@@ -1799,24 +1766,6 @@ def test_heatmap_exclude_box_is_clamped(tk_root, monkeypatch):
         assert hm._excluded == set(range(2, top + 1))
     finally:
         hm.destroy()
-
-
-def _pending_after_ids(root):
-    """Return the ids of the Tk timers still queued."""
-    return set(root.tk.splitlist(root.tk.call("after", "info")))
-
-
-def _background_errors(root, run):
-    """Run run(), pump the event loop for 400 ms and return the Tcl background errors raised."""
-    errors = []
-    previous = root.tk.call("interp", "bgerror", "")
-    root.tk.call("interp", "bgerror", "", root.register(lambda *args: errors.append(args)))
-    try:
-        run()
-        _pump(root, 400)
-    finally:
-        root.tk.call("interp", "bgerror", "", previous)
-    return errors
 
 
 @pytest.mark.display
@@ -1835,31 +1784,30 @@ def test_heatmap_replot_timers_never_outlive_reset_or_close(tk_root, monkeypatch
     try:
         hm.ceiling_var.set(50.0)
         hm._reset_ranges()  # sets the ceiling back to 100, which queues a replot
-        assert len(jobs) == 2 and not set(jobs) & _pending_after_ids(tk_root), \
+        assert len(jobs) == 2 and not set(jobs) & pending_after_ids(tk_root), \
             "Reset left a queued replot"
         hm.ceiling_var.set(99.0)
         hm.update_idletasks()  # the redraws' own idle draws run; the queued replot (250 ms) waits
-        assert jobs[-1] in _pending_after_ids(tk_root)
+        assert jobs[-1] in pending_after_ids(tk_root)
     finally:
-        errors = _background_errors(tk_root, hm.destroy)
-    assert jobs[-1] not in _pending_after_ids(tk_root), "a queued replot outlived the window"
+        errors = background_errors(tk_root, hm.destroy)
+    assert jobs[-1] not in pending_after_ids(tk_root), "a queued replot outlived the window"
     assert not errors, errors
 
 
 @pytest.mark.display
 def test_capacity_timers_never_outlive_the_window(tk_root, monkeypatch):
     """A mass redraw and a source swap still queued when Capacity closes are cancelled with it."""
-    import operaxn.capacity as capacity_module
     monkeypatch.setattr(capacity_module, "maximise_window", lambda win: win.withdraw())
     win = CapacityWindow(tk_root, {"operando": build_cycling_df()})
     try:
         win._queue_mass_replot()
         win._queue_source_change("operando")
         jobs = {win._mass_job, win._source_job}
-        assert None not in jobs and jobs <= _pending_after_ids(tk_root)
+        assert None not in jobs and jobs <= pending_after_ids(tk_root)
     finally:
-        errors = _background_errors(tk_root, win.destroy)
-    assert not jobs & _pending_after_ids(tk_root), "a queued Capacity job outlived the window"
+        errors = background_errors(tk_root, win.destroy)
+    assert not jobs & pending_after_ids(tk_root), "a queued Capacity job outlived the window"
     assert not errors, errors
 
 
@@ -1875,19 +1823,18 @@ def _plot_controls_jobs(root, monkeypatch):
 def _ici_jobs(root, monkeypatch):
     """Queue every edit the ICI window debounces; return their ids and the window."""
     win = _open_ici(root, monkeypatch, {"cell": _ici_df(), "other": _ici_df()})
-    before = _pending_after_ids(root)
+    before = pending_after_ids(root)
     win.reg_bar.start_var.set(1.0)
     win.reg_bar.max_rest_var.set(299.0)
     win.rk_axis_bar.mass_var.set("3")
     win.update_idletasks()  # matplotlib's own idle draws go first
     _choose_source(win, "other")
-    return _pending_after_ids(root) - before, win
+    return pending_after_ids(root) - before, win
 
 
 def _figure_sync_jobs(root, monkeypatch):
     """Queue embed_figure's re-sync and watch_figure_sync's watchdog; return ids and window."""
-    from operaxn.ici import embed_figure, watch_figure_sync
-    before = _pending_after_ids(root)
+    before = pending_after_ids(root)
     win = tk.Toplevel(root)
     win.overrideredirect(True)
     win.geometry("200x150+20000+20000")  # mapped off-screen: an unmapped frame gets no <Configure>
@@ -1896,7 +1843,7 @@ def _figure_sync_jobs(root, monkeypatch):
     canvas = embed_figure(Figure(), frame)
     watch_figure_sync(win, (canvas,))
     win.update()  # maps the window: the frame's <Configure> queues a re-sync
-    jobs = _pending_after_ids(root) - before
+    jobs = pending_after_ids(root) - before
     assert canvas._operaxn_sync_job in jobs and len(jobs) == 2, jobs
     return jobs, win
 
@@ -1907,9 +1854,9 @@ def _figure_sync_jobs(root, monkeypatch):
 def test_queued_jobs_never_outlive_their_window(tk_root, monkeypatch, queue):
     """Debounced updates and timers still queued when their window goes are cancelled with it."""
     jobs, owner = queue(tk_root, monkeypatch)
-    assert jobs and None not in jobs and jobs <= _pending_after_ids(tk_root), jobs
-    errors = _background_errors(tk_root, owner.destroy)
-    assert not jobs & _pending_after_ids(tk_root), "a queued job outlived its window"
+    assert jobs and None not in jobs and jobs <= pending_after_ids(tk_root), jobs
+    errors = background_errors(tk_root, owner.destroy)
+    assert not jobs & pending_after_ids(tk_root), "a queued job outlived its window"
     assert not errors, errors
 
 
@@ -1919,11 +1866,6 @@ def test_queued_jobs_never_outlive_their_window(tk_root, monkeypatch, queue):
 def test_closing_an_analysis_window_frees_it(tk_root, monkeypatch, which, close):
     """A Heatmap, ICI or Capacity window closed by its close button or by Clear All is freed at once;
     while it is open, a second click lifts it."""
-    import gc
-    import weakref
-    import operaxn.capacity as capacity_module
-    import operaxn.heatmap as heatmap_module
-    import operaxn.ici as ici_module
     for module in (gui_module, capacity_module, heatmap_module, ici_module):
         monkeypatch.setattr(module, "maximise_window", lambda win: win.withdraw())
     monkeypatch.setattr(messagebox, "askyesno", lambda *_a, **_k: True)
@@ -1938,7 +1880,7 @@ def test_closing_an_analysis_window_frees_it(tk_root, monkeypatch, which, close)
                        "capacity": app._open_capacity_window}[which]
         open_window()
         win = getattr(app, f"_{which}_window")
-        _pump(win, 300)
+        pump(win, 300)
         open_window()
         assert getattr(app, f"_{which}_window") is win, "a second click must lift the open window"
         ref = weakref.ref(win)
@@ -1951,622 +1893,3 @@ def test_closing_an_analysis_window_frees_it(tk_root, monkeypatch, which, close)
         assert ref() is None, f"{which} window closed by {close} is still referenced"
     finally:
         master.destroy()
-
-
-# ============================================================================
-# Plot-cache staleness (placeholder branches, GIF frames, clear-all)
-# ============================================================================
-
-@pytest.fixture(autouse=True)
-def _clean_plot_cache():
-    """Clear the id(ax)-keyed plot cache around each test, as test axes are freed constantly."""
-    operaxn.clear_plot_cache()
-    yield
-    operaxn.clear_plot_cache()
-
-
-def test_oned_guard_heals_raw_clear():
-    """A raw ax.clear() must not leave the next plot updating a detached line."""
-    ax = Figure().subplots()
-    x = np.linspace(10, 80, 50)
-    operaxn.plot_oned_data(ax, x, np.arange(50.0))
-    ax.clear()
-    operaxn.plot_oned_data(ax, x, np.arange(50.0) + 5)
-    assert len(ax.lines) == 1, "detached cached line took the update path"
-    assert np.allclose(ax.lines[0].get_ydata(), np.arange(50.0) + 5)
-
-
-def test_twod_guard_evicts_foreign_artist():
-    """A cache entry pointing at another axes' image is evicted, not updated."""
-    img = np.arange(1.0, 65.0).reshape(8, 8)
-    ax_a = Figure().subplots()
-    im_a = operaxn.plot_twod_data(ax_a, img)
-    ax_b = Figure().subplots()
-    output_module._plot_cache.set(f"twod_{id(ax_b)}", im_a)
-    operaxn.plot_twod_data(ax_b, img)
-    assert ax_b.images, "no image drawn on the new axes"
-    assert ax_b.images[0] is not im_a, "foreign artist reused"
-
-
-def test_echem_recreates_after_raw_clear():
-    """The echem update path must not trust a line detached by a raw clear."""
-    ax = Figure().subplots()
-    t = np.arange(10.0)
-    v = 3.7 + 0.01 * np.arange(10)
-    operaxn.plot_echem_data(ax, t, v)
-    ax.clear()
-    operaxn.plot_echem_data(ax, t, v)
-    assert ax.lines, "voltage trace not recreated after a raw clear"
-
-
-def test_oned_plot_recovers_after_placeholder():
-    """A no-1D scan must not blank every later 1D scan."""
-    ax = Figure().subplots()
-    x = np.linspace(10, 80, 50)
-    y1, y3 = np.arange(50.0), np.arange(50.0) + 7
-    fake = SimpleNamespace(
-        axes={"oned": ax},
-        state=SimpleNamespace(oned_arrays={1: {"x": x, "y": y1},
-                                           3: {"x": x, "y": y3}}),
-        config=operaxn.VisualiserConfig(),
-    )
-    OPERAXN._update_oned_plot(fake, 1)
-    assert len(ax.lines) == 1
-    OPERAXN._update_oned_plot(fake, 2)
-    assert not ax.lines
-    assert any("No 1D data" in t.get_text() for t in ax.texts)
-    OPERAXN._update_oned_plot(fake, 3)
-    assert len(ax.lines) == 1, "scan after placeholder rendered blank"
-    assert np.allclose(ax.lines[0].get_ydata(), y3)
-    assert not any("No 1D data" in t.get_text() for t in ax.texts), "stale placeholder"
-
-
-def test_twod_plot_recovers_and_colorbar_singular():
-    """The 2D pane recovers after a 2D-less scan with exactly one live colorbar."""
-    fig = Figure()
-    ax = fig.subplots()
-    img = np.arange(1.0, 65.0).reshape(8, 8)
-    fake = SimpleNamespace(
-        axes={"twod": ax},
-        state=SimpleNamespace(twod_arrays={1: {"image": img}, 3: {"image": img * 2}},
-                              current_scan_idx=0, intensity_limits={}),
-        controls=SimpleNamespace(update_intensity_range=lambda *a: None),
-        config=operaxn.VisualiserConfig(),
-        twod_image=None,
-    )
-    fake._calculate_intensity_limits = OPERAXN._calculate_intensity_limits.__get__(fake)
-    OPERAXN._update_twod_plot(fake, 1)
-    assert len(ax.images) == 1 and len(fig.axes) == 2, "image + colorbar expected"
-    OPERAXN._update_twod_plot(fake, 2)
-    assert not ax.images
-    assert len(fig.axes) == 1, "orphaned colorbar axes left behind"
-    OPERAXN._update_twod_plot(fake, 3)
-    assert len(ax.images) == 1, "scan after placeholder rendered blank"
-    assert len(fig.axes) == 2, "colorbar missing or stacked"
-    assert not any("No 2D data" in t.get_text() for t in ax.texts)
-
-
-def test_echem_plot_recovers_after_placeholder():
-    """The echem pane recovers after an echem-less dataset was shown."""
-    ax = Figure().subplots()
-    with_data = {"x": np.arange(10.0) * 60.0, "y": 3.7 + 0.01 * np.arange(10)}
-    fake = SimpleNamespace(
-        axes={"echem": ax},
-        state=SimpleNamespace(echem_arrays=with_data, scans=[],
-                              echem_df=pd.DataFrame(), time_method="absolute",
-                              current_scan_idx=0),
-        config=operaxn.VisualiserConfig(),
-    )
-    OPERAXN._update_echem_plot(fake)
-    assert ax.lines
-    fake.state.echem_arrays = {"x": np.array([])}
-    OPERAXN._update_echem_plot(fake)
-    assert any("No echem data" in t.get_text() for t in ax.texts)
-    fake.state.echem_arrays = with_data
-    OPERAXN._update_echem_plot(fake)
-    assert ax.lines, "echem trace not recreated after placeholder"
-    assert not any("No echem data" in t.get_text() for t in ax.texts)
-
-
-def test_gif_frame_leaves_cache_clean(monkeypatch, tmp_path):
-    """GIF frames must not cache artists keyed on their throwaway axes."""
-    x = np.linspace(10, 80, 50)
-    monkeypatch.setattr(gui_module, "get_correlated_data",
-                        lambda *a, **k: {"scan_num": 1,
-                                         "oned": {"x": x, "y": np.arange(50.0)},
-                                         "twod": None})
-    fake = SimpleNamespace(
-        state=SimpleNamespace(data_source=gui_module.DataSourceType.INHOUSE,
-                              scans=[], echem_df=pd.DataFrame(),
-                              echem_arrays={"x": np.array([])},
-                              intensity_limits={}, time_method="absolute"),
-        config=operaxn.VisualiserConfig(),
-    )
-    frame = OPERAXN._create_gif_frame(fake, str(tmp_path), 0, {"scan_num": 1}, dpi=50)
-    assert frame is not None and os.path.isfile(frame)
-    assert output_module._plot_cache.cache == {}, \
-        f"GIF frame cached artists on freed axes: {list(output_module._plot_cache.cache)}"
-
-
-def test_clear_all_clears_plot_cache():
-    """Clear-all evicts the cache entries keyed on the axes it destroys."""
-    output_module._plot_cache.set("sentinel", object())
-    fake = SimpleNamespace(
-        state=SimpleNamespace(scans=[], dialog_windows=[], reset=lambda: None),
-        plot_container=SimpleNamespace(winfo_children=lambda: []),
-        _show_empty_state=lambda: None,
-        file_list=SimpleNamespace(update_items=lambda items: None),
-        scan_selector=SimpleNamespace(set_range=lambda a, b: None,
-                                      set_value=lambda v: None),
-        button_panel=SimpleNamespace(update_states=lambda states: None),
-        controls=SimpleNamespace(grid_remove=lambda: None),
-        fig=None, axes={}, canvas=None, twod_image=None,
-        _is_busy=lambda: False,
-    )
-    OPERAXN._clear_all(fake)
-    assert output_module._plot_cache.cache == {}, "clear-all left cache entries"
-
-
-def test_data_check_reads_no_2d_image_when_1d_data_exist():
-    """The loaded-data check reads no 2D image while a 1D pattern exists, and one when none does."""
-    from collections.abc import Mapping
-    reads = []
-
-    class Lazy(Mapping):
-        """A make_twod_arrays-like mapping that records each image read."""
-
-        def __getitem__(self, scan_num):
-            reads.append(scan_num)
-            return {"image": np.ones((2, 2))}
-
-        def __iter__(self):
-            return iter([1, 2])
-
-        def __len__(self):
-            return 2
-
-    fake = SimpleNamespace(state=SimpleNamespace(data_source=gui_module.DataSourceType.INHOUSE,
-                                                 oned_arrays={1: {"x": [1.0], "y": [1.0]}},
-                                                 twod_arrays=Lazy()))
-    assert OPERAXN._check_data_availability(fake) and reads == []
-    fake.state.oned_arrays = {}
-    assert OPERAXN._check_data_availability(fake) and reads == [1]
-
-
-def test_needs_recreate_current_rebuild_matrix():
-    """A wanted current trace with a wiped cache entry or a detached line forces a rebuild."""
-    plotter = output_module._echem_plotter
-    t = np.arange(10.0)
-
-    # Current-only layout, cache wiped mid-session
-    ax = Figure().subplots()
-    plotter._recreate_plot(ax, t, np.array([]), 0.1 + 0.0 * t, False, True)
-    operaxn.clear_plot_cache()
-    assert plotter._needs_recreate(ax, False, True), \
-        "cleared cache with wanted current must force a rebuild"
-
-    # Both-traces layout, current line detached from its twin
-    ax = Figure().subplots()
-    operaxn.plot_echem_data(ax, t, 3.7 + 0.01 * t, 0.1 + 0.0 * t)
-    current_line = output_module._plot_cache.get(f"echem_c_{id(ax)}")
-    assert current_line is not None
-    current_line.remove()
-    assert plotter._needs_recreate(ax, True, True), \
-        "detached current line must force a rebuild"
-
-
-def test_scan_time_positions_align_with_scans():
-    """The positions list is 1:1 with scans, None for untimestamped ones."""
-    echem = pd.DataFrame({"timestamp": pd.date_range("2026-06-01 10:00", periods=5,
-                                                     freq="60s"),
-                          "echem_data": np.linspace(3.0, 3.4, 5)})
-    scans = [
-        {"scan_num": 1, "timestamp": "2026-06-01 10:00:00"},
-        {"scan_num": 2, "timestamp": None},
-        {"scan_num": 3, "timestamp": "2026-06-01 10:02:00"},
-    ]
-    positions = operaxn.get_scan_time_positions(scans, echem, "absolute")
-    assert len(positions) == 3, "must stay aligned with the scan list"
-    assert positions[0] == 0.0 and positions[1] is None and positions[2] == 120.0
-
-
-def test_scan_marker_skips_none_position():
-    """A None position hides the marker instead of crashing or misplacing it."""
-    ax = Figure().subplots()
-    t = np.arange(10.0) * 3600.0
-    v = 3.7 + 0.01 * np.arange(10)
-    operaxn.plot_echem_data(ax, t, v, scan_times=[0.0, None, 7200.0],
-                            current_scan_idx=0)
-    marker = output_module._plot_cache.get(f"echem_marker_{id(ax)}")
-    assert marker is not None and marker.get_visible()
-    operaxn.plot_echem_data(ax, t, v, scan_times=[0.0, None, 7200.0],
-                            current_scan_idx=1)
-    assert not marker.get_visible(), "None position must hide the marker"
-    operaxn.plot_echem_data(ax, t, v, scan_times=[0.0, None, 7200.0],
-                            current_scan_idx=2)
-    assert marker.get_visible(), "marker must reappear for a timed scan"
-    assert marker.get_xdata()[0] == 2.0, f"got {marker.get_xdata()[0]}"
-
-
-def test_gif_frame_marks_scan_position_not_frame_index(monkeypatch, tmp_path):
-    """A sub-range GIF must mark each frame at its own scan's time."""
-    x = np.linspace(10, 80, 50)
-    captured = {}
-
-    def spy_plot_echem(ax, tx, ty, current, scan_times, idx, plot_config=None):
-        captured["idx"] = idx
-
-    monkeypatch.setattr(gui_module, "get_correlated_data",
-                        lambda *a, **k: {"scan_num": 5,
-                                         "oned": {"x": x, "y": np.arange(50.0)},
-                                         "twod": None})
-    monkeypatch.setattr(gui_module, "plot_echem_data", spy_plot_echem)
-    monkeypatch.setattr(gui_module, "get_scan_time_positions",
-                        lambda *a, **k: [float(i) for i in range(10)])
-    fake = SimpleNamespace(
-        state=SimpleNamespace(data_source=gui_module.DataSourceType.INHOUSE,
-                              scans=[{"scan_num": n} for n in range(1, 11)],
-                              echem_df=pd.DataFrame({"timestamp": [1]}),
-                              echem_arrays={"x": np.arange(5.0),
-                                            "y": 3.7 + np.arange(5.0)},
-                              intensity_limits={}, time_method="absolute"),
-        config=operaxn.VisualiserConfig(),
-    )
-    frame = OPERAXN._create_gif_frame(fake, str(tmp_path), 0, {"scan_num": 5}, dpi=50)
-    assert frame is not None
-    assert captured["idx"] == 4, \
-        f"frame 0 of a range starting at scan 5 must mark index 4, got {captured['idx']}"
-
-
-def _gif_fake(data_source, **arrays):
-    """Return a stand-in app for the GIF frame methods: no echem, the given plot arrays."""
-    plot_arrays = {"oned_arrays": {}, "twod_arrays": {}, "neutron_arrays": {}, **arrays}
-    return SimpleNamespace(
-        state=SimpleNamespace(data_source=data_source, scans=[], echem_df=pd.DataFrame(),
-                              echem_arrays={"x": np.array([])}, intensity_limits={},
-                              time_method="absolute", **plot_arrays),
-        config=operaxn.VisualiserConfig(data_source=data_source),
-        _gif_placeholder=OPERAXN._gif_placeholder,
-    )
-
-
-def _frame_size(path):
-    """Return a PNG frame's (width, height)."""
-    from PIL import Image
-    with Image.open(path) as image:
-        return image.size
-
-
-def test_gif_frames_share_one_size_when_2d_is_missing(monkeypatch, tmp_path):
-    """A range mixing scans with and without a 2D image renders every frame at one size,
-    the scan without one showing the placeholder."""
-    x = np.linspace(10, 80, 50)
-    image = (np.arange(64.0).reshape(8, 8) + 1) * 10
-
-    def correlated(scans, scan_num, state=None):
-        return {"scan_num": scan_num, "oned": {"x": x, "y": np.arange(50.0) * scan_num},
-                "twod": image if scan_num == 2 else None}
-
-    monkeypatch.setattr(gui_module, "get_correlated_data", correlated)
-    texts = []
-    fake = _gif_fake(gui_module.DataSourceType.INHOUSE,
-                     **{"oned_arrays": {1: {}, 2: {}}, "twod_arrays": {2: {}}})
-    fake._gif_placeholder = lambda ax, text, *_: texts.append(text)
-    layout = OPERAXN._gif_layout(fake, [1, 2])
-    assert layout == (True, True, False, False), layout
-    sizes = [_frame_size(OPERAXN._create_gif_frame(fake, str(tmp_path), i, {"scan_num": n},
-                                                   dpi=50, layout=layout))
-             for i, n in enumerate((1, 2))]
-    assert sizes[0] == sizes[1], sizes
-    assert texts == ["No 2D data for this scan"], texts
-
-
-def test_generate_gif_writes_one_frame_size_for_mixed_2d(monkeypatch, tmp_path):
-    """The real GIF writer lays every frame out alike, so a mixed-2D range has one size.
-    Frame PNGs are measured as rendered: a GIF read back always has its one canvas size."""
-    from operaxn.dialog import GIFSettings
-    x = np.linspace(10, 80, 50)
-    image = (np.arange(64.0).reshape(8, 8) + 1) * 10
-
-    def correlated(scans, scan_num, state=None):
-        return {"scan_num": scan_num, "oned": {"x": x, "y": np.arange(50.0) * scan_num},
-                "twod": image if scan_num == 2 else None}
-
-    monkeypatch.setattr(gui_module, "get_correlated_data", correlated)
-    fake = _gif_fake(gui_module.DataSourceType.INHOUSE,
-                     **{"oned_arrays": {1: {}, 2: {}}, "twod_arrays": {2: {}}})
-    fake.state.scans = [{"scan_num": 1}, {"scan_num": 2}]
-    fake._gif_layout = lambda nums: OPERAXN._gif_layout(fake, nums)
-    sizes = []
-
-    def render(*args):
-        frame = OPERAXN._create_gif_frame(fake, *args)
-        sizes.append(_frame_size(frame))
-        return frame
-
-    fake._create_gif_frame = render
-    messages = []
-    fake._show_message = lambda *args: messages.append(args)
-    fake._close_dialog = lambda dialog: None
-    dialog = SimpleNamespace(begin_progress=lambda *a: None, update_progress=lambda *a: True)
-    out = str(tmp_path / "mixed.gif")
-    OPERAXN._generate_gif(fake, out, GIFSettings(fps=2, dpi=40, loop=0, scan_list=[1, 2]),
-                          dialog)
-    assert messages and messages[-1][0] == "Export complete", messages
-    assert len(sizes) == 2 and sizes[0] == sizes[1], sizes
-
-
-def test_gif_marks_an_unreadable_2d_image_as_the_main_window_does(monkeypatch, tmp_path):
-    """A scan whose 2D image failed to load gets the main window's red error text."""
-    x = np.linspace(10, 80, 50)
-    monkeypatch.setattr(gui_module, "get_correlated_data",
-                        lambda *a, **k: {"scan_num": 1,
-                                         "oned": {"x": x, "y": np.arange(50.0)},
-                                         "twod": None})
-    marks = []
-    fake = _gif_fake(gui_module.DataSourceType.INHOUSE,
-                     **{"oned_arrays": {1: {}}, "twod_arrays": {1: {"error": True}}})
-    fake._gif_placeholder = lambda ax, text, color="grey": marks.append((text, color))
-    layout = OPERAXN._gif_layout(fake, [1])
-    assert OPERAXN._create_gif_frame(fake, str(tmp_path), 0, {"scan_num": 1}, dpi=40,
-                                     layout=layout)
-    assert marks == [("Error reading 2D data; try reopening dataset", "red")], marks
-
-
-def test_gif_neutron_frames_keep_size_as_intensity_grows(monkeypatch, tmp_path):
-    """Neutron banks autoscale per scan; their frames must still all be one size."""
-    x = np.linspace(1000, 20000, 200)
-
-    def correlated(scans, scan_num, state=None):
-        scale = 1.0 if scan_num == 1 else 30000.0
-        return {"scan_num": scan_num,
-                "neutron": {str(b): {"tof": {"x": x, "y": scale * (1 + np.sin(x / 900))}}
-                            for b in range(1, 6)}}
-
-    monkeypatch.setattr(gui_module, "get_correlated_data", correlated)
-    fake = _gif_fake(gui_module.DataSourceType.NEUTRON,
-                     **{"neutron_arrays": {1: {}, 2: {}}})
-    layout = OPERAXN._gif_layout(fake, [1, 2])
-    sizes = [_frame_size(OPERAXN._create_gif_frame(fake, str(tmp_path), i, {"scan_num": n},
-                                                   dpi=50, layout=layout))
-             for i, n in enumerate((1, 2))]
-    assert sizes[0] == sizes[1], sizes
-
-
-def test_current_only_refresh_never_spawns_empty_twin():
-    """Repeated current-only refreshes update in place with no phantom twin."""
-    fig = Figure()
-    ax = fig.subplots()
-    t = np.arange(10.0)
-    c = 0.1 + 0.01 * np.arange(10)
-    cfg = {"show_voltage": False, "show_current": True}
-    for _ in range(3):
-        operaxn.plot_echem_data(ax, t, np.array([]), c, plot_config=cfg)
-    assert not hasattr(ax, "_ax2"), "empty twin axes spawned on refresh"
-    assert len(fig.axes) == 1, f"got {len(fig.axes)} axes"
-    data_lines = [ln for ln in ax.lines if len(ln.get_xdata()) == 10]
-    assert len(data_lines) == 1, "current trace duplicated or lost"
-
-
-IMG = np.outer(np.linspace(1, 50, 120), np.linspace(1, 30, 100)) + 1.0
-
-
-def _render(fig):
-    """Draw fig on an Agg canvas and return a copy of its RGBA pixels."""
-    canvas = FigureCanvasAgg(fig)
-    canvas.draw()
-    return np.asarray(canvas.buffer_rgba()).copy()
-
-
-def test_twod_update_keeps_norm_and_pixels():
-    """A 2D update re-limits the image's own LogNorm and renders exactly like a fresh plot."""
-    operaxn.clear_plot_cache()
-    fig = Figure(figsize=(5, 4), dpi=95)
-    ax = fig.subplots()
-    im = operaxn.plot_twod_data(ax, IMG, intensity_limits=(2.0, 900.0))
-    norm = im.norm
-    im2 = operaxn.plot_twod_data(ax, IMG * 1.5, intensity_limits=(5.0, 400.0))
-    assert im2 is im and im.norm is norm, "the update must not swap the norm"
-    assert (norm.vmin, norm.vmax) == (5.0, 400.0)
-    updated = _render(fig)
-    operaxn.clear_plot_cache()
-    fresh_fig = Figure(figsize=(5, 4), dpi=95)
-    operaxn.plot_twod_data(fresh_fig.subplots(), IMG * 1.5, intensity_limits=(5.0, 400.0))
-    assert np.array_equal(updated, _render(fresh_fig))
-    operaxn.clear_plot_cache()
-
-
-def test_intensity_handler_keeps_norm():
-    """The 2D intensity handler re-limits the image in place without replacing its norm."""
-    operaxn.clear_plot_cache()
-    fig = Figure()
-    ax = fig.subplots()
-    im = operaxn.plot_twod_data(ax, IMG, intensity_limits=(2.0, 900.0))
-    norm = im.norm
-    fake = SimpleNamespace(
-        state=SimpleNamespace(twod_arrays={1: {"image": IMG}}, intensity_limits={}, current_scan_idx=0),
-        axes={"twod": ax}, twod_image=im, canvas=None,
-        controls=SimpleNamespace(get_intensity_limits=lambda: (3.0, 300.0)))
-    OPERAXN._update_plots_with_intensity(fake)
-    assert im.norm is norm and (norm.vmin, norm.vmax) == (3.0, 300.0)
-    operaxn.clear_plot_cache()
-
-
-def test_settings_change_keeps_1d_2d_artists_and_rebuilds_echem():
-    """A Plot Settings change keeps the cached 1D line and 2D image; only the echem pane rebuilds."""
-    operaxn.clear_plot_cache()
-    fig = Figure()
-    a1, a2, a3 = fig.subplots(3)
-    operaxn.plot_oned_data(a1, np.linspace(10, 80, 50), np.arange(50.0))
-    line = a1.lines[0]
-    im = operaxn.plot_twod_data(a2, IMG, intensity_limits=(2.0, 900.0))
-    t = np.arange(10.0) * 600
-    operaxn.plot_echem_data(a3, t, 3.7 + 0.01 * t / 600, 0.1 + 0 * t)
-    calls = []
-    fake = SimpleNamespace(axes={"oned": a1, "twod": a2, "echem": a3},
-                           _update_plots=lambda: calls.append(1))
-    OPERAXN._on_plot_settings_update(fake)
-    assert calls == [1]
-    assert output_module._plot_cache.get(f"oned_{id(a1)}") is line
-    assert output_module._plot_cache.get(f"twod_{id(a2)}") is im
-    assert output_module._plot_cache.get(f"echem_v_{id(a3)}") is None and not a3.lines, \
-        "the echem pane is rebuilt"
-    operaxn.clear_plot_cache()
-
-
-# ============================================================================
-# Plot settings and exports
-# ============================================================================
-
-def _limit_stub():
-    """Return (stand-in dialog, its config, a text box) for PlotSettingsDialog._validate_entry."""
-    from operaxn.dialog import PlotSettingsDialog
-    from operaxn.gui import VisualiserConfig
-    config = VisualiserConfig()
-    stub = SimpleNamespace(config=config)
-    stub._set_config_value = lambda k, v: PlotSettingsDialog._set_config_value(stub, k, v)
-    box = {"text": ""}
-    var = SimpleNamespace(get=lambda: box["text"], set=lambda v: box.update(text=v))
-    return stub, config, box, var
-
-
-@pytest.mark.parametrize("text", ["inf", "-inf", "nan", "1e999"])
-def test_plot_settings_clear_a_non_finite_limit(text):
-    """A non-finite Plot Settings limit is cleared to auto, as unparseable text already is."""
-    from operaxn.dialog import PlotSettingsDialog
-    stub, config, box, var = _limit_stub()
-    box["text"] = text
-    PlotSettingsDialog._validate_entry(stub, "xmax", var)
-    assert config.oned_xmax is None and box["text"] == ""
-
-
-def test_plot_settings_keep_a_decreasing_dspacing_range():
-    """Finite limits are stored as typed, including X-ray d-spacing Min above Max."""
-    from operaxn.dialog import PlotSettingsDialog
-    stub, config, box, var = _limit_stub()
-    config.show_dspacing = True
-    for key, text in (("xmin", "5.2"), ("xmax", "2.07"), ("neutron_xmax", "15000")):
-        box["text"] = text
-        PlotSettingsDialog._validate_entry(stub, key, var)
-        assert box["text"] == text
-    assert (config.oned_xmin, config.oned_xmax, config.neutron_xmax) == (5.2, 2.07, 15000.0)
-
-
-def test_dspacing_blank_limit_is_filled_decreasing():
-    """With one X limit blank the X-ray d view keeps the chosen part and runs decreasing."""
-    tth = np.linspace(17.05, 43.59, 300)
-    plotter = OneDPlotter()
-    d = plotter.transformer.theta_to_d_spacing(tth)
-    # A scalar input gives a 0-d value, so take it through atleast_1d
-    d40, d25 = (float(np.atleast_1d(plotter.transformer.theta_to_d_spacing(v))[0]) for v in (40.0, 25.0))
-    for xmin, xmax, expected in [(None, d40, (d.max(), d40)), (d25, None, (d25, d.min())),
-                                 (None, None, (d.max(), d.min()))]:
-        ax = Figure().subplots()
-        plotter._create_plot(ax, tth, np.arange(300.0),
-                             PlotConfig(show_dspacing=True, oned_xmin=xmin, oned_xmax=xmax,
-                                        use_cache=False), "k")
-        assert np.allclose(ax.get_xlim(), expected)
-    ax = Figure().subplots()
-    plotter._create_plot(ax, tth, np.arange(300.0),
-                         PlotConfig(oned_xmax=40.0, use_cache=False), "k")
-    assert np.allclose(ax.get_xlim(), (17.05, 40.0)), "2-theta view must not change"
-
-
-@pytest.mark.parametrize("source, expected", [
-    (operaxn.DataSourceType.INHOUSE, (0.04, 0.36, 0.05, 0.6)),
-    (operaxn.DataSourceType.SYNCHROTRON, (0.1, 0.9, 0.05, 0.6)),
-])
-def test_cropped_image_extent_follows_the_crop(source, expected):
-    """The 2D image spans the cropped part of the source's base extent (exports rely on it)."""
-    config = operaxn.VisualiserConfig(data_source=source)
-    config.twod_xmin_percent, config.twod_xmax_percent = 10, 90
-    config.twod_ymin_percent, config.twod_ymax_percent = 5, 60
-    image = np.arange(1.0, 5401.0).reshape(60, 90)
-    im = operaxn.plot_twod_data(Figure().subplots(), image,
-                                plot_config={**config.to_dict(), "use_cache": False})
-    assert np.allclose(im.get_extent(), expected), im.get_extent()
-
-
-def test_failed_plot_update_leaves_drawing_switched_on():
-    """A plot error inside the update block restores draw_idle without drawing; the next update draws."""
-    calls = []
-    canvas = SimpleNamespace(draw_idle=lambda: calls.append("draw"))
-    original = canvas.draw_idle
-    frame = SimpleNamespace(canvas=canvas)
-    with pytest.raises(ValueError):
-        with OPERAXN._plot_update_context(frame):
-            canvas.draw_idle()
-            raise ValueError("Axis limits cannot be NaN or Inf")
-    assert canvas.draw_idle is original, "drawing stays switched off for the session"
-    assert calls == [], "a half-updated figure must not be drawn"
-    with OPERAXN._plot_update_context(frame):
-        canvas.draw_idle()
-    assert calls == ["draw"], "one draw per successful update"
-
-
-def test_failed_single_scan_export_closes_its_figure(tmp_path):
-    """A drawing error inside export_single_scan does not leave a pyplot figure open."""
-    import matplotlib.pyplot as plt
-    from operaxn.output import export_single_scan
-    bad = {"scan_num": 1, "oned": {"x": np.linspace(10, 80, 100), "y": np.ones(100)},
-           "twod": np.ones(50)}
-    before = len(plt.get_fignums())
-    for _ in range(3):
-        with pytest.raises(ValueError):
-            export_single_scan(bad, str(tmp_path / "bad.png"))
-    assert len(plt.get_fignums()) == before
-
-
-def test_echem_only_export_is_refused(tmp_path):
-    """A scan with no drawable panel raises instead of saving a title-only image."""
-    from operaxn.output import export_single_scan
-    out = tmp_path / "title_only.png"
-    with pytest.raises(ValueError, match="no 1D, 2D or neutron data") as refused:
-        export_single_scan({"scan_num": 3, "oned": None, "twod": None, "echem_value": 3.7},
-                           str(out), plot_types={"oned": True, "twod": True, "echem": True})
-    assert str(refused.value) == "no 1D, 2D or neutron data", \
-        "the text leaves the scan number to the range export's list"
-    assert not out.exists()
-
-
-@pytest.mark.display
-def test_export_dialog_needs_a_pattern_for_xray(tk_root, monkeypatch):
-    """Only "Echem values" ticked is refused with a warning for X-ray data."""
-    import operaxn.dialog as dialog_module
-    warnings, got = [], []
-    monkeypatch.setattr(dialog_module.messagebox, "showwarning",
-                        lambda *a, **_k: warnings.append(a))
-    dlg = dialog_module.ExportOptionsDialog(tk_root, is_neutron=False, num_scans=5,
-                                            on_export=lambda opts, dialog: got.append(opts))
-    try:
-        dlg.plot_vars["oned"].set(False)
-        dlg.plot_vars["twod"].set(False)
-        dlg._do_export()
-        assert warnings and not got
-        dlg.plot_vars["twod"].set(True)
-        dlg._do_export()
-        assert got, "a 2D selection must still export"
-    finally:
-        if dlg.winfo_exists():
-            dlg.destroy()
-
-
-@pytest.mark.display
-@pytest.mark.parametrize("lower, upper, ok", [
-    ("nan", "4.3", False), ("2.5", "inf", False), ("4.3", "2.5", False),
-    ("3.0", "3.0", False), ("2.5", "4.3", True), ("", "4.3", True),
-])
-def test_protocol_voltage_window_is_validated(tk_root, monkeypatch, lower, upper, ok):
-    """Non-finite bounds and lower >= upper are refused like the tolerance field."""
-    import operaxn.dialog as dialog_module
-    monkeypatch.setattr(dialog_module.messagebox, "showerror", lambda *a, **_k: None)
-    dlg = dialog_module.UploadOptionsDialog(tk_root)
-    try:
-        dlg.proto_technique_var.set("GCPL")
-        dlg.proto_v_lower_var.set(lower)
-        dlg.proto_v_upper_var.set(upper)
-        result = dlg._validated_protocol()
-        assert (result is not False) == ok, result
-    finally:
-        if dlg.winfo_exists():
-            dlg.destroy()

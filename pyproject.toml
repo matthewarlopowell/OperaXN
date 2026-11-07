@@ -81,17 +81,16 @@ Repository = "https://github.com/matthewarlopowell/OperaXN"
 operaxn = "operaxn.main:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["bin/core", "bin/operaxn"]
+packages = ["bin/operaxn"]
 
 [tool.hatch.build.targets.wheel.sources]
-"bin/core" = "core"
 "bin/operaxn" = "operaxn"
 
 [tool.hatch.build.targets.sdist]
 # Anchored with a leading slash so a stray nested tests/ or LICENSE
 # (e.g. a venv left inside the checkout) cannot be swept into the sdist.
 include = [
-    "/bin/core", "/bin/operaxn", "/definitions", "/tests", "/schema",
+    "/bin/operaxn", "/definitions", "/tests", "/schema",
     "/examples", "/LICENSE", "/README.md", "/CITATION.cff",
     "/CONTRIBUTING.md", "/requirements.txt",
 ]

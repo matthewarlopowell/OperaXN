@@ -1069,7 +1069,7 @@ class OPERAXN(tk.Frame):
             if not self.state.scans:
                 self._show_message("No experiment loaded",
                                    "Load experiment data before adding standard "
-                                   "electrochemistry on its own.", "warning")
+                                   "electrochemistry on its own", "warning")
                 return
             self._append_standard_echem_async(options.standard_echem_files)
             return
@@ -1114,7 +1114,7 @@ class OPERAXN(tk.Frame):
         if not self._is_busy():
             return False
         self._show_message("Busy", "Wait for the current load or export to finish, "
-                                   f"then {action} again.", "warning")
+                                   f"then {action} again", "warning")
         return True
 
     def _finish_busy(self, outcome: Optional[Callable[[], None]]) -> None:
@@ -1140,17 +1140,18 @@ class OPERAXN(tk.Frame):
                 if not added:
                     outcome = lambda: self._show_message(
                         "No electrochemistry data",
-                        "No valid electrochemistry data was found in the selected files.",
+                        "No valid electrochemistry data was found in the selected files",
                         "warning")
                     return
 
                 def complete() -> None:
+                    sources = self._echem_sources()
+                    analysis_state = "normal" if sources else "disabled"
                     self.button_panel.update_states({
-                        "capacity_plot": "normal",
-                        "ici_analysis": "normal",
+                        "capacity_plot": analysis_state,
+                        "ici_analysis": analysis_state,
                         "export_nxs": "normal",
                     })
-                    sources = self._echem_sources()
                     for attr in ("_ici_window", "_capacity_window"):
                         analysis_window = getattr(self, attr, None)
                         try:
@@ -1168,13 +1169,13 @@ class OPERAXN(tk.Frame):
                             "Electrochemistry added without current",
                             f"The selected {'files were' if many else 'file was'} loaded, but "
                             f"{'they have' if many else 'it has'} no usable current column "
-                            "and therefore cannot be used for ICI or Capacity analysis.",
+                            "and therefore cannot be used for ICI or Capacity analysis",
                             "warning")
                     else:
                         self._show_message(
                             "Electrochemistry added",
                             f"Added {len(usable)} analysis "
-                            f"source{'s' if len(usable) != 1 else ''} to the current experiment.",
+                            f"source{'s' if len(usable) != 1 else ''} to the current experiment",
                             "info")
 
                 outcome = complete
@@ -1235,7 +1236,7 @@ class OPERAXN(tk.Frame):
 
                 if not self.state.scans:
                     outcome = lambda: self._abandon_load(
-                        "Warning", "No valid scan data found.", "warning")
+                        "Error", "Failed to load data: no scans found in the selection", "error")
                     return
 
                 # A directly opened .nxs is shown as the source it records
@@ -1255,7 +1256,7 @@ class OPERAXN(tk.Frame):
                 logger.debug("Error details: %s", traceback.format_exc())
                 # bind now: `e` is unbound once the except block exits, and
                 # the lambda only runs later on the Tk main loop
-                error_message = f"Failed to process files: {e}"
+                error_message = f"Failed to load data: {e}"
                 outcome = lambda: self._abandon_load("Error", error_message, "error")
             finally:
                 self.after(0, lambda: self._finish_busy(outcome))
@@ -1279,7 +1280,8 @@ class OPERAXN(tk.Frame):
             self.state.echem_arrays = make_echem_arrays(self.state.echem_df, self.state.time_method)
 
         if not self._check_data_availability():
-            self._abandon_load("Warning", "No valid data found in selected files.", "warning")
+            self._abandon_load("Error", "Failed to load data: no scan has readable 1D, 2D or "
+                               "neutron data", "error")
             return
 
         self._initialise_plot_limits()
@@ -1470,7 +1472,7 @@ class OPERAXN(tk.Frame):
                 has_echem = self.state.echem_arrays.get("x", []).size > 0
 
                 if not any([has_oned, has_twod, has_echem, has_neutron]):
-                    self._show_message("Warning", "No data available to plot.", "warning")
+                    self._show_message("No data", "Nothing to plot", "warning")
                     return
 
                 self._create_figure(has_oned, has_twod, has_echem, has_neutron)
@@ -1790,10 +1792,6 @@ class OPERAXN(tk.Frame):
             self.state.intensity_limits[i] = (current_min, current_max)
 
         self._update_plots()
-        self._show_message("Success",
-                           f"Applied intensity range {current_min:.4g} - {current_max:.4g} "
-                           "to all scans",
-                           "info")
 
     def _lift_existing_dialog(self, attr: str) -> bool:
         """Lift and focus the dialog stored on `attr`; True when it was still open."""
@@ -1863,7 +1861,7 @@ class OPERAXN(tk.Frame):
         if not (self.state.neutron_arrays if is_neutron else self.state.oned_arrays):
             self._show_message(
                 "No data",
-                "Load 1D XRD or neutron data before opening the heatmap.",
+                "Load 1D XRD or neutron data before opening the heatmap",
                 "warning")
             return
 
@@ -1899,8 +1897,8 @@ class OPERAXN(tk.Frame):
         sources = self._echem_sources()
         if not sources:
             self._show_message(
-                "No echem data",
-                "Load echem data with current values before opening ICI Analysis.",
+                "No electrochemistry data",
+                "Load echem data with current values before opening ICI Analysis",
                 "warning")
             return
 
@@ -1919,8 +1917,8 @@ class OPERAXN(tk.Frame):
         sources = self._echem_sources()
         if not sources:
             self._show_message(
-                "No echem data",
-                "Load echem data with current values before opening Capacity Analysis.",
+                "No electrochemistry data",
+                "Load echem data with current values before opening Capacity Analysis",
                 "warning")
             return
 
@@ -1958,6 +1956,7 @@ class OPERAXN(tk.Frame):
                     self._export_multiple_scans(options.dpi, options.plot_types,
                                                 options.scan_list, dialog)
         except Exception as e:
+            logger.debug("Image export error: %s", traceback.format_exc())
             self._close_dialog(dialog)
             what = "Image" if options.export_type == "current" else "Images"
             self._show_message("Export failed", f"{what} could not be exported: {e}", "error")
@@ -1980,7 +1979,7 @@ class OPERAXN(tk.Frame):
         """Save the canonical NeXus file for the loaded experiment on a worker thread.
         It already holds everything chosen at generation time, so this is a plain save."""
         if not self.state.scans:
-            self._show_message("Error", "No data loaded", "error")
+            self._show_message("No data", "Load data before exporting", "warning")
             return
         if self._warn_if_busy("export"):
             return
@@ -2029,7 +2028,7 @@ class OPERAXN(tk.Frame):
         scan_data = get_correlated_data(self.state.scans, scan_num, self.state)
 
         if not scan_data:
-            self._show_message("Error", "No data for current scan", "error")
+            self._show_message("No data", f"Scan {scan_num} has no data to export", "warning")
             return
 
         filename = filedialog.asksaveasfilename(
@@ -2115,13 +2114,16 @@ class OPERAXN(tk.Frame):
         if stopped:
             message = (f"Stopped: {success_count} of {len(scan_list)} "
                        f"image{'s' if len(scan_list) != 1 else ''} exported to:\n{base_dir}")
+        elif not success_count:
+            message = "Images could not be exported:"
         else:
             message = (f"{success_count} image{'s' if success_count != 1 else ''} "
                        f"exported to:\n{base_dir}")
 
         if failed_scans:
             n = len(failed_scans)
-            message += f"\n\nFailed to export {n} scan{'s' if n != 1 else ''}:"
+            if success_count or stopped:
+                message += f"\n\nFailed to export {n} scan{'s' if n != 1 else ''}:"
             for scan_num, error in failed_scans[:5]:  # Show first 5 errors
                 message += f"\n  Scan {scan_num}: {error}"
             if len(failed_scans) > 5:
@@ -2134,7 +2136,7 @@ class OPERAXN(tk.Frame):
     def _create_gif(self) -> None:
         """Open the GIF page; the GIF builds from it, with progress shown there."""
         if not self.state.scans:
-            self._show_message("Warning", "No scans available to create GIF", "warning")
+            self._show_message("No data", "Load data before exporting", "warning")
             return
 
         if self._lift_existing_dialog('_gif_dialog'):
@@ -2220,6 +2222,7 @@ class OPERAXN(tk.Frame):
                                    "info")
 
             except Exception as e:
+                logger.debug("GIF export error: %s", traceback.format_exc())
                 self._close_dialog(dialog)
                 self._show_message("Export failed", f"GIF could not be exported: {e}", "error")
 
@@ -2332,7 +2335,7 @@ class OPERAXN(tk.Frame):
         """Build the summary workbook on a worker thread and save it.
         Prompted and reported like _export_nxs, defaulting to the loaded experiment's name."""
         if not self.state.scans:
-            self._show_message("Error", "No data loaded", "error")
+            self._show_message("No data", "Load data before exporting", "warning")
             return
         if self._warn_if_busy("export"):
             return

@@ -209,7 +209,7 @@ class DATReader(DataReader):
             return self._parse_lines(path, lines, raw), lines
         except Exception as e:
             file_type = "neutron DAT" if self.data_type == "neutron" else "DAT"
-            raise OSError(f"Error reading {file_type} file {path}: {e}")
+            raise OSError(f"Error reading {file_type} file {os.path.basename(path)}: {e}")
 
     def _parse_lines(self, path: str, lines: List[str], raw: bytes) -> np.ndarray:
         """Parse the file's lines into an (N, 2 or 3+) float array; raise ValueError if none."""
@@ -273,7 +273,7 @@ class EDFReader(DataReader):
         try:
             return _floor_clip(np.asarray(fabio.open(path).data))
         except Exception as e:
-            raise OSError(f"Error reading EDF file {path}: {e}")
+            raise OSError(f"Error reading EDF file {os.path.basename(path)}: {e}")
 
 
 class XYReader(DataReader):
@@ -289,7 +289,7 @@ class XYReader(DataReader):
                 data = data.reshape(-1, 2)
             return data
         except Exception as e:
-            raise OSError(f"Error reading XY file {path}: {e}")
+            raise OSError(f"Error reading XY file {os.path.basename(path)}: {e}")
 
 
 class HDFReader(DataReader):
@@ -339,7 +339,7 @@ class HDFReader(DataReader):
 
                 return data
         except Exception as e:
-            raise OSError(f"Error reading HDF file {path}: {e}")
+            raise OSError(f"Error reading HDF file {os.path.basename(path)}: {e}")
 
     def _find_data_array(self, h5file: h5py.File) -> Optional[np.ndarray]:
         """Return the data at the first known path, else the largest 2D/3D dataset, or None."""

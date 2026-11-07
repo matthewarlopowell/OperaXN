@@ -352,8 +352,8 @@ validation of the generated files.
 ```
 OperaXN/
   bin/
-    core/          # Pipeline: classify, correlate, NeXus read/write
     operaxn/       # Tk GUI: visualisation and analysis
+      core/        # Pipeline: classify, correlate, NeXus read/write
   definitions/     # NXoperando_monopd / NXoperando_tofnpd NXDL definitions
   examples/        # Synthetic example dataset generator and walkthrough
   schema/          # Vendored NXDL schema used to validate the definitions

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 import _builders
-import core
+from operaxn import core
 
 pytestmark = pytest.mark.gui
 

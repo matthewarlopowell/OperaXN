@@ -23,8 +23,7 @@ from .config import (
     LOG_FILE,
     log_config_summary
 )
-from .gui import OPERAXN
-from core import format_profile_block, profile_from_mantid_nexus
+from .core import format_profile_block, profile_from_mantid_nexus
 
 # ============================================================================
 # Constants
@@ -560,6 +559,7 @@ class ApplicationManager:
         self.logger = setup_logging(args.debug)
         self.root = None
         self.splash_manager = None
+        self._window_class = None  # OPERAXN, imported by run()
         self.initialization_complete = False
         self.initialization_failed = False
 
@@ -569,6 +569,9 @@ class ApplicationManager:
             if not self._validate_environment():
                 return 1
 
+            # Imported here, before the splash, so --version and --profile load no GUI
+            from .gui import OPERAXN
+            self._window_class = OPERAXN
             self._initialise_ui()
 
             # Build the GUI shortly before the splash closes
@@ -596,7 +599,7 @@ class ApplicationManager:
                 "OperaXN requires Tcl/Tk 8.6 or newer on macOS. "
                 "The system Python does not include a compatible version.\n\n"
                 "Fix: install Python from https://www.python.org, "
-                "create a virtual environment with it, and reinstall OperaXN."
+                "create a virtual environment with it, and reinstall OperaXN"
             )
             return False
 
@@ -639,7 +642,7 @@ class ApplicationManager:
 
         try:
             # Tk keeps the main frame alive as a child of root
-            OPERAXN(master=self.root)
+            self._window_class(master=self.root)
             self.initialization_complete = True
             self.logger.info("Application initialised successfully")
             if self.splash_manager:
@@ -689,7 +692,7 @@ class ApplicationManager:
             if not self.root:
                 self.root = tk.Tk()
                 self.root.withdraw()
-            messagebox.showerror("Fatal Error", message)
+            messagebox.showerror("Fatal error", message)
         except Exception:
             print(f"FATAL ERROR: {message}", file=sys.stderr)
 

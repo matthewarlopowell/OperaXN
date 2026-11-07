@@ -5,7 +5,7 @@ import os
 import pandas as pd
 import pytest
 
-import core
+from operaxn import core
 
 import _builders
 
@@ -27,7 +27,7 @@ SYN_FILES = {
 @pytest.fixture
 def syn_groups():
     """Return SynchrotronFileGrouper output over the fixed synchrotron file mix."""
-    return core.SynchrotronFileGrouper().group_files(dict(SYN_FILES))
+    return core.SynchrotronFileGrouper().group_files(list(SYN_FILES))
 
 
 @pytest.mark.parametrize("scan_id, key, expected", [
@@ -47,7 +47,7 @@ def test_synchrotron_orphan_hdf_stays_ungrouped(syn_groups):
 
 def test_synchrotron_integration_xy_joins_group():
     """An _integration_ .xy maps back to its scan ID and joins the anchored group."""
-    files = {k: v for k, v in SYN_FILES.items() if k != "/data/sample_123456_extra.xy"}
+    files = [f for f in SYN_FILES if f != "/data/sample_123456_extra.xy"]
     groups = core.SynchrotronFileGrouper().group_files(files)
     assert groups["123456"].get("xy") == "/data/sample_123456_integration_00.xy", \
         str(groups.get("123456"))
@@ -58,7 +58,7 @@ def test_synchrotron_dotted_names_keep_their_xy(prefix):
     """A dot inside the stem (e.g. '0.5C') neither drops the .xy nor changes the scan ID."""
     files = [f"{prefix}12345.nxs", f"pixium_{prefix}12345.hdf",
              f"{prefix}12345_integration_tth_0000_cell.xy"]
-    groups = core.SynchrotronFileGrouper().group_files({f: f for f in files})
+    groups = core.SynchrotronFileGrouper().group_files(files)
     assert groups == {"12345": {"nxs": files[0], "hdf": files[1], "xy": files[2]}}
     assert {core.SynchrotronFileGrouper.extract_scan_id(f) for f in files} == {"12345"}
 
@@ -309,7 +309,7 @@ def test_unreadable_logbook_run_line_is_named(tmp_path, caplog, runs):
     lines += [unreadable[run] for run in runs]
     path = tmp_path / "SC1_log_book.txt"
     _builders.write_logbook(str(path), lines)
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         df = core.NeutronMetadataParser.parse(str(path))
     assert df is not None and df["scan_id"].tolist() == ["123456"], str(df)
     expected = ("1 logbook line has no readable start and end time and was skipped: 123457"
@@ -340,7 +340,7 @@ def test_neutron_file_grouping(tmp_path):
     """Builder bank files group as scan -> measurement -> tof/d paths."""
     _builders.write_neutron_banks(str(tmp_path))
     files = [str(tmp_path / name) for name in sorted(os.listdir(tmp_path))]
-    groups = core.NeutronFileGrouper().group_neutron_files(files)
+    groups = core.NeutronFileGrouper().group_files(files)
     assert set(groups.keys()) == {"123456"}, str(groups)
     assert set(groups["123456"].keys()) == {"1", "2"}, str(groups["123456"])
     for meas in ("1", "2"):
@@ -397,32 +397,32 @@ def test_neutron_bank_names(filename, expected):
 def _bank_warnings(caplog):
     """Return the WARNING messages the neutron grouper logged."""
     return [r.getMessage() for r in caplog.records
-            if r.name == "core.classify" and r.levelno == logging.WARNING]
+            if r.name == "operaxn.core.classify" and r.levelno == logging.WARNING]
 
 
 def test_mantid_split_banks_keep_their_own_slots(caplog):
     """Split files 98765-0 to -13 fill banks 1-5 from their own files; one line names the rest."""
     files = sorted(f"/x/98765-{i}.dat" for i in range(14))
-    with caplog.at_level(logging.WARNING, logger="core"):
-        groups = core.NeutronFileGrouper().group_neutron_files(files)
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
+        groups = core.NeutronFileGrouper().group_files(files)
     assert {b: slot["tof"] for b, slot in groups["98765"].items()} == \
         {str(b): f"/x/98765-{b}.dat" for b in range(1, 6)}, groups
     assert _bank_warnings(caplog) == [
-        "9 .dat files were not recognised as neutron bank 1-5 files and were ignored "
-        "(e.g. 98765-0.dat)"]
+        "9 .dat files were not recognised as neutron bank 1-5 files and were ignored: "
+        "98765-0.dat, 98765-10.dat, 98765-11.dat and 6 more"]
 
 
 def test_banks_6_to_9_are_skipped_and_named(caplog):
     """Banks 6-9 are not loaded; one line names them instead of dropping them silently."""
     files = [f"/x/{name}" for bank in range(1, 10)
              for name in _builders.polaris_bank_names("153868", bank)]
-    with caplog.at_level(logging.WARNING, logger="core"):
-        groups = core.NeutronFileGrouper().group_neutron_files(files)
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
+        groups = core.NeutronFileGrouper().group_files(files)
     assert sorted(groups["153868"]) == ["1", "2", "3", "4", "5"], groups
     assert all(set(slot) == {"tof", "d"} for slot in groups["153868"].values()), groups
     assert _bank_warnings(caplog) == [
-        "8 .dat files were not recognised as neutron bank 1-5 files and were ignored "
-        "(e.g. POL153868-b_6-TOF.dat)"]
+        "8 .dat files were not recognised as neutron bank 1-5 files and were ignored: "
+        "POL153868-b_6-TOF.dat, POL153868-b_6-d.dat, POL153868-b_7-TOF.dat and 5 more"]
 
 
 def test_one_unrecognised_bank_file_is_reported_in_the_singular(caplog):
@@ -430,12 +430,12 @@ def test_one_unrecognised_bank_file_is_reported_in_the_singular(caplog):
     files = [f"/x/{name}" for bank in (1, 2)
              for name in _builders.polaris_bank_names("153868", bank)]
     files.append("/x/POL153868-b_13-d.dat")
-    with caplog.at_level(logging.WARNING, logger="core"):
-        groups = core.NeutronFileGrouper().group_neutron_files(files)
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
+        groups = core.NeutronFileGrouper().group_files(files)
     assert groups["153868"]["1"]["d"] == "/x/POL153868-b_1-d.dat", groups
     assert _bank_warnings(caplog) == [
-        "1 .dat file was not recognised as a neutron bank 1-5 file and was ignored "
-        "(POL153868-b_13-d.dat)"]
+        "1 .dat file was not recognised as a neutron bank 1-5 file and was ignored: "
+        "POL153868-b_13-d.dat"]
 
 
 def test_upper_case_dat_bank_files_group(caplog):
@@ -444,8 +444,8 @@ def test_upper_case_dat_bank_files_group(caplog):
              for name in _builders.polaris_bank_names("153868", bank)]
     files += [f"/w/{name[:-4]}.DAT" for bank in (1, 2)
               for name in _builders.wish_bank_names("59268", bank)]
-    with caplog.at_level(logging.WARNING, logger="core"):
-        groups = core.NeutronFileGrouper().group_neutron_files(files)
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
+        groups = core.NeutronFileGrouper().group_files(files)
     for run in ("153868", "59268"):
         assert sorted(groups.get(run, {})) == ["1", "2"], groups
         assert all(set(slot) == {"tof", "d"} for slot in groups[run].values()), groups
@@ -455,12 +455,12 @@ def test_upper_case_dat_bank_files_group(caplog):
 def test_d_in_a_cell_name_keeps_the_tof_file():
     """A 'cell_d_' sample prefix does not turn the TOF file into a second d file."""
     tof, d = _builders.wish_bank_names("59268", 1)
-    groups = core.NeutronFileGrouper().group_neutron_files([f"/x/cell_d_{tof}", f"/x/cell_d_{d}"])
+    groups = core.NeutronFileGrouper().group_files([f"/x/cell_d_{tof}", f"/x/cell_d_{d}"])
     assert groups["59268"]["1"] == {"tof": f"/x/cell_d_{tof}", "d": f"/x/cell_d_{d}"}, groups
 
 
 def test_upper_case_d_marker_reads_as_d():
     """An all upper-case WISH pair (59268-1_10RAW-D-0.DAT) keeps its TOF and d files apart."""
     tof, d = (name.upper() for name in _builders.wish_bank_names("59268", 1))
-    groups = core.NeutronFileGrouper().group_neutron_files([f"/x/{tof}", f"/x/{d}"])
+    groups = core.NeutronFileGrouper().group_files([f"/x/{tof}", f"/x/{d}"])
     assert groups.get("59268", {}).get("1") == {"tof": f"/x/{tof}", "d": f"/x/{d}"}, groups

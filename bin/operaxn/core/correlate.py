@@ -96,6 +96,7 @@ class EchemParser:
                 lines = f.readlines()
 
             if not lines:
+                logger.warning(f"No electrochemistry data found in {name}; not stored")
                 return None
 
             has_header = any(h in lines[0].lower() for h in self.HEADER_KEYWORDS)
@@ -130,11 +131,13 @@ class EchemParser:
 
             if data:
                 return pd.DataFrame(data)
-
+            # None: a warning already named the file
+            if data is not None:
+                logger.warning(f"No electrochemistry data found in {name}; not stored")
             return None
 
         except Exception as e:
-            logger.error(f"Failed to parse echem file {name}: {e}")
+            logger.error(f"Error parsing echem file {name}: {e}")
             return None
 
     def _detect_columns(self, header_line: str,
@@ -297,16 +300,17 @@ class EchemParser:
 
     @staticmethod
     def _parse_data_lines(lines: List[str], columns: Dict[str, int], voltage_scale: float,
-                          current_scale: float, name: str) -> List[Dict[str, Any]]:
+                          current_scale: float, name: str) -> Optional[List[Dict[str, Any]]]:
         """Parse data lines into row dicts, skipping unparseable and placeholder rows.
-        Ambiguous dates are read day-first (UK convention, by design)."""
+        None when a warning named the file; dates are read day-first (UK convention, by design)."""
         # A disabled time/voltage column (-1) would silently index parts[-1]
         if columns["time"] < 0 or columns["voltage"] < 0:
             logger.warning(f"Skipping {name}: echem time/voltage column could not be resolved")
-            return []
+            return None
 
         data = []
         offsets = set()
+        unreadable = 0
         # A row needs its time and voltage; a blank or missing current is read as None
         rows = [parts for parts in (line.strip().split("\t") for line in lines)
                 if len(parts) > max(columns["time"], columns["voltage"])]
@@ -319,7 +323,7 @@ class EchemParser:
         if cells and all(_is_number(cell) for cell in cells):
             logger.warning(f"Skipping {name}: echem time column holds plain numbers "
                            "(elapsed seconds?), not dates")
-            return []
+            return None
 
         with warnings.catch_warnings():
             # pandas warns when a value can only be month-first (e.g. 05/13);
@@ -344,6 +348,7 @@ class EchemParser:
                     else:
                         timestamp = pd.to_datetime(ts_str, dayfirst=True)
                 except (ValueError, TypeError):
+                    unreadable += bool(ts_str.strip())
                     continue
 
                 # Blank cells parse to NaT without raising; a NaT row would
@@ -357,6 +362,8 @@ class EchemParser:
                 try:
                     voltage = float(parts[columns["voltage"]]) * voltage_scale
                 except ValueError:
+                    # A blank cell holds no reading, so none is lost
+                    unreadable += bool(parts[columns["voltage"]].strip())
                     continue
 
                 current = None
@@ -381,6 +388,11 @@ class EchemParser:
             logger.warning(f"{name}: {early} echem row{'s' if early != 1 else ''} dated before "
                            f"1900 (placeholders?) {'were' if early != 1 else 'was'} skipped")
             data = [row for row in data if row["timestamp"].year >= 1900]
+        # A file with no row left is named once, by parse
+        if unreadable and data:
+            logger.warning(f"{name}: {unreadable} echem row{'s' if unreadable != 1 else ''} "
+                           "with no readable time or voltage "
+                           f"{'were' if unreadable != 1 else 'was'} skipped")
         return data
 
 
@@ -536,7 +548,7 @@ class ScanProcessor:
         logger.info(f"Found {len(neutron_files)} .dat file{'s' if len(neutron_files) != 1 else ''}")
 
         grouper = NeutronFileGrouper()
-        neutron_groups = grouper.group_neutron_files(neutron_files)
+        neutron_groups = grouper.group_files(neutron_files)
 
         unmatched: List[str] = []  # logbook runs with no data files
 

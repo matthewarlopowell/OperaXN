@@ -24,7 +24,7 @@ from .config import (DEFAULT_PROFILES, DEFINITION_URL_BASE, DEFINITION_VERSION,
 from .classify import (extract_edf_scan_fields, parse_mantid_header,
                        parse_mantid_header_lines)
 from .correlate import EchemParser
-from .model import DataSourceType, Scan, check_cancelled
+from .model import DataSourceType, Scan, TimeMethod, check_cancelled
 from .readers import FABIO_AVAILABLE, DataReaderFactory, HDFReader, fabio
 
 logger = logging.getLogger(__name__)
@@ -374,7 +374,7 @@ class NXSWriter:
     def __init__(self, data_source: DataSourceType = DataSourceType.INHOUSE,
                  include_2d_images: bool = False,
                  max_display_size: int = 0,
-                 correlation_method: str = "absolute",
+                 time_method: TimeMethod = TimeMethod.ABSOLUTE,
                  title: Optional[str] = None,
                  sample_name: Optional[str] = None,
                  sample_description: Optional[str] = None,
@@ -384,7 +384,7 @@ class NXSWriter:
         self.data_source = data_source
         self.include_2d_images = include_2d_images
         self.max_display_size = max_display_size  # 0 = full resolution
-        self.correlation_method = correlation_method
+        self.time_method = time_method
         self.title = title
         self.sample_name = sample_name
         self.sample_description = sample_description
@@ -481,7 +481,7 @@ class NXSWriter:
         process.create_dataset('version', data=GENERATOR_VERSION)
         process.create_dataset('date', data=_iso(pd.Timestamp.now()))
         process.create_dataset('data_source', data=self.data_source.value)
-        process.create_dataset('correlation_method', data=self.correlation_method)
+        process.create_dataset('correlation_method', data=self.time_method.value)
         process.create_dataset('total_scans', data=len(scans))
 
     def _write_entry_fields(self, entry: h5py.Group, scans: List[Scan],
@@ -994,8 +994,7 @@ class NXSWriter:
                 logger.warning(f"Standard electrochemistry file {name} not found; skipped")
                 continue
             standard_echem_df = self.echem_parser.parse(parse_path, name)
-            if standard_echem_df is None or standard_echem_df.empty:
-                logger.warning(f"No electrochemistry data found in {name}; not stored")
+            if standard_echem_df is None:  # the parser named the file
                 continue
             datasets.append({'source_file': name,
                              'data': standard_echem_df})

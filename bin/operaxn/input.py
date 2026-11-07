@@ -19,21 +19,21 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from core import ECHEM_TIME_TOLERANCE, SYNCHROTRON_MAX_DISPLAY_SIZE
-from core import (  # noqa: F401  (GUI scan labels)
+from .core import ECHEM_TIME_TOLERANCE, SYNCHROTRON_MAX_DISPLAY_SIZE
+from .core import (  # noqa: F401  (GUI scan labels)
     NeutronFileGrouper,
     SynchrotronFileGrouper,
 )
-from core import EchemParser, format_relative_time, parse_relative_time
-from core import (
+from .core import EchemParser, format_relative_time, parse_relative_time
+from .core import (
     cache_dir, convert_tabular_to_txt, default_cache_path, generate,
 )
-from core import DataSourceType, ScanData, TimeMethod
-from core import is_canonical_nxs, load
-from core import write_standard_echem_group
+from .core import DataSourceType, ScanData, TimeMethod
+from .core import is_canonical_nxs, load
+from .core import write_standard_echem_group
 # gui.py imports replace_when_done from here
-from core.nxs_writer import CYCLING_PROTOCOL_FIELDS, replace_when_done
-from core import DataReaderFactory, HDFReader, clear_global_cache
+from .core.nxs_writer import CYCLING_PROTOCOL_FIELDS, replace_when_done
+from .core import DataReaderFactory, HDFReader, clear_global_cache
 
 logger = logging.getLogger(__name__)
 
@@ -253,12 +253,6 @@ def process_paths(selected_paths: List[str],
             if os.path.isfile(os.path.join(images_dir, ".operaxn_images")):
                 shutil.rmtree(images_dir, ignore_errors=True)
             raise RuntimeError("\n".join(fatal) or "NeXus generation failed")
-        if progress_callback:
-            # Non-fatal warnings (e.g. a 2D sidecar that could not be
-            # persisted) would otherwise never reach the user on success
-            for msg in messages:
-                if msg.startswith("Warning"):
-                    progress_callback(msg)
 
     _session["nxs_path"] = os.path.abspath(nxs_path)
     _session["images_nxs"] = _session["nxs_path"]
@@ -457,8 +451,7 @@ def add_standard_echem_files(paths: List[str]) -> List[Dict[str, Any]]:
                     os.remove(parse_path)
                 except OSError:
                     pass
-        if data is None or data.empty:
-            logger.warning("No electrochemistry data found in %s", source_path)
+        if data is None:  # the parser named the file
             continue
         additions.append({
             "source_file": os.path.basename(source_path),

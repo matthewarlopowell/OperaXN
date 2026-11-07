@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import tkinter as tk
+import traceback
 from tkinter import filedialog, messagebox
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -237,8 +238,13 @@ def intensity_limits(matrix: np.ndarray, ceiling: float = 100.0,
     data = data[np.isfinite(data)]
     if log:
         data = data[data > 0]
+        # an uncommitted bound <= 0 cannot be used either: it returns to automatic
+        vmin = None if vmin is not None and vmin <= 0 else vmin
+        vmax = None if vmax is not None and vmax <= 0 else vmax
     if data.size == 0:
         data = np.array([VMIN_FLOOR])
+    if vmin is not None and vmax is not None and vmax <= vmin:
+        vmax = None  # an uncommitted crossed pair: Max returns to automatic
     if vmin is not None:
         lo = float(vmin)
     elif log:
@@ -360,6 +366,12 @@ def _parse_float(text: str) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return value if np.isfinite(value) else None
+
+
+def _log_bound(text: str) -> str:
+    """Return a typed intensity bound for log mode: blank (automatic) when not above 0."""
+    value = _parse_float(text)
+    return '' if value is not None and value <= 0 else text
 
 
 def title_text(text: str) -> str:
@@ -568,8 +580,11 @@ class HeatmapWindow(tk.Toplevel):
         # Ceiling percentile clips hot pixels so weak peaks show
         _label(intensity, 'ceiling (%):', dim=True).pack(side='left', padx=(_PAD_S, 0))
         self.ceiling_var = tk.DoubleVar(value=100.0)
-        _spinbox(intensity, self.ceiling_var, from_=50.0, to=100.0,
-                 increment=0.5, format='%.1f', width=6).pack(side='left', padx=2)
+        spin = _spinbox(intensity, self.ceiling_var, from_=50.0, to=100.0,
+                        increment=0.5, format='%.1f', width=6)
+        spin.pack(side='left', padx=2)
+        spin.bind('<Return>', self._commit_ceiling)
+        spin.bind('<FocusOut>', self._commit_ceiling)
         trace_write(self, self.ceiling_var, lambda *_: self._queue_replot())
         _Btn(intensity, 'Reset', padx=6,
              command=self._reset_ranges).pack(side='left', padx=2)
@@ -630,15 +645,38 @@ class HeatmapWindow(tk.Toplevel):
         return buttons
 
     def _range_pair(self, master, label, min_var, max_var) -> None:
-        """Build labelled min-to-max entries that replot on Return or focus loss."""
+        """Build labelled min-to-max entries that commit and replot on Return or focus loss."""
         _label(master, label).pack(side='left', padx=(0, 2))
         for i, var in enumerate((min_var, max_var)):
             if i:
                 _label(master, 'to', dim=True).pack(side='left', padx=2)
             entry = _entry(master, var)
             entry.pack(side='left')
-            entry.bind('<Return>', lambda _e: self._replot())
-            entry.bind('<FocusOut>', lambda _e: self._replot())
+            entry.bind('<Return>', lambda _e, v=var: self._commit_range(v))
+            entry.bind('<FocusOut>', lambda _e, v=var: self._commit_range(v))
+
+    def _commit_range(self, var: tk.StringVar) -> None:
+        """Clear unusable text or a Log bound <= 0, or the other bound this one is not below."""
+        if var.get().strip() and _parse_float(var.get()) is None:
+            var.set('')
+        elif var is self.zmin_var or var is self.zmax_var:
+            if self.scale_var.get() == 'log':
+                var.set(_log_bound(var.get()))  # as switching to Log does
+            lo, hi = _parse_float(self.zmin_var.get()), _parse_float(self.zmax_var.get())
+            if lo is not None and hi is not None and lo >= hi:
+                (self.zmax_var if var is self.zmin_var else self.zmin_var).set('')
+        self._replot()
+
+    def _commit_ceiling(self, _event=None) -> None:
+        """Show the ceiling in use: a number clamped to 50-100, anything else 100."""
+        try:
+            typed = float(self.ceiling_var.get())
+        except (ValueError, tk.TclError):
+            typed = None
+        value = (min(max(typed, 50.0), 100.0)
+                 if typed is not None and np.isfinite(typed) else 100.0)
+        if value != typed:
+            self.ceiling_var.set(value)
 
     def _set_toggle(self, var: tk.StringVar, buttons: dict, value: str) -> None:
         """Switch a toggle group and replot; bank, x axis and scan filter reload the rows."""
@@ -655,6 +693,12 @@ class HeatmapWindow(tk.Toplevel):
         var.set(value)
         for val, btn in buttons.items():
             btn.set_selected(val == value)
+        if var is self.scale_var and value == 'log':
+            # Log cannot use a typed bound <= 0, in any bank: it returns to the automatic floor
+            self.zmin_var.set(_log_bound(self.zmin_var.get()))
+            self.zmax_var.set(_log_bound(self.zmax_var.get()))
+            self._bank_limits = {bank: (_log_bound(lo), _log_bound(hi))
+                                 for bank, (lo, hi) in self._bank_limits.items()}
         if var is self.xaxis_var:
             self._set_entries(self.xmin_var, self.xmax_var)
         if var is self.bank_var or var is self.xaxis_var:
@@ -1013,7 +1057,7 @@ class HeatmapWindow(tk.Toplevel):
     def _export_figure(self) -> None:
         """Save the displayed map as a publication figure."""
         if self._matrix is None:
-            messagebox.showwarning('No data', 'Nothing to export.', parent=self)
+            messagebox.showwarning('No data', 'Nothing to export', parent=self)
             return
         path = filedialog.asksaveasfilename(
             parent=self, title='Export heatmap figure',
@@ -1024,6 +1068,7 @@ class HeatmapWindow(tk.Toplevel):
         try:
             self.save_figure(path)
         except Exception as exc:
+            logger.debug('Heatmap export error: %s', traceback.format_exc())
             messagebox.showerror('Export failed', f'Heatmap could not be exported: {exc}',
                                  parent=self)
             return
@@ -1031,6 +1076,9 @@ class HeatmapWindow(tk.Toplevel):
 
     def _export_all_banks(self) -> None:
         """Save one publication figure per bank, bank number appended."""
+        if not any(self._rows_for(bank)[1] is not None for bank in self._banks):
+            messagebox.showwarning('No data', 'No bank has patterns on this axis', parent=self)
+            return
         path = filedialog.asksaveasfilename(
             parent=self, title='Export all banks (the bank number is appended)',
             defaultextension='.png', filetypes=EXPORT_FILETYPES,
@@ -1045,12 +1093,9 @@ class HeatmapWindow(tk.Toplevel):
                 if self.save_figure(out, bank):
                     written.append(out)
         except Exception as exc:
+            logger.debug('Heatmap export error: %s', traceback.format_exc())
             messagebox.showerror('Export failed', f'Heatmaps could not be exported: {exc}',
                                  parent=self)
-            return
-        if not written:
-            messagebox.showwarning('No data', 'No bank has patterns on this axis.',
-                                   parent=self)
             return
         noun = 'Heatmap' if len(written) == 1 else 'Heatmaps'
         messagebox.showinfo('Export complete', f'{noun} exported to:\n' + '\n'.join(written),

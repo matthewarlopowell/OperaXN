@@ -19,9 +19,9 @@ from typing import Dict, List, Callable, Optional, Set, Tuple, Any
 import numpy as np
 import pandas as pd
 
-from core import (ECHEM_TIME_TOLERANCE, TimeMethod, is_canonical_nxs,
-                  read_correlation_method, read_data_source)
-from core.config import MAX_ECHEM_TIME_TOLERANCE
+from .core import (ECHEM_TIME_TOLERANCE, TimeMethod, is_canonical_nxs,
+                   read_correlation_method, read_data_source)
+from .core.config import MAX_ECHEM_TIME_TOLERANCE
 
 from .output import clear_plot_cache
 from .config import (
@@ -458,9 +458,10 @@ class BaseDialog(tk.Toplevel):
             value_label.config(text=f"{float(variable.get()):g}{unit}")
 
         def moved(_value: str) -> None:
-            show_value()
+            # The command may move the slider back (a crop pair never crosses)
             if command:
                 command()
+            show_value()
 
         scale = self.create_themed_scale(parent, variable, from_, to, showvalue=False)
         if resolution != 1:
@@ -523,6 +524,9 @@ class PlotSettingsDialog(BaseDialog):
 
     X_TWOTHETA_HEADING = "X-axis range (2θ [°]):"
     X_DSPACING_HEADING = "X-axis range (d-spacing [Å]):"
+    # Each 2D crop slider's partner, and +1 where it stays below that partner
+    _CROP_PAIRS = {'ymin_2d_var': ('ymax_2d_var', 1), 'ymax_2d_var': ('ymin_2d_var', -1),
+                   'xmin_2d_var': ('xmax_2d_var', 1), 'xmax_2d_var': ('xmin_2d_var', -1)}
 
     def __init__(self, master: tk.Misc, config: Any, on_update: Callable) -> None:
         super().__init__(master, "Plot Settings")
@@ -681,7 +685,15 @@ class PlotSettingsDialog(BaseDialog):
             var = tk.DoubleVar(value=value)
             setattr(self, var_name, var)
             self.create_scale_row(crop, row, label, var, 0, 100, unit="%",
-                                  command=self._apply_settings)
+                                  command=lambda n=var_name: self._on_crop(n))
+
+    def _on_crop(self, name: str) -> None:
+        """Keep a crop pair at least 1 % apart, so it never crosses, then apply."""
+        partner, sign = self._CROP_PAIRS[name]
+        var, other = getattr(self, name), getattr(self, partner).get()
+        if sign * (other - var.get()) < 1:
+            var.set(other - sign)
+        self._apply_settings()
 
     def _on_dspacing_toggle(self) -> None:
         """Convert entered X limits between 2-theta and d-spacing, then apply."""
@@ -765,7 +777,7 @@ class PlotSettingsDialog(BaseDialog):
                 clear_plot_cache()
 
         except ValueError as e:
-            messagebox.showerror("Invalid input", str(e), parent=self)
+            messagebox.showerror("Error", f"Failed to apply the plot settings: {e}", parent=self)
 
 
 # ============================================================================
@@ -809,6 +821,16 @@ def parse_scan_range(text: str, max_scan: Optional[int] = None) -> List[int]:
     except (ValueError, TypeError, AttributeError):
         return []
     return [s for s in sorted(scans) if s >= 1 and (max_scan is None or s <= max_scan)]
+
+
+def _read_scan_range(dialog: BaseDialog, var: tk.StringVar, num_scans: int) -> List[int]:
+    """Return the scans a range entry names, all of them when blank; [] after a refusal box."""
+    text = var.get().strip()
+    scans = parse_scan_range(text, num_scans) if text else list(range(1, num_scans + 1))
+    if not scans:
+        messagebox.showerror("Invalid scan range", f"'{text}' names no scan from 1 to "
+                             f"{num_scans} ({SCAN_RANGE_HINT})", parent=dialog)
+    return scans
 
 
 # ============================================================================
@@ -878,18 +900,15 @@ class ExportOptionsDialog(BaseDialog):
         plot_types = {k: v.get() for k, v in self.plot_vars.items()}
         # "Echem values" only adds V and I to the title; X-ray needs a 1D or 2D panel
         if not self.is_neutron and not (plot_types.get("oned") or plot_types.get("twod")):
-            messagebox.showwarning("No selection",
-                                   "Please select 1D or 2D XRD data to export",
-                                   parent=self)
+            messagebox.showerror("No selection",
+                                 "Please select 1D or 2D XRD data to export",
+                                 parent=self)
             return
 
         scan_list = None
         if self.export_var.get() == "multiple":
-            scan_list = parse_scan_range(self.range_var.get(), self.num_scans)
+            scan_list = _read_scan_range(self, self.range_var, self.num_scans)
             if not scan_list:
-                messagebox.showwarning("Invalid range",
-                                       "Please enter a valid scan range",
-                                       parent=self)
                 return
 
         self.result = ExportOptions(
@@ -944,11 +963,8 @@ class GIFSettingsDialog(BaseDialog):
 
     def _create(self) -> None:
         """Validate the range, then hand the settings to on_create (or store them and close)."""
-        scan_list = parse_scan_range(self.range_var.get(), self.num_scans)
+        scan_list = _read_scan_range(self, self.range_var, self.num_scans)
         if not scan_list:
-            messagebox.showwarning("Invalid range",
-                                   "Please enter a valid scan range",
-                                   parent=self)
             return
 
         self.result = GIFSettings(
@@ -1247,8 +1263,9 @@ class UploadOptionsDialog(BaseDialog):
                                  font_type="heading", pady=(14, 4))
         echem_frame = self._block()
         self.std_echem_var = tk.StringVar(value="None")
-        self._entry(echem_frame, self.std_echem_var, width=20, readonly=True
-                    ).pack(side="left", padx=(0, 8))
+        self.std_echem_entry = self._entry(echem_frame, self.std_echem_var, width=20,
+                                           readonly=True)
+        self.std_echem_entry.pack(side="left", padx=(0, 8))
         self.std_select_btn = self._small_button(
             echem_frame, "Select", self._select_std_echem)
         self.std_clear_btn = self._small_button(
@@ -1397,6 +1414,7 @@ class UploadOptionsDialog(BaseDialog):
             state="normal" if (has_2d_source and not direct_nxs) else "disabled")
         if not has_2d_source or direct_nxs:
             self.include_2d_var.set(False)
+        self.std_echem_entry.config(state="disabled" if direct_nxs else "readonly")
         self.std_select_btn.config(state=gen_state)
         self.std_clear_btn.config(state=gen_state)
         self.tolerance_entry.config(state=gen_state)
@@ -1426,7 +1444,7 @@ class UploadOptionsDialog(BaseDialog):
         """Build the UploadOptions result and close.
         An empty selection is valid only to append standard echem to already-loaded data."""
         if not self._paths and not (self._has_loaded_data and self._std_echem):
-            messagebox.showerror("Error", "Please select files or a directory",
+            messagebox.showerror("No selection", "Please select files or a directory",
                                  parent=self)
             return
 
@@ -1481,7 +1499,7 @@ class UploadOptionsDialog(BaseDialog):
         except (ValueError, TypeError):
             messagebox.showerror(
                 "Invalid preparation date",
-                f"'{text}' is not an ISO 8601 date (use YYYY-MM-DD).",
+                f"'{text}' is not an ISO 8601 date (use YYYY-MM-DD)",
                 parent=self)
             return False
         return text
@@ -1499,7 +1517,7 @@ class UploadOptionsDialog(BaseDialog):
             value = None
         if value is None or not np.isfinite(value) or value <= 0:
             messagebox.showerror(
-                "Echem time tolerance",
+                "Invalid echem time tolerance",
                 f"'{text}' is not a positive number of seconds",
                 parent=self)
             return False
@@ -1520,7 +1538,7 @@ class UploadOptionsDialog(BaseDialog):
             return None
         if not values.get("technique"):
             messagebox.showerror(
-                "Cycling protocol",
+                "Invalid cycling protocol",
                 "Technique is required when cycling protocol details are given",
                 parent=self)
             return False
@@ -1533,7 +1551,7 @@ class UploadOptionsDialog(BaseDialog):
                     number = None
                 if number is None or not np.isfinite(number):
                     messagebox.showerror(
-                        "Cycling protocol",
+                        "Invalid cycling protocol",
                         f"Voltage window {label} bound '{values[key]}' "
                         "is not a finite number",
                         parent=self)
@@ -1543,7 +1561,7 @@ class UploadOptionsDialog(BaseDialog):
         upper = values.get("voltage_window_upper")
         if lower is not None and upper is not None and not lower < upper:
             messagebox.showerror(
-                "Cycling protocol",
+                "Invalid cycling protocol",
                 "The voltage window lower bound must be below the upper bound",
                 parent=self)
             return False

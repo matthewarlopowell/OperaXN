@@ -3,7 +3,6 @@ readers, round-trip, project files, real datasets."""
 import builtins
 import ctypes
 import glob
-import importlib
 import io
 import logging
 import os
@@ -11,6 +10,7 @@ import re
 import shutil
 import tempfile
 import threading
+import types
 import uuid
 import warnings
 import zipfile
@@ -21,12 +21,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import core
-import core.readers as readers
-from core import nxs_writer
+from operaxn import core
+from operaxn.core import nxs_writer, readers
 
 import _builders
-from _helpers import assert_pynxtools_valid, need_dataset, needs_fabio, wall
+from _helpers import assert_pynxtools_valid, modules_after, need_dataset, needs_fabio, wall
 
 
 def _warning_messages(caplog):
@@ -50,6 +49,20 @@ def test_process_raw_correlates_the_inhouse_dir(pipeline):
     assert len(scans) == 3, f"got {len(scans)}"
     assert len(echem) == 40, f"got {len(echem)}"
     assert abs(scans[0].echem - 3.76) < 1e-9, f"got {scans[0].echem}"
+
+
+def test_process_raw_hands_its_cancel_to_classification(inhouse_dir, monkeypatch):
+    """A cancel set once files are collected stops process_raw at classification with Cancelled."""
+    cancel = threading.Event()
+    classify_files = core.FileClassificationManager.classify_files
+
+    def cancel_then_classify(self, df, event=None):
+        cancel.set()
+        return classify_files(self, df, event)
+
+    monkeypatch.setattr(core.FileClassificationManager, "classify_files", cancel_then_classify)
+    with pytest.raises(core.Cancelled):
+        core.process_raw([inhouse_dir], core.DataSourceType.INHOUSE, cancel=cancel)
 
 
 def test_window_extrema_span_the_window(pipeline):
@@ -102,7 +115,7 @@ def test_partial_echem_match_is_counted(tmp_path, caplog):
 
     def counted(**kwargs):
         caplog.clear()
-        with caplog.at_level(logging.INFO, logger="core"):
+        with caplog.at_level(logging.INFO, logger="operaxn.core"):
             core.process_raw([src], core.DataSourceType.INHOUSE, **kwargs)
         return [r.getMessage() for r in caplog.records
                 if r.getMessage().startswith("Echem matched")]
@@ -177,7 +190,7 @@ def test_echem_that_matches_no_scan_is_reported_once(tmp_path, caplog):
     runs = {}
     for method in (core.TimeMethod.ABSOLUTE, core.TimeMethod.RELATIVE):
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="core"):
+        with caplog.at_level(logging.WARNING, logger="operaxn.core"):
             scans, _ = core.process_raw([str(src)], core.DataSourceType.INHOUSE, time_method=method)
         found = [r.getMessage() for r in caplog.records if "No scan matched" in r.getMessage()]
         runs[method] = ([s.echem is not None for s in scans], found)
@@ -190,7 +203,7 @@ def test_echem_that_matches_no_scan_is_reported_once(tmp_path, caplog):
                     lambda: os.remove(src / "echem.txt")):
         prepare()
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="core"):
+        with caplog.at_level(logging.WARNING, logger="operaxn.core"):
             core.process_raw([str(src)], core.DataSourceType.INHOUSE)
         assert not [r for r in caplog.records if "No scan matched" in r.getMessage()]
 
@@ -391,7 +404,7 @@ def test_synchrotron_scan_without_start_time_is_dropped(tmp_path, caplog):
         del f["entry1/end_time"]
     _builders.write_eclab_echem(str(src / "echem.txt"))
     out = str(tmp_path / "syn.nxs")
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([str(src)], out, core.DataSourceType.SYNCHROTRON)
     assert ok, msgs
     assert len(core.load(out).scans) == 1
@@ -689,7 +702,7 @@ def test_echem_offset_change_is_warned_once(tmp_path, caplog, stamps, warned):
     """An echem file whose times change UTC offset logs one warning naming it; rows stay wall clock."""
     path = tmp_path / "cycler.txt"
     _write_offset_echem(str(path), stamps)
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         df = core.EchemParser().parse(str(path))
     assert len(df) == len(stamps) and df["timestamp"].iloc[0].tzinfo is None
     hits = [r.getMessage() for r in caplog.records if "change UTC offset" in r.getMessage()]
@@ -718,7 +731,7 @@ def test_echem_elapsed_seconds_file_is_skipped(tmp_path, caplog, first_cell, ste
     rows = ["time/s\tEcell/V\tI/mA", f"{first_cell}\t3.7\t0.1"]
     rows += [f"{step.format(1990.5 + 0.5 * i)}\t{3.7 + 0.001 * i:.4f}\t0.1" for i in range(200)]
     path.write_text("\n".join(rows) + "\n")
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         assert core.EchemParser().parse(str(path)) is None
     assert any("elapsed.txt" in r.getMessage() and "plain numbers" in r.getMessage()
                for r in caplog.records), caplog.messages
@@ -726,16 +739,18 @@ def test_echem_elapsed_seconds_file_is_skipped(tmp_path, caplog, first_cell, ste
 
 @pytest.mark.parametrize("placeholder", ["30/12/1899 00:00:00", "01/01/0001 00:00:00"])
 def test_echem_rows_before_1900_are_dropped(tmp_path, caplog, placeholder):
-    """A placeholder row dated before 1900 is dropped (with a count where pandas can read it);
-    the rest of the file is kept."""
+    """Pre-1900 and unreadable-voltage rows are dropped, each counted where readable; rest kept."""
     path = tmp_path / "echem.txt"
     _builders.write_echem_txt(str(path))
     lines = path.read_text().splitlines()
     lines.insert(1, f"{placeholder}\t3.0\t0.0")
+    lines.insert(2, "05/02/2024 10:00:30\tn/a\t0.0")
     path.write_text("\n".join(lines) + "\n")
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         df = core.EchemParser().parse(str(path))
     assert len(df) == 40 and df["timestamp"].min() == pd.Timestamp("2024-02-05 10:00:00")
+    assert ("echem.txt: 1 echem row with no readable time or voltage was skipped"
+            in caplog.messages), caplog.messages
     if placeholder.endswith("1899 00:00:00"):
         assert any("1 echem row dated before 1900 (placeholders?) was skipped" in r.getMessage()
                    for r in caplog.records)
@@ -775,7 +790,7 @@ def test_positional_column_without_its_unit_skips_the_file(tmp_path, caplog, hea
     rows = [header] + ["\t".join([f"05/02/2024 10:{m:02d}:00"] + cells) for m in range(5)]
     path = tmp_path / "log.txt"
     path.write_text("\n".join(rows) + "\n")
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         assert core.EchemParser().parse(str(path)) is None
     assert caplog.messages == [f"Skipping log.txt: {reason}"]
 
@@ -787,7 +802,7 @@ def test_positional_columns_with_their_unit_still_load(tmp_path, caplog, header)
     """Voltage and current columns taken by position still load when their labels carry the unit."""
     path = tmp_path / "echem.txt"
     _write_echem(path, header)
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         df = core.EchemParser().parse(str(path))
     assert df is not None and len(df) == 5 and np.allclose(df["current"], 2.0)
     assert np.allclose(df["echem_data"], 3.7 + 0.01 * np.arange(5)) and not caplog.records
@@ -800,7 +815,7 @@ def test_temperature_log_beside_the_echem_is_left_out(tmp_path, caplog):
     rows = ["Time\tTemperature 1 (C)\tTemperature 2 (C)"]
     rows += [f"05/02/2024 10:{m:02d}:30\t25.{m:02d}\t26.0" for m in range(40)]
     (src / "cell_temperature.txt").write_text("\n".join(rows) + "\n")
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         scans, echem = core.process_raw([str(src)], core.DataSourceType.INHOUSE)
     assert len(echem) == 40 and {os.path.basename(f) for f in echem["source_file"]} == {"echem.txt"}
     assert scans[0].voltage_max < 4 and abs(scans[0].echem - 3.76) < 1e-9, scans[0].voltage_max
@@ -815,7 +830,7 @@ def test_combined_echem_files_are_named(tmp_path, caplog):
     _builders.write_inhouse_scans(str(src))
     _builders.write_echem_txt(str(src / "cell_b.txt"), n_rows=20)
     _builders.write_echem_txt(str(src / "cell_a.txt"), n_rows=20, hour=11)
-    with caplog.at_level(logging.INFO, logger="core"):
+    with caplog.at_level(logging.INFO, logger="operaxn.core"):
         _, echem = core.process_raw([str(src)], core.DataSourceType.INHOUSE)
     assert len(echem) == 40
     lines = [r.getMessage() for r in caplog.records if "files:" in r.getMessage()]
@@ -883,7 +898,7 @@ def test_current_unit_decision_is_logged(tmp_path, caplog, header, level, texts)
     """A scaled current logs one info line, an unrecognised unit one warning, a mA column nothing."""
     path = tmp_path / "echem.txt"
     _write_echem(path, ["time/s", "Ewe/V", header])
-    with caplog.at_level(logging.INFO, logger="core"):
+    with caplog.at_level(logging.INFO, logger="operaxn.core"):
         assert core.EchemParser().parse(str(path)) is not None
     lines = [r for r in caplog.records if "current column" in r.getMessage()]
     if level is None:
@@ -977,7 +992,7 @@ def test_unit_line_names_the_file(tmp_path, caplog):
     """The current-unit line names the echem file as well as the column."""
     path = tmp_path / "cell7.txt"
     _write_echem(path, ["time/s", "Ewe/V", "I/A"])
-    with caplog.at_level(logging.INFO, logger="core"):
+    with caplog.at_level(logging.INFO, logger="operaxn.core"):
         assert core.EchemParser().parse(str(path)) is not None
     lines = [r.getMessage() for r in caplog.records if "current column" in r.getMessage()]
     assert lines == ["Echem current column 'I/A' in cell7.txt converted to mA (x1000)"], lines
@@ -990,7 +1005,7 @@ def test_millivolt_voltage_is_stored_in_volts(tmp_path, caplog, header):
     """An mV voltage column, named or taken by position, is stored in volts with one info line."""
     path = tmp_path / "cell7.txt"
     _write_echem(path, header, volt=lambda m: f"{3700 + m * 10}")
-    with caplog.at_level(logging.INFO, logger="core"):
+    with caplog.at_level(logging.INFO, logger="operaxn.core"):
         df = core.EchemParser().parse(str(path))
     assert df is not None and np.allclose(df["echem_data"], 3.7 + 0.01 * np.arange(5)), \
         None if df is None else list(df["echem_data"])
@@ -1004,7 +1019,7 @@ def test_voltage_not_in_millivolts_is_read_as_written(tmp_path, caplog, label, w
     """A V or unlabelled voltage is read as written silently; any other unit too, with a warning."""
     path = tmp_path / "cell7.txt"
     _write_echem(path, ["Time", label, "I/mA"])
-    with caplog.at_level(logging.INFO, logger="core"):
+    with caplog.at_level(logging.INFO, logger="operaxn.core"):
         df = core.EchemParser().parse(str(path))
     assert df is not None and np.allclose(df["echem_data"], 3.7 + 0.01 * np.arange(5))
     lines = [(r.levelno, r.getMessage()) for r in caplog.records if "voltage column" in r.getMessage()]
@@ -1021,7 +1036,7 @@ def test_voltage_unit_followed_by_more_text_is_read(tmp_path, caplog, label, mil
     path = tmp_path / "cell7.txt"
     _write_echem(path, ["Time", label, "I/mA"],
                  volt=(lambda m: f"{3700 + m * 10}") if millivolts else (lambda m: f"{3.7 + m * 0.01:.4f}"))
-    with caplog.at_level(logging.INFO, logger="core"):
+    with caplog.at_level(logging.INFO, logger="operaxn.core"):
         df = core.EchemParser().parse(str(path))
     assert df is not None and np.allclose(df["echem_data"], 3.7 + 0.01 * np.arange(5)), \
         None if df is None else list(df["echem_data"])
@@ -1061,7 +1076,7 @@ def test_unit_lines_name_the_users_csv_not_its_converted_copy(tmp_path, caplog):
     text = "Time,Ewe/V,I/A\n" + "".join(f"{t},{v:.4f},{i / 1000:.7f}\n" for t, v, i in _ROWS)
     (src / "cell7.csv").write_text(text)
     (tmp_path / "std7.csv").write_text(text)
-    with caplog.at_level(logging.INFO, logger="core"):
+    with caplog.at_level(logging.INFO, logger="operaxn.core"):
         ok, msgs = core.generate([str(src)], str(tmp_path / "units.nxs"), core.DataSourceType.INHOUSE,
                                  standard_echem_files=[str(tmp_path / "std7.csv")])
     assert ok, msgs
@@ -1071,12 +1086,14 @@ def test_unit_lines_name_the_users_csv_not_its_converted_copy(tmp_path, caplog):
 
 
 def test_skipped_standard_echem_files_are_named(tmp_path, caplog):
-    """A chosen standard echem file that is missing or holds no echem is named in a warning."""
+    """A missing or empty standard echem file, or an operando one with no row, is named."""
     src = str(tmp_path / "inhouse")
     _builders.write_inhouse_dir(src)
     (tmp_path / "notes.txt").write_text("Time\tVoltage\tCurrent\n")
+    with open(os.path.join(src, "empty_log.txt"), "w") as f:
+        f.write("Time\tEwe/V\tI/mA\n")
     out = str(tmp_path / "std.nxs")
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE,
                                  standard_echem_files=[str(tmp_path / "gone.txt"),
                                                        str(tmp_path / "notes.txt")])
@@ -1084,6 +1101,7 @@ def test_skipped_standard_echem_files_are_named(tmp_path, caplog):
     messages = caplog.messages
     assert "Standard electrochemistry file gone.txt not found; skipped" in messages, messages
     assert "No electrochemistry data found in notes.txt; not stored" in messages, messages
+    assert "No electrochemistry data found in empty_log.txt; not stored" in messages, messages
 
 
 def test_unconverted_standard_table_is_named_once(tmp_path, caplog):
@@ -1091,7 +1109,7 @@ def test_unconverted_standard_table_is_named_once(tmp_path, caplog):
     src = str(tmp_path / "inhouse")
     _builders.write_inhouse_dir(src)
     (tmp_path / "broken.xlsx").write_bytes(b"not a workbook")
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([src], str(tmp_path / "std.nxs"), core.DataSourceType.INHOUSE,
                                  standard_echem_files=[str(tmp_path / "gone.csv"),
                                                        str(tmp_path / "broken.xlsx")])
@@ -1110,7 +1128,7 @@ def test_writer_names_a_standard_table_given_unconverted(tmp_path, caplog):
     _builders.write_arbin_xlsx(tables[1])
     pd.read_excel(tables[1]).to_csv(tables[0], index=False)
     out = str(tmp_path / "std.nxs")
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         core.NXSWriter(core.DataSourceType.INHOUSE).write(out, scans, echem_df, tables)
     named = [r.getMessage() for r in caplog.records if "std." in r.getMessage()]
     assert named == [f"Standard electrochemistry file {name} is not converted to text; skipped"
@@ -1189,7 +1207,7 @@ def test_missing_echem_warning_is_logged(tmp_path, caplog):
     src.mkdir()
     _builders.write_inhouse_scans(str(src))
     out = str(tmp_path / "xrd_only.nxs")
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE)
     assert ok, str(msgs)
     assert "Warning: No echem data available" in msgs
@@ -1219,7 +1237,7 @@ def test_text_file_that_is_neither_echem_nor_logbook_is_named(tmp_path, caplog):
     _builders.write_wish_dir(str(src))
     with open(src / "cell_temperature_log.txt", "w") as f:
         f.write("".join(f"05/02/2024 10:{m:02d}:00\t25.3\t40.1\n" for m in range(30)))
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         scans, echem = core.process_raw([str(src)], core.DataSourceType.NEUTRON)
     assert len(scans) == 1 and len(echem) == 40
     named = [m for m in _warning_messages(caplog) if "not recognised as echem or logbook" in m]
@@ -1232,14 +1250,13 @@ def test_echem_and_logbook_files_raise_no_unrecognised_warning(tmp_path, caplog)
     """The real shapes (EC-Lab echem, WISH logbook) never trigger the unrecognised-text warning."""
     src = tmp_path / "wish"
     _builders.write_wish_dir(str(src))
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         core.process_raw([str(src)], core.DataSourceType.NEUTRON)
     assert not [m for m in _warning_messages(caplog) if "not recognised as echem" in m]
 
 
 def test_one_unmatched_file_reads_singular(tmp_path, caplog):
-    """One orphan .xy is reported as '1 file did not belong to any scan and was ignored (1 .xy)'
-    and the scan with its .nxs still generates."""
+    """One orphan .xy is named in the singular; the scan with its .nxs still generates."""
     src = tmp_path / "syn"
     os.makedirs(src)
     _builders.write_synchrotron_scan(str(src), "000001", "2024-02-05T10:05:00",
@@ -1247,12 +1264,13 @@ def test_one_unmatched_file_reads_singular(tmp_path, caplog):
     shutil.copy(src / "i11-1-000001_integration_tth_0000.xy",
                 src / "i11-1-000003_integration_tth_0000.xy")
     _builders.write_eclab_echem(str(src / "echem.txt"))
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([str(src)], str(tmp_path / "syn.nxs"),
                                  core.DataSourceType.SYNCHROTRON)
     assert ok, msgs
     messages = _warning_messages(caplog)
-    assert "1 file did not belong to any scan and was ignored (1 .xy)" in messages, messages
+    assert ("1 file did not belong to any scan and was ignored (1 .xy): "
+            "i11-1-000003_integration_tth_0000.xy" in messages), messages
 
 
 def test_inhouse_dat_without_a_header_is_named(tmp_path, caplog):
@@ -1267,7 +1285,7 @@ def test_inhouse_dat_without_a_header_is_named(tmp_path, caplog):
 
     def lines():
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="core"):
+        with caplog.at_level(logging.WARNING, logger="operaxn.core"):
             scans, _ = core.process_raw([str(src)], core.DataSourceType.INHOUSE)
         assert len(scans) == 3
         return [r.getMessage() for r in caplog.records if "ignored" in r.getMessage()]
@@ -1275,7 +1293,7 @@ def test_inhouse_dat_without_a_header_is_named(tmp_path, caplog):
     assert sorted(lines()) == [
         "1 .dat/.edf file was not recognised as scan data and was ignored: scan_004.dat "
         "(scans need a readable Date in their header)",
-        "1 file did not belong to any scan and was ignored (1 .xy)"]
+        "1 file did not belong to any scan and was ignored (1 .xy): scan_005.xy"]
     (src / "notes.txt").write_text("calibration\t25.3\t40.1\n")
     named = [m for m in lines() if "not recognised" in m]
     assert len(named) == 1 and named[0].startswith(
@@ -1285,19 +1303,32 @@ def test_inhouse_dat_without_a_header_is_named(tmp_path, caplog):
                              "header line naming time, voltage or current)")
 
 
-@needs_fabio
-def test_damaged_edf_is_named_once(tmp_path, caplog):
-    """An EDF fabio cannot read is named in its one ERROR line, not again as unrecognised."""
-    src = tmp_path / "lab"
-    _builders.write_inhouse_dir(str(src))
-    (src / "image_009.edf").write_bytes(b"not an edf image")
-    with caplog.at_level(logging.WARNING, logger="core"):
-        scans, _ = core.process_raw([str(src)], core.DataSourceType.INHOUSE)
-    assert len(scans) == 3
+@pytest.mark.parametrize("source, damaged, kept, error", [
+    pytest.param(core.DataSourceType.INHOUSE, "image_009.edf", 3, "Error classifying EDF file ",
+                 marks=needs_fabio, id="edf"),
+    pytest.param(core.DataSourceType.SYNCHROTRON, "i11-1-000009.nxs", 1,
+                 "Error extracting NeXus metadata from ", id="synchrotron-nxs"),
+])
+def test_damaged_scan_file_is_named_once(tmp_path, caplog, source, damaged, kept, error):
+    """An EDF or scan .nxs that cannot be read is named once, in its ERROR line."""
+    src = tmp_path / "scans"
+    if source == core.DataSourceType.INHOUSE:
+        _builders.write_inhouse_dir(str(src))
+        (src / damaged).write_bytes(b"not an edf image")
+    else:
+        os.makedirs(src)
+        for scan_id, minute in (("000001", 5), ("000009", 10)):
+            _builders.write_synchrotron_scan(str(src), scan_id, f"2024-02-05T10:{minute:02d}:00",
+                                             f"2024-02-05T10:{minute:02d}:39")
+        _builders.write_eclab_echem(str(src / "echem.txt"))
+        # A scan .nxs cut short (still being written at the beamline)
+        (src / damaged).write_bytes((src / damaged).read_bytes()[:100])
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
+        scans, _ = core.process_raw([str(src)], source)
+    assert len(scans) == kept
     named = [(r.levelname, r.getMessage()) for r in caplog.records
-             if "image_009.edf" in r.getMessage()]
-    assert len(named) == 1 and named[0][0] == "ERROR" and \
-        named[0][1].startswith("Error classifying EDF file "), named
+             if os.path.splitext(damaged)[0] in r.getMessage()]
+    assert len(named) == 1 and named[0][0] == "ERROR" and named[0][1].startswith(error), named
 
 
 @needs_fabio
@@ -1390,10 +1421,10 @@ def test_unextractable_zip_member_costs_only_that_file(tmp_path, caplog):
     pos = info.header_offset + 30 + len(info.filename) + len(info.extra) + info.file_size // 2
     raw[pos] ^= 0x01
     zp.write_bytes(bytes(raw))
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         scans, echem = core.process_raw([str(zp)], core.DataSourceType.INHOUSE)
     assert len(scans) == 2 and len(echem) == 40, (len(scans), len(echem))
-    assert any(m.startswith("Could not extract cell/scan_002.dat from lab.zip: Bad CRC-32")
+    assert any(m.startswith("Skipping cell/scan_002.dat in lab.zip: Bad CRC-32")
                for m in _warning_messages(caplog)), _warning_messages(caplog)
 
 
@@ -1409,15 +1440,15 @@ def _pairs_zip(tmp_path, name, times=_builders.SCAN_TIMES, prefix=""):
 def test_zip_images_none_copied_reports_no_sidecar(tmp_path, monkeypatch, caplog):
     """If every ZIP image move fails: an 'N of N' warning, no 'Persisted' line, no sidecar left."""
     zip_path = _pairs_zip(tmp_path, "cell.zip", _builders.SCAN_TIMES[:2])
-    generate_module = importlib.import_module("core.generate")
+    pipeline = core.pipeline
 
     def move(source, dest, *args, **kwargs):
         raise OSError(3, "The system cannot find the path specified", dest)
 
-    monkeypatch.setattr(generate_module.shutil, "move", move)
+    monkeypatch.setattr(pipeline.shutil, "move", move)
     out = str(tmp_path / "out" / "cell.nxs")
     os.makedirs(os.path.dirname(out))
-    with caplog.at_level(logging.INFO, logger="core"):
+    with caplog.at_level(logging.INFO, logger="operaxn.core"):
         ok, msgs = core.generate([zip_path], out, core.DataSourceType.INHOUSE)
     assert ok, msgs
     assert [m for m in msgs if "2D images" in m] == [
@@ -1431,8 +1462,8 @@ def test_one_failed_zip_image_copy_costs_one_image(tmp_path, monkeypatch):
     """A ZIP image whose sidecar copy fails is reported by count; the other images stay viewable."""
     zip_path = _pairs_zip(tmp_path, "cell.zip", _builders.SCAN_TIMES[:2])
 
-    generate_module = importlib.import_module("core.generate")
-    real_move = generate_module.shutil.move
+    pipeline = core.pipeline
+    real_move = pipeline.shutil.move
     failed = []
 
     def move(source, dest, *args, **kwargs):
@@ -1441,7 +1472,7 @@ def test_one_failed_zip_image_copy_costs_one_image(tmp_path, monkeypatch):
             raise OSError(3, "The system cannot find the path specified", dest)
         return real_move(source, dest, *args, **kwargs)
 
-    monkeypatch.setattr(generate_module.shutil, "move", move)
+    monkeypatch.setattr(pipeline.shutil, "move", move)
     out = str(tmp_path / "out" / "cell.nxs")
     os.makedirs(os.path.dirname(out))
     ok, msgs = core.generate([zip_path], out, core.DataSourceType.INHOUSE)
@@ -1459,14 +1490,14 @@ def test_zip_image_held_open_elsewhere_keeps_its_copy(tmp_path, monkeypatch):
     """A move whose copy landed but whose source another program holds open (the unlink is
     refused) keeps the copy: every scan shows its persisted image and no failure is counted."""
     zip_path = _pairs_zip(tmp_path, "cell.zip", _builders.SCAN_TIMES[:2])
-    generate_module = importlib.import_module("core.generate")
+    pipeline = core.pipeline
 
     def move(source, dest, *args, **kwargs):
         # shutil.move's copy fallback, then the unlink Windows refuses (WinError 32)
         shutil.copy2(source, dest)
         raise PermissionError(13, "in use", source)
 
-    monkeypatch.setattr(generate_module.shutil, "move", move)
+    monkeypatch.setattr(pipeline.shutil, "move", move)
     out = str(tmp_path / "out" / "cell.nxs")
     os.makedirs(os.path.dirname(out))
     ok, msgs = core.generate([zip_path], out, core.DataSourceType.INHOUSE)
@@ -1491,7 +1522,7 @@ def test_one_repeated_logbook_run_reads_singular(tmp_path, caplog):
     src = str(tmp_path / "wish")
     line = _builders.wish_logbook_line("123456", "2024-02-05 10:00:00", "2024-02-05 10:30:00")
     _builders.write_wish_dir(src, lines=[line, line])
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         scans, _ = core.process_raw([src], core.DataSourceType.NEUTRON)
     assert len(scans) == 1
     messages = _warning_messages(caplog)
@@ -1502,7 +1533,7 @@ def test_logbook_selected_with_its_folder_is_read_once(tmp_path, caplog):
     """Selecting a folder and its logbook again gives each run once and no repeated-run warning."""
     src = str(tmp_path / "wish")
     _builders.write_wish_dir(src)
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         scans, _ = core.process_raw([src, os.path.join(src, "Cell_log_book.txt")],
                                     core.DataSourceType.NEUTRON)
     assert len(scans) == 1, [s.scan_num for s in scans]
@@ -1543,7 +1574,7 @@ def test_table_selected_with_its_folder_is_converted_once(tmp_path, caplog):
     src.mkdir()
     _builders.write_inhouse_scans(str(src))
     _builders.write_arbin_xlsx(str(src / "echem.xlsx"))
-    with caplog.at_level(logging.INFO, logger="core"):
+    with caplog.at_level(logging.INFO, logger="operaxn.core"):
         _, echem = core.process_raw([str(src), str(src / "echem.xlsx")],
                                     core.DataSourceType.INHOUSE)
     messages = caplog.messages
@@ -1560,7 +1591,7 @@ def test_a_file_reached_three_times_is_counted_and_named_once(tmp_path, caplog):
 
     def repeats(paths):
         caplog.clear()
-        with caplog.at_level(logging.INFO, logger="core"):
+        with caplog.at_level(logging.INFO, logger="operaxn.core"):
             scans, rows = core.process_raw(paths, core.DataSourceType.INHOUSE)
         assert len(scans) == 3 and len(rows) == 40, (len(scans), len(rows))
         return [r.getMessage() for r in caplog.records if "more than once" in r.getMessage()]
@@ -1587,8 +1618,7 @@ def _binary_opens(monkeypatch):
 
 def test_collection_warms_every_file_up_front(neutron_dir, monkeypatch):
     """Every collected file is opened once across the worker pool before classification."""
-    monkeypatch.setattr(importlib.import_module("core.generate"),
-                        "PARALLEL_PROCESSING_THRESHOLD", 0)
+    monkeypatch.setattr(core.pipeline, "PARALLEL_PROCESSING_THRESHOLD", 0)
     opened = _binary_opens(monkeypatch)
     with core.FileProcessor(core.DataSourceType.NEUTRON) as processor:
         records = processor.process_paths([neutron_dir])
@@ -1598,12 +1628,11 @@ def test_collection_warms_every_file_up_front(neutron_dir, monkeypatch):
 
 def test_warm_up_skips_unreadable_paths(tmp_path, monkeypatch, caplog):
     """A file gone since collection costs one DEBUG line; the files after it are still warmed."""
-    monkeypatch.setattr(importlib.import_module("core.generate"),
-                        "PARALLEL_PROCESSING_THRESHOLD", 0)
+    monkeypatch.setattr(core.pipeline, "PARALLEL_PROCESSING_THRESHOLD", 0)
     gone, present = tmp_path / "gone.dat", tmp_path / "scan.dat"
     present.write_text("1 2\n")
     opened = _binary_opens(monkeypatch)
-    with caplog.at_level(logging.DEBUG, logger="core"):
+    with caplog.at_level(logging.DEBUG, logger="operaxn.core"):
         core.FileProcessor._warm_up([str(gone), str(present)])
     assert os.path.normpath(str(present)) in opened, opened
     warned = [m for m in caplog.messages if m.startswith(f"Could not warm {gone}: ")]
@@ -1616,7 +1645,7 @@ def test_one_logbook_entry_without_data_reads_singular(tmp_path, caplog):
     lines = [_builders.wish_logbook_line("123456", "2024-02-05 10:00:00", "2024-02-05 10:30:00"),
              _builders.wish_logbook_line("123999", "2024-02-05 11:00:00", "2024-02-05 11:30:00")]
     _builders.write_wish_dir(src, lines=lines)
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         scans, _ = core.process_raw([src], core.DataSourceType.NEUTRON)
     assert len(scans) == 1
     messages = _warning_messages(caplog)
@@ -1631,7 +1660,7 @@ def test_logbook_entries_without_data_are_counted_and_listed_by_run(tmp_path, ca
     lines = [_builders.wish_logbook_line(run, f"2024-02-05 {h}:00:00", f"2024-02-05 {h}:30:00")
              for h, run in zip(range(14, 9, -1), runs)]
     _builders.write_wish_dir(src, lines=lines)
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         scans, _ = core.process_raw([src], core.DataSourceType.NEUTRON)
     assert len(scans) == 1
     messages = _warning_messages(caplog)
@@ -1648,7 +1677,7 @@ def test_run_with_bank_files_but_no_logbook_entry_is_named(tmp_path, caplog):
     banks = os.path.join(extra, "diffraction-data")
     for name in os.listdir(banks):
         shutil.copy(os.path.join(banks, name), os.path.join(src, "diffraction-data"))
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         scans, _ = core.process_raw([src], core.DataSourceType.NEUTRON)
     hits = [m for m in _warning_messages(caplog) if "no logbook entry" in m]
     assert hits == ["1 run has bank files but no logbook entry and was skipped: 153999"], hits
@@ -1661,7 +1690,7 @@ def test_neutron_bank_files_without_a_logbook_fail_naming_it(tmp_path, caplog):
     src = str(tmp_path / "wish")
     _builders.write_wish_dir(src)
     os.remove(os.path.join(src, "Cell_log_book.txt"))
-    with caplog.at_level(logging.INFO, logger="core"):
+    with caplog.at_level(logging.INFO, logger="operaxn.core"):
         ok, msgs = core.generate([src], str(tmp_path / "x.nxs"), core.DataSourceType.NEUTRON)
     assert not ok and msgs == ["Error: No neutron logbook found in the selection: "
                                "runs are timed from the logbook"], msgs
@@ -1693,7 +1722,7 @@ def test_neutron_run_whose_logbook_line_lost_a_tab_generates(tmp_path, caplog):
     assert '"2m 6s"\t"5.44"' in text  # the builder's fields, so the edit cannot silently miss
     with open(path, "w", newline="") as f:
         f.write(text.replace('"2m 6s"\t"5.44"', '"1m 27s" "5.44"'))
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([src], str(tmp_path / "n.nxs"), core.DataSourceType.NEUTRON)
     assert ok, msgs
     assert not [m for m in _warning_messages(caplog) if "logbook" in m], _warning_messages(caplog)
@@ -1712,7 +1741,7 @@ def test_laboratory_pairs_loaded_as_synchrotron_are_refused(tmp_path, caplog):
     """Lab .dat + .edf pairs as Synchrotron fail with 'check the data source' and no traceback."""
     src = tmp_path / "lab"
     _lab_pairs(src)
-    with caplog.at_level(logging.INFO, logger="core"):
+    with caplog.at_level(logging.INFO, logger="operaxn.core"):
         ok, msgs = core.generate([str(src)], str(tmp_path / "x.nxs"),
                                  core.DataSourceType.SYNCHROTRON)
     assert not ok and any("check the data source" in m for m in msgs), msgs
@@ -1760,14 +1789,14 @@ def test_synchrotron_scans_still_load(tmp_path):
     ("scan.xy", "# only a comment\n"),
 ])
 def test_one_d_file_without_data_rows_is_unreadable(tmp_path, name, text):
-    """An empty or header-only 1D file raises one OSError naming the path once, with no numpy warning."""
+    """An empty or header-only 1D file raises one OSError naming the file once; no numpy warning."""
     path = tmp_path / name
     path.write_text(text)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         with pytest.raises(OSError, match="no data rows$") as err:
             core.DataReaderFactory.read_file(str(path), use_cache=False)
-    assert str(err.value).count(str(path)) == 1, str(err.value)
+    assert str(err.value).count(name) == 1 and str(tmp_path) not in str(err.value), str(err.value)
     assert not caught, [str(w.message) for w in caught]
 
 
@@ -2135,7 +2164,7 @@ def test_neutron_scan_with_no_readable_bank_is_written_with_a_warning(tmp_path, 
             with open(os.path.join(src, "diffraction-data", name), "w") as f:
                 f.write("XYDATA\nnot a number\n")
     out = str(tmp_path / "out.nxs")
-    with caplog.at_level(logging.WARNING, logger="core"):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([src], out, core.DataSourceType.NEUTRON)
     assert ok, msgs
     assert ("Scan 2 (run 123457): no bank file could be read; written without data"
@@ -2421,19 +2450,34 @@ def test_dependency_floors_agree():
     assert shown == declared, "README.md floors differ from pyproject.toml"
 
 
+def test_core_exports_its_exceptions_and_the_pipeline_module():
+    """core exports Cancelled and InputError; core.pipeline is the module, core.generate its function."""
+    assert core.Cancelled is core.model.Cancelled and core.InputError is core.model.InputError
+    assert {"Cancelled", "InputError"} <= set(core.__all__)
+    assert isinstance(core.pipeline, types.ModuleType)
+    assert core.generate is core.pipeline.generate
+
+
+def test_core_imports_without_the_gui():
+    """A fresh `import operaxn.core` loads no Tk, matplotlib or other operaxn module."""
+    loaded = modules_after("import operaxn.core")
+    assert [m for m in loaded if m.split(".")[0] in ("tkinter", "_tkinter", "matplotlib")
+            or m.startswith("operaxn.") and not m.startswith("operaxn.core")] == []
+
+
 def test_no_undefined_names_in_packages():
-    """Pyflakes finds no undefined names in core or operaxn, so a definition removed while still
-    referenced fails loudly."""
+    """Pyflakes finds no undefined name in operaxn or operaxn.core (a removed name still in use)."""
     pyflakes_api = pytest.importorskip("pyflakes.api")
     from pyflakes.reporter import Reporter
-    root = os.path.dirname(os.path.dirname(os.path.abspath(core.__file__)))
+    pkg = os.path.dirname(os.path.dirname(os.path.abspath(core.__file__)))
+    paths = glob.glob(os.path.join(pkg, "**", "*.py"), recursive=True)
+    assert {os.path.basename(os.path.dirname(p)) for p in paths} == {"operaxn", "core"}, paths
     issues = []
-    for pkg in ("core", "operaxn"):
-        for path in glob.glob(os.path.join(root, pkg, "*.py")):
-            out, err = io.StringIO(), io.StringIO()
-            pyflakes_api.checkPath(path, Reporter(out, err))
-            issues += [line for line in out.getvalue().splitlines()
-                       if "undefined name" in line]
+    for path in paths:
+        out, err = io.StringIO(), io.StringIO()
+        pyflakes_api.checkPath(path, Reporter(out, err))
+        issues += [line for line in out.getvalue().splitlines()
+                   if "undefined name" in line]
     assert issues == [], "\n".join(issues)
 
 

@@ -19,7 +19,7 @@ import h5py
 import numpy as np
 import pandas as pd
 
-import core
+from operaxn import core
 
 ONED_X = np.linspace(10, 80, 50)
 TOF_X = np.linspace(1000, 20000, 40)

@@ -5,7 +5,7 @@ import h5py
 import numpy as np
 import pytest
 
-import core
+from operaxn import core
 
 import _builders
 from _helpers import s, wall, tz_aware, assert_pynxtools_valid, needs_fabio

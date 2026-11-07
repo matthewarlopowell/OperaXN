@@ -25,7 +25,7 @@ LOG_FILE = "operaxn.log" if DEBUG_MODE else None
 
 # Re-exported from core so enum identity is shared across the whole app:
 # a locally defined copy would silently fail == comparisons against core's.
-from core import DataSourceType  # noqa: E402,F401
+from .core import DataSourceType  # noqa: E402,F401
 
 
 # ============================================================================
@@ -82,7 +82,7 @@ class OPERAXNTheme:
 
 # Cache, processing and the default per-axis 2D display cap (0 disables
 # downsampling): re-exported from core so there is a single source
-from core.config import (  # noqa: E402,F401
+from .core.config import (  # noqa: E402,F401
     CACHE_ENABLED,
     MAX_CACHE_SIZE_MB,
     MAX_WORKERS,
@@ -169,7 +169,7 @@ APP_NAME = "OperaXN"
 # Single source of truth for the app version: core.config.GENERATOR_VERSION
 # (also written into every generated .nxs as entry/process/version, which
 # the reader maps to the generator_version metadata key)
-from core import GENERATOR_VERSION as APP_VERSION  # noqa: E402,F401
+from .core import GENERATOR_VERSION as APP_VERSION  # noqa: E402,F401
 
 APP_AUTHOR = "Matthew Powell"
 APP_COPYRIGHT = "2025-2026"

@@ -257,7 +257,7 @@ class DATClassifier(FileClassifierBase):
                 return DataType.ONED.value, timestamp, exposure_time
 
         except Exception as e:
-            logger.error(f"Error classifying DAT file {path}: {e}")
+            logger.error(f"Error classifying DAT file {os.path.basename(path)}: {e}")
             self.reported.add(path)
 
         return None, None, None
@@ -296,7 +296,7 @@ class EDFClassifier(FileClassifierBase):
                 return DataType.TWOD.value, timestamp, exposure_time
 
         except Exception as e:
-            logger.error(f"Error classifying EDF file {path}: {e}")
+            logger.error(f"Error classifying EDF file {os.path.basename(path)}: {e}")
             self.reported.add(path)
 
         return None, None, None
@@ -337,7 +337,7 @@ class TXTClassifier(FileClassifierBase):
             return None, None, None
 
         except Exception as e:
-            logger.error(f"Error classifying TXT file {path}: {e}")
+            logger.error(f"Error classifying TXT file {os.path.basename(path)}: {e}")
             self.reported.add(path)
             return None, None, None
 
@@ -554,7 +554,7 @@ class NeutronFileGrouper:
         r'(?<!\d)(\d{%d,%d})-(\d)(?!\d)' % (SCAN_ID_MIN_DIGITS, SCAN_ID_MAX_DIGITS))
     _POL_PATTERN = re.compile(r'POL(\d+)-b_(\d)(?!\d)')
 
-    def group_neutron_files(self, file_list: List[str]) -> Dict[str, Dict[str, Dict[str, str]]]:
+    def group_files(self, file_list: List[str]) -> Dict[str, Dict[str, Dict[str, str]]]:
         """Group .dat paths as {scan_id: {measurement: {'tof'|'d': path}}}."""
         groups: Dict[str, Dict[str, Dict[str, str]]] = {}
         skipped: List[str] = []
@@ -582,10 +582,10 @@ class NeutronFileGrouper:
         if skipped:
             if len(skipped) == 1:
                 logger.warning(f"1 .dat file was not recognised as a neutron bank 1-5 file "
-                               f"and was ignored ({skipped[0]})")
+                               f"and was ignored: {skipped[0]}")
             else:
                 logger.warning(f"{len(skipped)} .dat files were not recognised as neutron "
-                               f"bank 1-5 files and were ignored (e.g. {skipped[0]})")
+                               f"bank 1-5 files and were ignored: {name_list(skipped)}")
         logger.info(f"Grouped {len(groups)} scan{'s' if len(groups) != 1 else ''}")
         return groups
 
@@ -631,13 +631,13 @@ class NeutronFileGrouper:
 class SynchrotronFileGrouper:
     """Grouper of related synchrotron .nxs, .hdf and .xy files by scan ID."""
 
-    def group_files(self, file_dict: Dict[str, str]) -> Dict[str, Dict[str, str]]:
+    def group_files(self, file_list: List[str]) -> Dict[str, Dict[str, str]]:
         """Group paths as {scan_id: {'nxs'|'hdf'|'xy': path}}; a .nxs anchors each group."""
         groups: Dict[str, Dict[str, str]] = {}
         nxs_ids: Set[str] = set()
 
         # First pass: collect the scan IDs of all .nxs files
-        for extracted_path in file_dict:
+        for extracted_path in file_list:
             basename = os.path.basename(extracted_path)
             ext = os.path.splitext(basename)[1].lower()
 
@@ -647,7 +647,7 @@ class SynchrotronFileGrouper:
                     nxs_ids.add(scan_id)
 
         # Second pass: assign each file to its group
-        for extracted_path in file_dict:
+        for extracted_path in file_list:
             basename = os.path.basename(extracted_path)
             ext = os.path.splitext(basename)[1].lower()
 
@@ -710,6 +710,10 @@ class NexusMetadataExtractor:
         '/entry1/instrument/detector/preset',
     ]
 
+    def __init__(self) -> None:
+        # Files already named in an ERROR line
+        self.reported: Set[str] = set()
+
     def extract(self, nxs_path: str) -> Optional[Dict[str, Any]]:
         """Return the timestamp/exposure metadata of a scan .nxs; None if absent or unreadable."""
         try:
@@ -727,7 +731,8 @@ class NexusMetadataExtractor:
                 return metadata or None
 
         except Exception as e:
-            logger.error(f"Failed to extract NXS metadata from {nxs_path}: {e}")
+            logger.error(f"Error extracting NeXus metadata from {os.path.basename(nxs_path)}: {e}")
+            self.reported.add(nxs_path)
             return None
 
     def _extract_timestamp(self, h5file: h5py.File) -> Optional[str]:

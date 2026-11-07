@@ -9,13 +9,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 try:
-    import core
+    from operaxn import core
 except ImportError:
     # Bare dev checkout with no installed package: import from bin/. When the
     # package is installed (CI runs `pip install .[test]`) the installed
-    # packages are used, so the wheel's bin->core/operaxn mapping stays tested.
+    # package is used, so the wheel's bin/operaxn mapping stays tested.
     sys.path.insert(0, str(REPO_ROOT / "bin"))
-    import core
+    from operaxn import core
 
 import h5py
 import numpy as np
