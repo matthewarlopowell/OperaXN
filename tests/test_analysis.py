@@ -34,7 +34,7 @@ from operaxn.heatmap import (
     publication_figure, row_edges, scan_positions_seconds, title_text,
 )
 from operaxn.ici import (
-    ICIWindow, PLOT_BG, _SelectorStrip, _compute_all_pulses, _compute_fit,
+    ICIWindow, PLOT_BG, _RKAxisBar, _SelectorStrip, _compute_all_pulses, _compute_fit,
     _detect_pulses, _style_ax,
 )
 from operaxn.input import get_standard_echem
@@ -140,6 +140,15 @@ def test_leading_rest_stays_cycle_zero():
     assert (assign_cycles(lead)["cycle"].values[:3] == 0).all()
 
 
+def test_discharge_first_record_starts_cycle_one_on_its_discharge():
+    """A record that starts on discharge counts cycles from that discharge, none left in cycle 0."""
+    df = build_cycling_df()
+    cyc = assign_cycles(df.assign(current=-df["current"]))
+    assert (cyc["cycle"] > 0).all(), "a discharge-first record lost samples to cycle 0"
+    assert sorted(cyc["cycle"].unique()) == [1, 2], f"got {sorted(cyc['cycle'].unique())}"
+    assert list(cyc[cyc["cycle"] == 1]["phase"].unique()) == ["discharge", "charge"]
+
+
 def test_compute_capacity_trapezoidal_integral():
     """1 mA over 9 one-second intervals integrates to exactly 9/3600 mAh."""
     cyc = assign_cycles(build_cycling_df())
@@ -185,19 +194,19 @@ def test_capacity_legend_names_the_ends_past_ten_cycles(n_cycles, expected):
 
 
 def test_no_legend_warning_when_nothing_plotted():
-    """Discharge-only data never starts a cycle; no legend warning is emitted."""
-    discharge_only = pd.DataFrame({
+    """Rest-only data starts no cycle; no legend warning is emitted."""
+    rest_only = pd.DataFrame({
         "timestamp": [pd.Timestamp("2026-06-01 10:00:00") + pd.Timedelta(seconds=s)
                       for s in range(6)],
         "echem_data": [3.5] * 6,
-        "current": [-1.0] * 6,
+        "current": [0.0] * 6,
     })
     with warnings.catch_warnings():
         warnings.simplefilter("error", UserWarning)
         fig = Figure()
         ax1, ax2 = fig.subplots(1, 2)
-        plot_time_vs_voltage(ax1, discharge_only)
-        plot_capacity_vs_voltage(ax2, discharge_only)
+        plot_time_vs_voltage(ax1, rest_only)
+        plot_capacity_vs_voltage(ax2, rest_only)
 
 
 def test_relative_mode_keeps_subsecond_precision():
@@ -251,9 +260,43 @@ def test_compute_fit_recovers_parameters(fit_df):
 
 
 def test_narrow_fit_window_rejected(fit_df):
-    """A regression window with fewer than 2 points yields no fit."""
-    fit_pulses = _detect_pulses(fit_df, max_rest=300.0)
-    assert _compute_fit(fit_df, fit_pulses[0], r1_start=0.5, r1_length=0.1) is None
+    """A regression window holding one or two samples yields no fit; three samples fit."""
+    pulse = _detect_pulses(fit_df, max_rest=300.0)[0]
+    assert _compute_fit(fit_df, pulse, r1_start=0.5, r1_length=0.1) is None
+    # 0.5 and 0.75 s: a two-point line would report R² 1 with zero error bars
+    assert _compute_fit(fit_df, pulse, r1_start=0.5, r1_length=0.5) is None
+    fit = _compute_fit(fit_df, pulse, r1_start=0.5, r1_length=0.75)
+    assert fit is not None and len(fit["X_fit"]) == 3
+    assert np.isfinite(fit["R_err"]) and np.isfinite(fit["k_err"])
+
+
+def _ten_hz_pulse(lead_s):
+    """Return a 10 Hz log from a 5 s pulse lead_s into the record, timed as the app times it."""
+    n_lead, n_rest = int(lead_s * 10), 100
+    current = [0.0] * n_lead + [2.0] * 50 + [0.0] * n_rest
+    df = _assign_time(pd.DataFrame({
+        "timestamp": pd.Timestamp("2026-01-01") + pd.to_timedelta(
+            np.arange(len(current)) * 100, unit="ms"),
+        "echem_data": np.r_[np.full(n_lead + 50, 3.8),
+                            3.7 - 0.001 * np.sqrt(np.arange(n_rest) / 10)],
+        "current": current,
+    }))
+    return df.iloc[n_lead:].reset_index(drop=True)
+
+
+@pytest.mark.parametrize("case", ["a sample 1 us early", "a pulse 3600 s into a 10 Hz log"])
+def test_fit_window_ignores_timestamp_noise(fit_df, case):
+    """A window takes the samples it covers, whatever float noise their timestamps carry."""
+    if case == "a sample 1 us early":
+        rest = np.flatnonzero(_detect_pulses(fit_df, max_rest=300.0)[0]["relax_mask"])
+        t_s = fit_df["t_s"].to_numpy().copy()
+        t_s[rest[[2, 6]]] -= 1e-6  # the 0.5 s and 1.5 s rest samples
+        log, window, taken = fit_df.assign(t_s=t_s), (0.5, 1.0), [0.5, 0.75, 1.0, 1.25]
+    else:
+        log, window, taken = _ten_hz_pulse(3600.0), (0.1, 0.9), np.arange(1, 10) / 10
+    fit = _compute_fit(log, _detect_pulses(log, max_rest=300.0)[0], *window)
+    got = fit["X_fit"] ** 2
+    assert len(got) == len(taken) and np.allclose(got, taken, atol=1e-5), got
 
 
 def test_compute_all_pulses_returns_one_indexed_fit_per_pulse(fit_df):
@@ -297,13 +340,14 @@ def test_build_xrd_matrix_interpolates_a_descending_grid():
 
 
 def test_axis_labels_come_from_one_set():
-    """All windows but ICI take their TOF, d-spacing, 2θ and time labels from operaxn.config."""
+    """Every window takes its TOF, d-spacing, 2θ and time labels from operaxn.config."""
     import glob
     import operaxn.config as cfg
     assert (cfg.TOF_LABEL, cfg.DSPACING_LABEL, cfg.TWOTHETA_LABEL, cfg.TIME_HOURS_LABEL) == (
         "Time of flight [μs]", "$d$-spacing [Å]", r"2$\theta$ [°]", "Time [h]")
     assert (cfg.TOF_TEXT, cfg.DSPACING_TEXT) == ("Time of flight (μs)", "d-spacing (Å)")
-    stray = ("Time of Flight", "d spacing (", "2θ (degrees)", "Time (hours)", "'t (h)'")
+    stray = ("Time of Flight", "d spacing (", "2θ (degrees)", "Time (hours)", "'t (h)'",
+             "Time (h)")
     for path in glob.glob(os.path.join(os.path.dirname(cfg.__file__), "*.py")):
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
@@ -354,15 +398,36 @@ def test_figure_text_puts_units_in_square_brackets():
     assert not upright, f"the θ of 2θ must be italic (mathtext): {upright}"
 
 
-def test_ici_time_axes_keep_parentheses_until_the_ici_merge():
-    """ICI's Overview and Pulse zoom say "Time (h)" beside its "Voltage (V)", built and redrawn."""
-    ici = SimpleNamespace(_fig_top=Figure(), _df=None, _ax_pulse_twin=None)
-    ICIWindow._build_top_axes(ici)
-    built = [ici.ax_overview.get_xlabel(), ici.ax_pulse.get_xlabel()]
-    ICIWindow._plot_overview(ici, 1, 1, "charge")
-    ICIWindow._plot_pulse_zoom(ici, 1, 1, "charge")
-    assert built + [ici.ax_overview.get_xlabel(), ici.ax_pulse.get_xlabel()] == ["Time (h)"] * 4
-    assert ici.ax_overview.get_ylabel() == ici.ax_pulse.get_ylabel() == "Voltage (V)"
+def _ici_texts(win):
+    """Return every text drawn in an ICI window's three figures."""
+    figures = (win._fig_top, win._fig_bot, win._fig_right)
+    return {text.get_text() for fig in figures for text in fig.findobj(Text) if text.get_text()}
+
+
+@pytest.mark.display
+def test_ici_figures_put_units_in_square_brackets(tk_root, monkeypatch):
+    """ICI's figure labels write [units] like every other figure, as built and on every R/k axis."""
+    win = _open_ici(tk_root, monkeypatch, {"operando": _ici_df()}, fitted=True)
+    try:
+        texts = _ici_texts(win)
+        win.rk_axis_bar.mass_var.set("10")
+        for xaxis in ("capacity", "specific_capacity"):
+            win.rk_axis_bar._set_xaxis(xaxis)
+            texts |= _ici_texts(win)
+    finally:
+        win.destroy()
+    empty = _open_ici(tk_root, monkeypatch, {})
+    try:
+        built = _ici_texts(empty)
+    finally:
+        empty.destroy()
+    in_parentheses = sorted(s for s in texts | built if re.search(
+        r"\((V|mA|mAh|mAh/g|s|h|Ω|√s|s¹ᐟ²|Ω·s⁻¹ᐟ²)\)", s))
+    assert not in_parentheses, f"units must be in square brackets: {in_parentheses}"
+    assert {"Time [h]", "Voltage [V]", "Current [mA]", "√Δt [s¹ᐟ²]", "ΔV [V]", "R [Ω]",
+            "k [Ω·s⁻¹ᐟ²]", "Capacity [mAh]", "Specific capacity [mAh/g]"} <= texts
+    assert {"√Δt [s¹ᐟ²]", "ΔV [V]", "R [Ω]", "k [Ω·s⁻¹ᐟ²]", "Voltage [V]"} <= built
+    assert not [s for s in texts | built if "\u2013" in s], "an en dash used as a separator"
 
 
 def test_scan_positions_absolute_and_relative():
@@ -407,17 +472,6 @@ def test_app_handlers_exist():
     assert missing == [], missing
 
 
-def test_ici_window_api():
-    """ICIWindow takes source/upload hooks; regression edits auto-apply, apply-all stays manual."""
-    params = inspect.signature(ICIWindow.__init__).parameters
-    assert "echem_sources" in params
-    assert "on_add_source" in params
-    assert hasattr(ICIWindow, "_on_apply_all")
-    assert hasattr(ICIWindow, "_apply_regression_change") \
-        and not hasattr(ICIWindow, "_on_apply"), "regression edits must auto-apply"
-    assert hasattr(ICIWindow, "_focus_primary_panel")
-
-
 def test_standard_echem_accessor_and_package_export():
     """get_standard_echem returns a list and ICIWindow is exported from the package."""
     assert isinstance(get_standard_echem(), list)
@@ -425,50 +479,62 @@ def test_standard_echem_accessor_and_package_export():
 
 
 def test_source_switches_wait_for_dropdown_close():
-    """ICI and Capacity source switches defer through after_idle (pins
-    the implementation source; rename-sensitive)."""
-    assert "after_idle" in inspect.getsource(ICIWindow._on_source_change)
+    """Capacity's source switch is deferred through after_idle, so the dropdown closes first."""
     assert "after_idle" in inspect.getsource(CapacityWindow._queue_source_change)
 
 
-def test_phase_change_preserves_pulse_selection():
-    """Phase toggles keep the selected pulse (pins the
-    _on_selection_change source; rename-sensitive)."""
-    assert "pulse_var.set(1)" not in inspect.getsource(ICIWindow._on_selection_change)
-
-
-def _ici_df(n_cycles=1, pulses=3):
-    """Return an ICI-style record: 30 s pulses at +/-2 mA, each followed by a 20 s exact-zero rest."""
+def _ici_df(n_cycles=1, pulses=3, rest_step=1.0, spread=0.0):
+    """Return +/-2 mA 30 s pulses before 20 s zero rests (every rest_step s); spread raises R, k."""
     t, i, v, now, volt = [], [], [], 0.0, 3.6
     for _ in range(n_cycles):
         for sign in (1.0, -1.0):
-            for _ in range(pulses):
+            for n in range(pulses):
                 for _ in range(30):
                     t.append(now)
                     i.append(2.0 * sign)
                     v.append(volt)
                     now += 1
                     volt += 0.001 * sign
-                for k in range(20):
+                for k in range(int(20 / rest_step)):
+                    root_dt = np.sqrt(k * rest_step)
                     t.append(now)
                     i.append(0.0)
-                    v.append(volt - 0.002 * sign * np.sqrt(k))
-                    now += 1
-    return pd.DataFrame({"timestamp": pd.Timestamp("2026-01-01") + pd.to_timedelta(t, unit="s"),
-                         "echem_data": v, "current": i})
+                    v.append(volt - sign * (0.002 * root_dt + spread * n * (1 + root_dt)))
+                    now += rest_step
+    # An array: pandas 3 reads a list's whole floats as nanoseconds once fractions follow
+    stamps = pd.Timestamp("2026-01-01") + pd.to_timedelta(np.asarray(t), unit="s")
+    return pd.DataFrame({"timestamp": stamps, "echem_data": v, "current": i})
 
 
-def _ici_stand_in(df):
-    """Return a SimpleNamespace that runs ICIWindow's export path without a window."""
+def _ici_stand_in(df, fitted=False):
+    """Return a stand-in for ICIWindow's export path; fitted sets a 1-11 s window on both phases."""
+    window = {"charge": (1.0, 10.0), "discharge": (1.0, 10.0)} if fitted else {}
     fake = SimpleNamespace(_df=assign_cycles(df), _export_stem="cell", _pulses={}, _ici_cache={},
-                           _last_max_rest=300.0, _r1_pulse_overrides={}, _r1_phase_overrides={},
+                           _last_max_rest=300.0, _r1_pulse_overrides={}, _r1_phase_overrides=window,
                            reg_bar=SimpleNamespace(max_rest_var=SimpleNamespace(get=lambda: 300.0)))
     fake._max_cycle = lambda: ICIWindow._max_cycle(fake)
     fake._get_mass_mg = lambda: 10.0
     fake._get_pulses = lambda c, ph: ICIWindow._get_pulses(fake, c, ph)
+    fake._pulse_key = lambda c, ph, i: ICIWindow._pulse_key(fake, c, ph, i)
     fake._get_r1 = lambda c=None, ph=None, i=None: ICIWindow._get_r1(fake, c, ph, i)
     fake._compute_ici = lambda c, ph: ICIWindow._compute_ici(fake, c, ph)
+    fake._export_tables = lambda: ICIWindow._export_tables(fake)
+    fake._store_pending_edit = lambda: None
     return fake
+
+
+def _open_ici(tk_root, monkeypatch, sources, fitted=False):
+    """Open a withdrawn ICI window past its first draw; fitted gives every pulse a 1-11 s window."""
+    import operaxn.ici as ici_module
+    monkeypatch.setattr(ici_module, "maximise_window", lambda win: win.withdraw())
+    win = ICIWindow(tk_root, echem_sources=sources)
+    _pump(win, 300)
+    if fitted:
+        win.reg_bar.start_var.set(1.0)
+        win.reg_bar.length_var.set(10.0)
+        win._on_apply_all()
+        _pump(win, 300)
+    return win
 
 
 def test_pulse_legend_moves_with_the_phase():
@@ -492,31 +558,131 @@ def test_ici_fit_plot_adds_no_twin_axis_or_span():
     fake = _ici_stand_in(_ici_df())
     fake._r1_phase_overrides["charge"] = (1.0, 10.0)  # a window the 1 Hz rests can fill
     fig = Figure()
-    fake.ax_dv, fake.ax_r = fig.subplots(1, 2)
+    fake.ax_dv = fig.add_subplot()
     ICIWindow._plot_ici_fit(fake, 1, 1, "charge")
     assert fake.ax_dv.lines and fake.ax_dv.collections, "the fit was not drawn"
-    assert len(fig.axes) == 2, "extra (twin) axes drawn"
+    assert len(fig.axes) == 1, "extra (twin) axes drawn"
     spans = [p for ax in fig.axes for p in ax.patches if isinstance(p, (Polygon, Rectangle))]
     assert spans == [], spans
 
 
-def test_ici_export_reports_a_locked_second_file(tmp_path, monkeypatch):
-    """An ICI export that cannot write its second file shows 'Export failed' instead of raising."""
+def test_ici_export_with_a_locked_file_replaces_neither(tmp_path, monkeypatch):
+    """A discharge file held open elsewhere fails the export before either file is replaced."""
     import operaxn.ici as ici
     errors = []
     monkeypatch.setattr(ici.filedialog, "askdirectory", lambda **k: str(tmp_path))
+    monkeypatch.setattr(ici.messagebox, "askyesno", lambda *a, **k: True)
     monkeypatch.setattr(ici.messagebox, "showinfo", lambda *a, **k: None)
     monkeypatch.setattr(ici.messagebox, "showerror", lambda *a, **k: errors.append(a))
-    real = pd.DataFrame.to_csv
+    for phase in ("charge", "discharge"):
+        (tmp_path / f"cell_ici_{phase}.csv").write_text("old\n")
+    real_open, real_to_csv = open, pd.DataFrame.to_csv
 
-    def locked(self, path, *a, **k):
+    def refuse_locked(path):
         if str(path).endswith("_discharge.csv"):
             raise PermissionError("file is open in Excel")
-        return real(self, path, *a, **k)
 
-    monkeypatch.setattr(pd.DataFrame, "to_csv", locked)
-    ici.ICIWindow._export_csv(_ici_stand_in(_ici_df()))
-    assert errors and errors[0][0] == "Export failed", errors
+    def locked_open(path, *a, **k):
+        refuse_locked(path)
+        return real_open(path, *a, **k)
+
+    def locked_to_csv(self, path, *a, **k):
+        refuse_locked(path)
+        return real_to_csv(self, path, *a, **k)
+
+    monkeypatch.setattr(ici, "open", locked_open, raising=False)
+    monkeypatch.setattr(pd.DataFrame, "to_csv", locked_to_csv)
+    ici.ICIWindow._export_csv(_ici_stand_in(_ici_df(), fitted=True))
+    assert errors == [("Export failed",
+                       "ICI results could not be exported: file is open in Excel")], errors
+    assert (tmp_path / "cell_ici_charge.csv").read_text() == "old\n", "the charge file was replaced"
+
+
+def test_ici_export_refuses_when_no_pulse_is_fitted(tmp_path, monkeypatch):
+    """With no fitted pulse (here no rests) Export CSV warns and writes nothing, like Capacity."""
+    import operaxn.ici as ici
+    shown = []
+    monkeypatch.setattr(ici.filedialog, "askdirectory",
+                        lambda **k: shown.append("folder asked") or str(tmp_path))
+    monkeypatch.setattr(ici.messagebox, "showwarning", lambda *a, **k: shown.append(a))
+    monkeypatch.setattr(ici.messagebox, "showinfo", lambda *a, **k: shown.append(a))
+    charge_only = pd.DataFrame({
+        "timestamp": pd.Timestamp("2026-01-01") + pd.to_timedelta(range(60), unit="s"),
+        "echem_data": np.linspace(3.0, 4.0, 60), "current": [1.0] * 60})
+    ici.ICIWindow._export_csv(_ici_stand_in(charge_only))
+    assert shown == [("No data", "No fitted pulses to export")], shown
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_ici_export_asks_before_replacing_the_pair(tmp_path, monkeypatch):
+    """A second export into the same folder asks once, naming both files; No leaves them alone."""
+    import operaxn.ici as ici
+    asked, shown = [], []
+    monkeypatch.setattr(ici.filedialog, "askdirectory", lambda **k: str(tmp_path))
+    monkeypatch.setattr(ici.messagebox, "askyesno", lambda *a, **k: asked.append(a) and False)
+    monkeypatch.setattr(ici.messagebox, "showinfo", lambda *a, **k: shown.append(a))
+    fake = _ici_stand_in(_ici_df(), fitted=True)
+    ici.ICIWindow._export_csv(fake)
+    paths = [str(tmp_path / f"cell_ici_{phase}.csv") for phase in ("charge", "discharge")]
+    assert asked == [], asked
+    assert shown == [("Export complete", "ICI results exported to:\n" + "\n".join(paths))], shown
+    for path in paths:
+        with open(path, "w") as fh:
+            fh.write("kept\n")
+    ici.ICIWindow._export_csv(fake)
+    assert asked == [("Confirm", "Replace cell_ici_charge.csv and cell_ici_discharge.csv?")], asked
+    assert len(shown) == 1 and all(open(path).read() == "kept\n" for path in paths)
+
+
+def _export_ici_csv(fake, tmp_path, monkeypatch):
+    """Run ICIWindow's export on a stand-in into tmp_path; return the charge, discharge tables."""
+    import operaxn.ici as ici
+    monkeypatch.setattr(ici.filedialog, "askdirectory", lambda **k: str(tmp_path))
+    monkeypatch.setattr(ici.messagebox, "showinfo", lambda *a, **k: None)
+    ici.ICIWindow._export_csv(fake)
+    return [pd.read_csv(tmp_path / f"cell_ici_{phase}.csv", encoding="utf-8-sig")
+            for phase in ("charge", "discharge")]
+
+
+def test_ici_csv_numbers_each_fitted_pulse(tmp_path, monkeypatch):
+    """The ICI CSV has Pulse after Cycle and, last, the window each row was fitted with."""
+    fake = _ici_stand_in(_ici_df(), fitted=True)
+    fake._r1_pulse_overrides[fake._pulse_key(1, "charge", 2)] = (0.5, 0.1)  # no 1 Hz rest point
+    fake._r1_pulse_overrides[fake._pulse_key(1, "discharge", 2)] = (2.0, 8.0)
+    charge, discharge = _export_ici_csv(fake, tmp_path, monkeypatch)
+    assert list(charge.columns) == list(discharge.columns) == [
+        "Cycle", "Pulse", "Voltage (V)", "Capacity (mAh)", "Specific Capacity (mAh/g)",
+        "R (Ohm)", "R Error (Ohm)", "k (Ohm s^-1/2)", "k Error (Ohm s^-1/2)", "R2",
+        "Window Start (s)", "Window Length (s)"], charge.columns
+    assert charge["Pulse"].tolist() == [1, 3], charge
+    assert discharge["Pulse"].tolist() == [1, 2, 3], discharge
+    windows = discharge[["Window Start (s)", "Window Length (s)"]].values.tolist()
+    assert windows == [[1.0, 10.0], [2.0, 8.0], [1.0, 10.0]], windows
+    assert np.allclose(charge["Specific Capacity (mAh/g)"], charge["Capacity (mAh)"] / 0.010)
+
+
+def test_ici_and_capacity_report_the_same_specific_capacity(tmp_path, monkeypatch):
+    """Each ICI pulse's (specific) capacity is the Capacity CSV's value at that pulse's V0 point."""
+    import operaxn.capacity as capacity
+    df = _ici_df(n_cycles=2)
+    ici_tables = _export_ici_csv(_ici_stand_in(df, fitted=True), tmp_path, monkeypatch)
+    out = tmp_path / "cell_capacity.csv"
+    monkeypatch.setattr(capacity.filedialog, "asksaveasfilename", lambda **k: str(out))
+    monkeypatch.setattr(capacity.messagebox, "showinfo", lambda *a, **k: None)
+    CapacityWindow._export_csv(SimpleNamespace(_df=df, _export_stem="cell",
+                                               all_cycles_var=SimpleNamespace(get=lambda: True),
+                                               _get_cycles=lambda: [1, 2],
+                                               _get_mass_mg=lambda: 10.0))
+    cap = pd.read_csv(out, encoding="utf-8-sig")
+    for phase, table in zip(("charge", "discharge"), ici_tables):
+        assert len(table) == 2 * 3, table
+        for row in table.to_dict("records"):
+            leg = cap[(cap["Cycle"] == row["Cycle"]) & (cap["Phase"] == phase)]
+            at_v0 = leg[np.isclose(leg["Voltage (V)"], row["Voltage (V)"])
+                        & np.isclose(leg["Capacity (mAh)"], row["Capacity (mAh)"])]
+            assert len(at_v0) == 1, (phase, row)
+            assert np.isclose(at_v0["Specific Capacity (mAh/g)"].iloc[0],
+                              row["Specific Capacity (mAh/g)"]), (phase, row)
 
 
 def test_capacity_window_controls():
@@ -547,32 +713,43 @@ def test_capacity_export_reports_a_locked_file(tmp_path, monkeypatch):
     df = pd.DataFrame({"timestamp": t, "echem_data": np.linspace(3, 4, 30),
                        "current": [1.0] * 10 + [0.0] * 5 + [-1.0] * 10 + [0.0] * 5})
     fake = SimpleNamespace(_df=df, _export_stem="cell", _get_cycles=lambda: [1],
-                           _get_mass=lambda: 0.0)
+                           all_cycles_var=SimpleNamespace(get=lambda: True),
+                           _get_mass_mg=lambda: 0.0)
     CapacityWindow._export_csv(fake)
     assert errors == [("Export failed",
                        "Capacity data could not be exported: file is open in Excel")], errors
 
 
-def test_capacity_csv_has_the_documented_columns(tmp_path, monkeypatch):
-    """Export CSV writes the columns README.md lists; Specific Capacity is empty without a mass."""
+@pytest.mark.parametrize("box, exported", [("all", [1, 2]), (7, [2]), (2.6, [2]), (None, [1])],
+                         ids=["all cycles", "typed 7 of 2", "typed 2.6", "text"])
+def test_capacity_csv_has_the_documented_columns(tmp_path, monkeypatch, box, exported):
+    """Export CSV writes README.md's columns for the cycles shown, committing the box first."""
     import operaxn.capacity as capacity
     out = tmp_path / "cell_capacity.csv"
     errors = []
     monkeypatch.setattr(capacity.filedialog, "asksaveasfilename", lambda **k: str(out))
-    monkeypatch.setattr(capacity.messagebox, "showerror", lambda *a, **k: errors.append(a))
+    for kind in ("showerror", "showwarning"):
+        monkeypatch.setattr(capacity.messagebox, kind, lambda *a, **k: errors.append(a))
     monkeypatch.setattr(capacity.messagebox, "showinfo", lambda *a, **k: None)
-    t = [pd.Timestamp("2026-06-01 10:00:00") + pd.Timedelta(seconds=s) for s in range(30)]
-    df = pd.DataFrame({"timestamp": t, "echem_data": np.linspace(3, 4, 30),
-                       "current": [1.0] * 10 + [0.0] * 5 + [-1.0] * 10 + [0.0] * 5})
-    fake = SimpleNamespace(_df=df, _export_stem="cell", _get_cycles=lambda: [1],
-                           _get_mass=lambda: 0.0)
+    shown = {"cycle": box}  # the cycle box: what it reads as (None: text that is no number)
+    fake = SimpleNamespace(_df=build_cycling_df(), _export_stem="cell", _available=[1, 2],
+                           _shown_cycle=1, all_cycles_var=SimpleNamespace(get=lambda: box == "all"),
+                           cycle_var=SimpleNamespace(set=lambda c: shown.update(cycle=c)),
+                           _selected_cycle=lambda: None if shown["cycle"] is None
+                           else int(shown["cycle"]),  # as the IntVar reads it ('2.6' -> 2)
+                           _replot=lambda: None, _get_mass_mg=lambda: 0.0)
+    fake._commit_cycle = lambda: CapacityWindow._commit_cycle(fake)
+    fake._get_cycles = lambda: CapacityWindow._get_cycles(fake)
     CapacityWindow._export_csv(fake)
     assert errors == [], errors
     with open(out, encoding="utf-8-sig") as fh:
         header, first = fh.readline().rstrip("\n"), fh.readline().rstrip("\n")
     assert header == ("Cycle,Phase,Time (s),Voltage (V),Capacity (mAh),"
                       "Specific Capacity (mAh/g)"), header
-    assert first.startswith("1,charge,") and first.endswith(","), first
+    assert first.startswith(f"{exported[0]},charge,") and first.endswith(","), first
+    assert sorted(pd.read_csv(out, encoding="utf-8-sig")["Cycle"].unique()) == exported
+    if box != "all":
+        assert shown["cycle"] == exported[0], "the box must show the cycle exported"
 
 
 @pytest.mark.parametrize("export, what", [("_export_figure", "Heatmap"),
@@ -608,11 +785,33 @@ def test_export_all_banks_counts_the_files_written(tmp_path, monkeypatch, drawn,
 @pytest.mark.parametrize("text, mass", [("12.5", 12.5), ("inf", 0.0), ("nan", 0.0), ("-5", 0.0),
                                         ("0", 0.0)])
 def test_capacity_and_ici_take_only_a_finite_positive_mass(text, mass):
-    """A typed mass that is not a finite positive number counts as no mass in both windows."""
+    """A mass that is no finite positive number counts as none in both windows; its box shows 0."""
     var = SimpleNamespace(get=lambda: text)
-    assert CapacityWindow._get_mass(SimpleNamespace(mass_var=var)) == mass
+    assert CapacityWindow._get_mass_mg(SimpleNamespace(mass_var=var)) == mass
     ici = SimpleNamespace(rk_axis_bar=SimpleNamespace(mass_var=var))
     assert ICIWindow._get_mass_mg(ici) == mass
+    for commit in (CapacityWindow._commit_mass, _RKAxisBar._commit_mass):
+        box, redrawn = {"text": text}, []
+        bar = SimpleNamespace(mass_var=SimpleNamespace(get=lambda: box["text"],
+                                                       set=lambda t: box.update(text=t)))
+        commit(bar, lambda: redrawn.append(1))
+        assert box["text"] == (text if mass else "0") and redrawn == [1], (commit, box)
+
+
+@pytest.mark.parametrize("label, scale", [("I/mA", 1.0), ("I/A", 1e-3)])
+def test_ici_fit_reads_the_current_unit_from_the_echem_header(tmp_path, fit_df, label, scale):
+    """An echem file read by the app gives the same R and k (ohm) whatever current unit it names."""
+    import core
+    t0 = pd.Timestamp("2026-06-01 10:00:00")
+    rows = [f"{(t0 + pd.Timedelta(seconds=t)).strftime('%d/%m/%Y %H:%M:%S.%f')}"
+            f"\t{float(v)!r}\t{float(i) * scale!r}"
+            for t, v, i in zip(fit_df["t_s"], fit_df["echem_data"], fit_df["current"])]
+    path = tmp_path / "ici.txt"
+    path.write_text("\n".join([f"Date/Time\tEwe/V\t{label}"] + rows) + "\n", encoding="utf-8")
+    seg = assign_cycles(core.EchemParser().parse(str(path)))
+    fits = _compute_all_pulses(seg, _detect_pulses(seg, max_rest=300.0), lambda idx: (0.5, 3.0))
+    assert len(fits) == 1 and np.isclose(fits[0]["I_A"], I_A), fits
+    assert np.isclose(fits[0]["R"], R_TRUE) and np.isclose(fits[0]["k"], K_TRUE), fits[0]
 
 
 def test_all_cycles_labels_use_primary_text_colour():
@@ -713,40 +912,284 @@ def _pump(win, ms):
     win.wait_variable(flag)
 
 
+def _rest_lengths_df(rests=(10, 10, 400, 10, 20)):
+    """Return 1 Hz charge: a 30 s pulse before each rest length (s), then a closing 30 s run."""
+    current, t, now = [], [], 0.0
+    for rest in rests:
+        current += [2.0] * 30 + [0.0] * rest
+        t += list(np.arange(now, now + 30 + rest))
+        now += 30 + rest
+    current += [2.0] * 30
+    t += list(np.arange(now, now + 30))
+    return pd.DataFrame({"timestamp": pd.Timestamp("2026-06-01") + pd.to_timedelta(t, unit="s"),
+                         "echem_data": np.linspace(3.0, 4.0, len(t)), "current": current})
+
+
 @pytest.mark.display
-def test_max_rest_edits_redetect_pulses(tk_root):
-    """max_rest bar edits re-detect pulses through the live ICI window."""
-    wiring_current, wiring_t = [], []
-    now = 0.0
-    for rest in (90, 90, 400):
-        wiring_current += [2.0] * 60 + [0.0] * rest
-        wiring_t += list(np.arange(now, now + 60 + rest))
-        now += 60 + rest
-    wiring_current += [-2.0] * 60 + [0.0] * 90
-    wiring_t += list(np.arange(now, now + 150))
-    wiring_df = pd.DataFrame({
-        "timestamp": [pd.Timestamp("2026-06-01 10:00:00") + pd.Timedelta(seconds=s)
-                      for s in wiring_t],
-        "echem_data": np.linspace(3.0, 4.0, len(wiring_t)),
-        "current": wiring_current,
-    })
-    win = ICIWindow(tk_root, wiring_df)
+def test_max_rest_edits_keep_windows_and_selection_on_their_pulses(tk_root, monkeypatch):
+    """Max rest (300 s at first) re-detects pulses; windows, selection and range follow them."""
+    win = _open_ici(tk_root, monkeypatch, {"cell": _rest_lengths_df()})
+    bar, sel = win.reg_bar, win.selector
+
+    def starts():
+        return [p["pulse_start_t"] for p in win._get_pulses(1, "charge")]
+
     try:
+        assert bar.max_rest_var.get() == 300.0 and starts() == [0.0, 40.0, 510.0, 550.0]
+        assert float(sel._pulse_spin.cget("to")) == 4, "the pulse range is set from the first load"
+        sel.pulse_var.set(3)  # the pulse starting at 510 s
+        bar.start_var.set(2.0)
+        bar.length_var.set(5.0)
         _pump(win, 350)
-        n_default = len(win._get_pulses(1, "charge"))
-        assert float(win.selector._pulse_spin.cget("to")) == n_default, \
-            "the pulse spinbox must be bounded from the first load"
-        win.reg_bar.max_rest_var.set(500.0)
+        sel.pulse_var.set(2)
         _pump(win, 350)
-        n_raised = len(win._get_pulses(1, "charge"))
-        win.reg_bar.max_rest_var.set(50.0)
+        bar.max_rest_var.set(310.0)  # the same four pulses
         _pump(win, 350)
-        n_lowered = len(win._get_pulses(1, "charge"))
+        assert win._get_r1(1, "charge", 2) == (0.5, 1.0), "a Max rest edit set a pulse window"
+        sel.pulse_var.set(3)
+        _pump(win, 350)
+        bar.max_rest_var.set(500.0)  # admits the 400 s rest as the new pulse 3
+        _pump(win, 350)
+        assert starts() == [0.0, 40.0, 80.0, 510.0, 550.0], starts()
+        assert win._get_r1(1, "charge", 4) == (2.0, 5.0), "the tuned pulse lost its window"
+        assert win._get_r1(1, "charge", 3) == (0.5, 1.0), "the new pulse took the tuned window"
+        assert sel.pulse_var.get() == 4, "the selection did not follow its pulse"
+        assert float(sel._pulse_spin.cget("to")) == 5, "the pulse range was not updated"
+        bar.max_rest_var.set(300.0)
+        _pump(win, 350)
+        assert float(sel._pulse_spin.cget("to")) == 4
+        assert sel.pulse_var.get() == 3 and win._get_r1(1, "charge", 3) == (2.0, 5.0)
+        sel.pulse_var.set(4)  # the pulse with the 20 s rest
+        _pump(win, 50)
+        bar.max_rest_var.set(15.0)  # drops it: the selection moves to the last pulse left
+        _pump(win, 350)
+        assert starts() == [0.0, 40.0, 510.0] and sel.pulse_var.get() == 3
+        assert float(sel._pulse_spin.cget("to")) == 3
+        bar.max_rest_var.set(5.0)  # shorter than every rest
+        _pump(win, 350)
+        assert starts() == [], "lowering Max rest below every rest must reject every pulse"
     finally:
         win.destroy()
-    assert n_default == 2, f"max_rest must exclude long rests by default, got {n_default}"
-    assert n_raised == 3, f"raising max_rest must admit the long-rest pulse, got {n_raised}"
-    assert n_lowered == 0, f"lowering max_rest must reject all pulses, got {n_lowered}"
+
+
+@pytest.mark.display
+def test_regression_edits_land_on_their_own_pulse(tk_root, monkeypatch):
+    """A Start/Length edit stays with its pulse even when the selection moves before it settles."""
+    win = _open_ici(tk_root, monkeypatch, {"cell": _ici_df()})
+    try:
+        win.reg_bar.length_var.set(5.0)
+        win.selector.pulse_var.set(2)  # before the edit's debounce fires
+        _pump(win, 350)
+        windows = [win._get_r1(1, "charge", pulse) for pulse in (1, 2, 3)]
+        shown = (win.reg_bar.start_var.get(), win.reg_bar.length_var.get())
+        win.reg_bar.length_var.set(2.0)  # on pulse 2
+        win.selector.pulse_var.set(3)
+        win.reg_bar.length_var.set(3.0)  # on pulse 3, before pulse 2's edit settles
+        _pump(win, 350)
+        both = [win._get_r1(1, "charge", pulse) for pulse in (2, 3)]
+    finally:
+        win.destroy()
+    assert windows == [(0.5, 5.0), (0.5, 1.0), (0.5, 1.0)], windows
+    assert shown == (0.5, 1.0), "the bar must show pulse 2's own window"
+    assert both == [(0.5, 2.0), (0.5, 3.0)], "an edit must survive a quick edit on the next pulse"
+
+
+def _choose_source(win, name):
+    """Pick name in the ICI window's Echem menu, as a click does."""
+    menu = win.nametowidget(win.selector.source_button.cget("menu"))
+    menu.invoke(menu.index(name))
+
+
+def _fitted_windows(win, phase):
+    """Return {pulse: (first Δt in s, points)} of cycle 1's fits in phase: the window each used."""
+    return {fit["pulse_idx"]: (round(float(fit["X_fit"][0]) ** 2, 6), len(fit["X_fit"]))
+            for fit in win._compute_ici(1, phase)}
+
+
+def _window_samples(start, length, step=0.25, rest=20.0):
+    """Return (first Δt in s, points) a regression window takes from a rest sampled every step s."""
+    grid = np.arange(0.0, rest, step)
+    taken = grid[(grid >= start) & (grid < start + length)]
+    return float(taken[0]), len(taken)
+
+
+@pytest.mark.display
+def test_ici_regression_window_resolves_pulse_then_phase_then_default(tk_root, monkeypatch):
+    """A pulse uses its own edit, else Apply All's window, else the default; browsing sets none."""
+    df = _ici_df(rest_step=0.25)
+    win = _open_ici(tk_root, monkeypatch, {"cell": df, "other": df.copy()})
+    try:
+        default = _window_samples(win.reg_bar.start_var.get(), win.reg_bar.length_var.get())
+        edited, applied = _window_samples(1.0, 2.0), _window_samples(2.0, 4.0)
+        assert len({default, edited, applied}) == 3
+        everywhere = {1: default, 2: default, 3: default}
+        assert _fitted_windows(win, "charge") == _fitted_windows(win, "discharge") == everywhere
+        win.selector.pulse_var.set(3)
+        win.selector._set_phase("discharge")
+        win.selector._set_phase("charge")
+        assert win.selector.pulse_var.get() == 3, "a phase toggle must keep the selected pulse"
+        win.selector.pulse_var.set(2)
+        _pump(win, 400)
+        assert _fitted_windows(win, "charge") == everywhere, "browsing must set no window"
+        win.reg_bar.start_var.set(1.0)
+        win.reg_bar.length_var.set(2.0)
+        _pump(win, 400)  # applies after the bar's debounce, with no button
+        assert _fitted_windows(win, "charge") == {1: default, 2: edited, 3: default}
+        assert _fitted_windows(win, "discharge") == everywhere
+        win.selector.pulse_var.set(3)  # Apply All must also reach pulse 2's window
+        win.reg_bar.start_var.set(2.0)
+        win.reg_bar.length_var.set(4.0)
+        win._on_apply_all()
+        _pump(win, 400)
+        for phase in ("charge", "discharge"):
+            assert _fitted_windows(win, phase) == {1: applied, 2: applied, 3: applied}, phase
+        win.selector.pulse_var.set(1)
+        win.reg_bar.start_var.set(1.0)
+        win.reg_bar.length_var.set(2.0)
+        _pump(win, 400)
+        assert _fitted_windows(win, "charge") == {1: edited, 2: applied, 3: applied}
+        shown = {}
+        for pulse in (2, 1):
+            win.selector.pulse_var.set(pulse)
+            shown[pulse] = (win.reg_bar.start_var.get(), win.reg_bar.length_var.get())
+        _pump(win, 400)
+        assert shown == {2: (2.0, 4.0), 1: (1.0, 2.0)}, "the bar shows the selected pulse's window"
+        assert _fitted_windows(win, "charge") == {1: edited, 2: applied, 3: applied}, \
+            "showing a window is no edit"
+        loaded = win._df
+        _choose_source(win, "other")
+        assert win._df is loaded, "the switch must wait until the menu has closed"
+        _pump(win, 100)
+        assert win._df is not loaded
+        for phase in ("charge", "discharge"):
+            assert _fitted_windows(win, phase) == everywhere, phase
+    finally:
+        win.destroy()
+
+
+@pytest.mark.display
+def test_ici_opens_with_the_overview_panel_focused(tk_root, monkeypatch):
+    """Opening the ICI window focuses its overview/pulse panel, the first plot region."""
+    focused = []
+    real_focus_set = tk.Misc.focus_set
+    monkeypatch.setattr(tk.Misc, "focus_set",
+                        lambda self: (focused.append(self), real_focus_set(self))[1])
+    win = _open_ici(tk_root, monkeypatch, {"cell": _ici_df()})
+    try:
+        assert win._primary_canvas_frame in focused, focused
+    finally:
+        win.destroy()
+
+
+def _rk_bands(win):
+    """Draw the R/k figure; return its target band, its white bands (px) and the right overhang."""
+    canvas = win._canvas_right
+    canvas.draw()
+    renderer = canvas.get_renderer()
+    width, height = canvas.figure.bbox.width, canvas.figure.bbox.height
+    axes = (win.ax_r_chg, win.ax_r_dis, win.ax_k_chg, win.ax_k_dis)
+    xaxes = [ax.xaxis.get_tightbbox(renderer) for ax in axes]
+    titles = [ax.title.get_window_extent(renderer) for ax in axes]
+    bands = [height - titles[0].y1, xaxes[-1].y0]
+    bands += [xaxes[i - 1].y0 - titles[i].y1 for i in range(1, len(axes))]
+    bands.append(min(ax.yaxis.get_tightbbox(renderer).x0 for ax in axes))
+    return 0.028 * height, bands, max(box.x1 for box in xaxes) - width
+
+
+@pytest.mark.display
+def test_ici_rk_panels_keep_even_bands_after_resize_and_redraw(tk_root, monkeypatch):
+    """Each resize and R/k redraw re-spaces the four R/k plots with even bands, none cut."""
+    cell = _ici_df(rest_step=0.25, spread=0.002)   # R 0-2 ohm
+    wide = _ici_df(rest_step=0.25, spread=0.2)     # R 0-200 ohm: wider tick labels
+    win = _open_ici(tk_root, monkeypatch, {"cell": cell, "wide": wide})
+    try:
+        for width, height in ((420, 520), (640, 1000), (420, 520)):
+            win._canvas_right.resize(SimpleNamespace(width=width, height=height))  # as Tk does
+            for redraw in ("resize", "x axis", "source"):
+                if redraw == "x axis":
+                    win.rk_axis_bar.mass_var.set("3.5")
+                    win.rk_axis_bar._set_xaxis("specific_capacity")
+                elif redraw == "source":
+                    _choose_source(win, "wide" if win.selector.source_var.get() == "cell"
+                                   else "cell")
+                    _pump(win, 100)
+                band, bands, overhang = _rk_bands(win)
+                assert np.allclose(bands, band, atol=1.5), (width, height, redraw, band, bands)
+                assert overhang <= 0, (width, height, redraw, overhang)
+            win.rk_axis_bar._set_xaxis("voltage")
+    finally:
+        win.destroy()
+
+
+@pytest.mark.display
+def test_ici_spinboxes_ignore_text_that_is_not_a_number(tk_root, monkeypatch):
+    """Text or 'inf' in Cycle or Pulse raises nothing; an arrow or a mass edit redraws once."""
+    errors = []
+    monkeypatch.setattr(tk_root, "report_callback_exception", lambda *a: errors.append(a[1]))
+    win = _open_ici(tk_root, monkeypatch, {"operando": _ici_df()})
+    try:
+        for text in ("a", "inf"):
+            for spin in (win.selector._cycle_spin, win.selector._pulse_spin):
+                spin.delete(0, "end")
+                spin.insert("end", text)
+            win.selector._next_cycle()
+            win.selector._prev_pulse()
+            win.rk_axis_bar.mass_var.set("5")
+            _pump(win, 300)
+        win.selector.cycle_var.set(1)
+        win.selector.pulse_var.set(1)
+        _pump(win, 50)
+        full, rk = [], []
+        live, right = win._update_live_plots, win._update_right_plots
+        win._update_live_plots = lambda: (full.append(1), live())
+        win._update_right_plots = lambda *a: (rk.append(1), right(*a))
+        win.selector._pulse_spin.invoke("buttonup")
+        _pump(win, 50)
+        mass = next(w for w in win.rk_axis_bar.winfo_children()[0].winfo_children()
+                    if isinstance(w, tk.Spinbox))
+        counts = []
+        for edit in (lambda: mass.invoke("buttonup"),
+                     lambda: [mass.insert("end", ch) for ch in "2.5"],
+                     lambda: (mass.insert("end", "1"), win._on_rk_axis_changed())):  # Return
+            rk.clear()
+            edit()
+            _pump(win, 300)
+            counts.append(len(rk))
+    finally:
+        win.destroy()
+    assert errors == [], errors
+    assert len(full) == 1, f"one Pulse arrow click redrew {len(full)} times"
+    assert counts == [1, 1, 1], f"R/k redraws per arrow click, typed mass, Return: {counts}"
+
+
+@pytest.mark.display
+def test_ici_names_the_selection_one_way(tk_root, monkeypatch):
+    """Titles, legends, fit colour and no-fit hint name the selection one way (Pulse 0 is 1)."""
+    win = _open_ici(tk_root, monkeypatch, {"operando": _ici_df(n_cycles=2)}, fitted=True)
+    try:
+        win.selector.pulse_var.set(0)
+        selected = win.selector.pulse_var.get()
+        win.selector._set_scope("all")
+        titles = [win.ax_pulse.get_title(), win.ax_dv.get_title()]
+        r2_legend = [t.get_text() for t in win.ax_r2.get_legend().get_texts()]
+        rk_legend = [t.get_text() for t in win.ax_r_chg.get_legend().get_texts()]
+        fit_colours = set()
+        for phase in ("charge", "discharge"):
+            win.selector._set_phase(phase)
+            fit_colours.add(win.ax_dv.lines[0].get_color())
+    finally:
+        win.destroy()
+    plain = _open_ici(tk_root, monkeypatch, {"operando": _ici_df()})
+    try:
+        hint = [t.get_text() for t in plain.ax_dv.texts]
+    finally:
+        plain.destroy()
+    assert selected == 1, "a typed Pulse 0 must select pulse 1"
+    assert all(t.startswith("Cycle 1  |  Charge  |  Pulse 1") for t in titles), titles
+    assert r2_legend == ["Charge C1", "Discharge C1", "Charge C2", "Discharge C2"], r2_legend
+    assert rk_legend == ["Charge C1", "Charge C2"], rk_legend
+    assert len(fit_colours) == 1, fit_colours
+    assert hint == ["Too few rest points in the regression window\n(increase Length)"], hint
 
 
 @pytest.mark.display
@@ -1420,17 +1863,53 @@ def test_capacity_timers_never_outlive_the_window(tk_root, monkeypatch):
     assert not errors, errors
 
 
-@pytest.mark.display
-def test_plot_controls_timers_never_outlive_the_panel(tk_root):
-    """Debounced updates still queued when the plot controls go are cancelled with them."""
-    controls = gui_module.PlotControls(tk_root, gui_module.VisualiserConfig(), lambda *a: None,
+def _plot_controls_jobs(root, monkeypatch):
+    """Queue the plot controls' debounced updates; return their ids and the panel."""
+    controls = gui_module.PlotControls(root, gui_module.VisualiserConfig(), lambda *a: None,
                                        lambda *a: None, lambda *a: None)
     controls.intensity_debouncer.schedule(lambda: None)
     controls.echem_debouncer.schedule(lambda: None)
-    jobs = {controls.intensity_debouncer._after_id, controls.echem_debouncer._after_id}
-    assert None not in jobs and jobs <= _pending_after_ids(tk_root)
-    errors = _background_errors(tk_root, controls.destroy)
-    assert not jobs & _pending_after_ids(tk_root), "a queued update outlived the panel"
+    return {controls.intensity_debouncer._after_id, controls.echem_debouncer._after_id}, controls
+
+
+def _ici_jobs(root, monkeypatch):
+    """Queue every edit the ICI window debounces; return their ids and the window."""
+    win = _open_ici(root, monkeypatch, {"cell": _ici_df(), "other": _ici_df()})
+    before = _pending_after_ids(root)
+    win.reg_bar.start_var.set(1.0)
+    win.reg_bar.max_rest_var.set(299.0)
+    win.rk_axis_bar.mass_var.set("3")
+    win.update_idletasks()  # matplotlib's own idle draws go first
+    _choose_source(win, "other")
+    return _pending_after_ids(root) - before, win
+
+
+def _figure_sync_jobs(root, monkeypatch):
+    """Queue embed_figure's re-sync and watch_figure_sync's watchdog; return ids and window."""
+    from operaxn.ici import embed_figure, watch_figure_sync
+    before = _pending_after_ids(root)
+    win = tk.Toplevel(root)
+    win.overrideredirect(True)
+    win.geometry("200x150+20000+20000")  # mapped off-screen: an unmapped frame gets no <Configure>
+    frame = tk.Frame(win)
+    frame.pack(fill="both", expand=True)
+    canvas = embed_figure(Figure(), frame)
+    watch_figure_sync(win, (canvas,))
+    win.update()  # maps the window: the frame's <Configure> queues a re-sync
+    jobs = _pending_after_ids(root) - before
+    assert canvas._operaxn_sync_job in jobs and len(jobs) == 2, jobs
+    return jobs, win
+
+
+@pytest.mark.display
+@pytest.mark.parametrize("queue", [_plot_controls_jobs, _ici_jobs, _figure_sync_jobs],
+                         ids=["plot controls", "ICI window", "shared figure timers"])
+def test_queued_jobs_never_outlive_their_window(tk_root, monkeypatch, queue):
+    """Debounced updates and timers still queued when their window goes are cancelled with it."""
+    jobs, owner = queue(tk_root, monkeypatch)
+    assert jobs and None not in jobs and jobs <= _pending_after_ids(tk_root), jobs
+    errors = _background_errors(tk_root, owner.destroy)
+    assert not jobs & _pending_after_ids(tk_root), "a queued job outlived its window"
     assert not errors, errors
 
 

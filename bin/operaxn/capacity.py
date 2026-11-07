@@ -19,13 +19,14 @@ from matplotlib import cm
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 
-from .config import (CSV_ENCODING, FIGURE_DPI, MAX_LEGEND_CYCLES, SECONDS_PER_HOUR,
-                     TIME_HOURS_LABEL)
+from .config import (CSV_ENCODING, FIGURE_DPI, MASS_REPLOT_DELAY_MS, MAX_LEGEND_CYCLES,
+                     SECONDS_PER_HOUR, TIME_HOURS_LABEL)
 from .ici import (
     BG, BG2, BG3, BORDER, DIM, INPUT, TEXT, _FONT, _PAD_S,
     PLOT_BG, PLOT_BORDER, PLOT_TEXT,
     _Btn, _canvas_frame, _label, _separator, _spinbox, _style_ax,
-    echem_source_button, embed_figure, maximise_window, trace_write, watch_figure_sync,
+    echem_source_button, embed_figure, entered_mass_mg, maximise_window, show_mass_in_use,
+    trace_write, watch_figure_sync,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,18 +64,19 @@ def _label_phases(current: np.ndarray) -> np.ndarray:
 
 
 def assign_cycles(echem_df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy with t_s, phase and cycle columns; each new charge block starts a cycle.
-    Cycles are 1-indexed; samples before the first charge stay cycle 0."""
+    """Return a copy with t_s, phase and cycle columns; each first-phase block starts a cycle.
+    The first phase is the sign of the first current; rests before it stay cycle 0."""
     df = _assign_time(echem_df.copy())
     labels = _label_phases(df["current"].fillna(0).values)
     df["phase"] = labels
+    first = next((label for label in labels if label != "rest"), "charge")
 
     cycles = np.zeros(len(df), dtype=int)
     cycle_num = 0
     prev = None
 
     for i in range(len(labels)):
-        if labels[i] == "charge" and prev != "charge":
+        if labels[i] == first and prev != first:
             cycle_num += 1
         if labels[i] in ("charge", "discharge"):
             cycles[i] = cycle_num
@@ -97,6 +99,12 @@ def compute_capacity(df: pd.DataFrame) -> np.ndarray:
     dt = np.diff(t, prepend=t[0])
     i_mid = np.concatenate(([i_mA[0]], (i_mA[:-1] + i_mA[1:]) / 2))
     return np.cumsum(i_mid * dt) / SECONDS_PER_HOUR
+
+
+def specific_capacity(capacity_mAh, mass_mg: float):
+    """Return capacity (mAh) per gram of a mass given in mg, in mAh/g; NaN unless mass_mg > 0."""
+    capacity = np.asarray(capacity_mAh, dtype=float)
+    return capacity / (mass_mg / 1000.0) if mass_mg > 0 else capacity * np.nan
 
 
 def _start_cycle_plot(ax, echem_df, xlabel, cycles_to_plot):
@@ -126,7 +134,7 @@ def _cycle_label(cycle_num, cycles):
 
 def plot_capacity_vs_voltage(ax, echem_df, mass_mg=0.0, cycles_to_plot=None):
     """Plot voltage against capacity (mAh/g when mass_mg > 0), one colour per cycle.
-    Charge and discharge legs share the cycle colour; only the charge leg is labelled."""
+    Charge and discharge legs share the cycle colour; only the first leg drawn is labelled."""
     use_specific = mass_mg > 0
     setup = _start_cycle_plot(
         ax, echem_df, "Specific capacity [mAh/g]" if use_specific else "Capacity [mAh]",
@@ -137,15 +145,17 @@ def plot_capacity_vs_voltage(ax, echem_df, mass_mg=0.0, cycles_to_plot=None):
     for cycle_num in cycles:
         cycle_df = df[df["cycle"] == cycle_num]
         color = colors.get(cycle_num, "grey")
+        labelled = False
         for phase in ("charge", "discharge"):
             phase_df = cycle_df[cycle_df["phase"] == phase]
             if phase_df.empty:
                 continue
             cap = compute_capacity(phase_df)
             if use_specific:
-                cap = cap / (mass_mg / 1000.0)
+                cap = specific_capacity(cap, mass_mg)
             ax.plot(cap, phase_df["echem_data"].values, color=color, linewidth=1.5,
-                    label=_cycle_label(cycle_num, cycles) if phase == "charge" else None)
+                    label=None if labelled else _cycle_label(cycle_num, cycles))
+            labelled = True
     if ax.get_legend_handles_labels()[0]:
         ax.legend(fontsize=7, loc="best")
 
@@ -169,9 +179,6 @@ def plot_time_vs_voltage(ax, echem_df, cycles_to_plot=None):
 # Capacity Window
 # ============================================================================
 
-MASS_REPLOT_DELAY_MS = 150  # debounce for live redraws while the mass is typed
-
-
 class CapacityWindow(tk.Toplevel):
     """Capacity analysis window (voltage against time and capacity); opens maximised.
     Mass and cycle edits redraw live, with no Apply step; CSVs default to <export_stem>_capacity."""
@@ -192,6 +199,7 @@ class CapacityWindow(tk.Toplevel):
         self._export_stem = export_stem
         self._mass_job = None
         self._source_job = None
+        self._shown_cycle = 1
         self.bind('<Destroy>', self._cancel_pending, add='+')
 
         self._build_ui()
@@ -217,8 +225,8 @@ class CapacityWindow(tk.Toplevel):
                               increment=0.1, format='%.2f', width=7,
                               command=self._queue_mass_replot)
         mass_entry.pack(side='left', padx=(2, _PAD_S))
-        mass_entry.bind('<Return>', self._replot)
-        mass_entry.bind('<FocusOut>', self._queue_mass_replot)
+        mass_entry.bind('<Return>', lambda _event: self._commit_mass(self._replot))
+        mass_entry.bind('<FocusOut>', lambda _event: self._commit_mass(self._queue_mass_replot))
         trace_write(self, self.mass_var, self._queue_mass_replot)
         _separator(bar, horizontal=False).pack(side='left', fill='y', padx=_PAD_S, pady=3)
         _Btn(bar, 'Export CSV', command=self._export_csv).pack(side='left', padx=2)
@@ -243,7 +251,8 @@ class CapacityWindow(tk.Toplevel):
                                     command=self._replot,
                                     disabledbackground=INPUT, disabledforeground=DIM)
         self._cycle_spin.pack(side='left', padx=2)
-        self._cycle_spin.bind('<Return>', self._replot)
+        self._cycle_spin.bind('<Return>', self._commit_cycle)
+        self._cycle_spin.bind('<FocusOut>', self._commit_cycle)
         self._next_btn = _Btn(strip, '▶', width=1, padx=2,
                               command=lambda: self._step_cycle(1))
         self._next_btn.pack(side='left', padx=1)
@@ -312,16 +321,20 @@ class CapacityWindow(tk.Toplevel):
         """Return the stepper's cycle, or None while its text is not a number."""
         try:
             return self.cycle_var.get()
-        except tk.TclError:
+        except (tk.TclError, OverflowError):
             return None
 
-    def _get_mass(self) -> float:
+    def _get_mass_mg(self) -> float:
         """Return the entered sample mass in mg (0 unless a finite positive number)."""
-        try:
-            value = float(self.mass_var.get())
-        except (ValueError, tk.TclError):
-            return 0.0
-        return value if np.isfinite(value) and value > 0 else 0.0
+        return entered_mass_mg(self.mass_var)
+
+    def _commit_cycle(self, _event=None) -> None:
+        """Show an available cycle: the nearest to a typed number, else the one shown."""
+        typed = self._selected_cycle()
+        if self._available:
+            self.cycle_var.set(self._shown_cycle if typed is None
+                               else min(self._available, key=lambda c: abs(c - typed)))
+        self._replot()
 
     def _get_cycles(self) -> List[int]:
         """Return every available cycle, or the selected one when stepping."""
@@ -333,12 +346,19 @@ class CapacityWindow(tk.Toplevel):
     def _replot(self, *_args) -> None:
         """Redraw both panels for the selected cycles and mass."""
         selected = self._get_cycles()
+        if len(selected) == 1:
+            self._shown_cycle = selected[0]
         plot_time_vs_voltage(self.ax_time, self._df, cycles_to_plot=selected)
-        plot_capacity_vs_voltage(self.ax_cap, self._df, mass_mg=self._get_mass(),
+        plot_capacity_vs_voltage(self.ax_cap, self._df, mass_mg=self._get_mass_mg(),
                                  cycles_to_plot=selected)
         self._style_axes(self.ax_time, 'Voltage vs time')
         self._style_axes(self.ax_cap, 'Voltage vs capacity')
         self._canvas.draw()
+
+    def _commit_mass(self, redraw) -> None:
+        """Show the mass in use in the box ('0' when its text is no mass), then redraw."""
+        show_mass_in_use(self.mass_var)
+        redraw()
 
     def _queue_mass_replot(self, *_args) -> None:
         """Redraw shortly after the last mass edit, so typing stays responsive."""
@@ -348,7 +368,7 @@ class CapacityWindow(tk.Toplevel):
 
     def _queue_source_change(self, name: str) -> None:
         """Swap datasets once the dropdown has closed."""
-        self._source_job = self.after_idle(self._on_source_change, name)
+        self._source_job = self.after_idle(self._apply_source_change, name)
 
     def _cancel_pending(self, event) -> None:
         """Cancel pending mass and source jobs on close, as their callbacks go with the window."""
@@ -387,7 +407,7 @@ class CapacityWindow(tk.Toplevel):
     # Sources and export
     # ------------------------------------------------------------------
 
-    def _on_source_change(self, name: str) -> None:
+    def _apply_source_change(self, name: str) -> None:
         """Switch to another echem dataset, showing all its cycles."""
         if name == self._source_name or name not in self._sources:
             return
@@ -411,45 +431,47 @@ class CapacityWindow(tk.Toplevel):
         if self._source_name not in self._sources and self._sources:
             name = next(iter(self._sources))
             self.source_var.set(name)
-            self._on_source_change(name)
+            self._apply_source_change(name)
 
     def _export_csv(self) -> None:
         """Write the selected cycles' voltage and (specific) capacity to a CSV file."""
+        if not self.all_cycles_var.get():
+            self._commit_cycle()
         selected = self._get_cycles()
         if not selected:
-            messagebox.showwarning('No cycles', 'No cycles selected to export.', parent=self)
+            messagebox.showwarning('No cycles', 'No cycles selected to export', parent=self)
             return
         path = filedialog.asksaveasfilename(
             parent=self, title='Export Capacity CSV', defaultextension='.csv',
             filetypes=[('CSV files', '*.csv')], initialfile=f'{self._export_stem}_capacity.csv')
         if not path:
             return
-        mass = self._get_mass()
-        df_full = assign_cycles(self._df)
-        rows = []
-        for cycle_num in selected:
-            cycle_df = df_full[df_full['cycle'] == cycle_num]
-            for phase in ('charge', 'discharge'):
-                phase_df = cycle_df[cycle_df['phase'] == phase]
-                if phase_df.empty:
-                    continue
-                cap = compute_capacity(phase_df)
-                spec_cap = (cap / (mass / 1000.0) if mass > 0
-                            else np.full_like(cap, np.nan))
-                for t, v, c, sc in zip(phase_df['t_s'].values,
-                                       phase_df['echem_data'].values,
-                                       cap, spec_cap):
-                    rows.append({
-                        'Cycle': cycle_num,
-                        'Phase': phase,
-                        'Time (s)': t,
-                        'Voltage (V)': v,
-                        'Capacity (mAh)': c,
-                        'Specific Capacity (mAh/g)': sc,
-                    })
         try:
+            mass = self._get_mass_mg()
+            df_full = assign_cycles(self._df)
+            rows = []
+            for cycle_num in selected:
+                cycle_df = df_full[df_full['cycle'] == cycle_num]
+                for phase in ('charge', 'discharge'):
+                    phase_df = cycle_df[cycle_df['phase'] == phase]
+                    if phase_df.empty:
+                        continue
+                    cap = compute_capacity(phase_df)
+                    spec_cap = specific_capacity(cap, mass)
+                    for t, v, c, sc in zip(phase_df['t_s'].values,
+                                           phase_df['echem_data'].values,
+                                           cap, spec_cap):
+                        rows.append({
+                            'Cycle': cycle_num,
+                            'Phase': phase,
+                            'Time (s)': t,
+                            'Voltage (V)': v,
+                            'Capacity (mAh)': c,
+                            'Specific Capacity (mAh/g)': sc,
+                        })
             pd.DataFrame(rows).to_csv(path, index=False, encoding=CSV_ENCODING)
-        except OSError as exc:
+        except Exception as exc:
+            logger.debug('Capacity export error: %s', traceback.format_exc())
             messagebox.showerror('Export failed', f'Capacity data could not be exported: {exc}',
                                  parent=self)
             return

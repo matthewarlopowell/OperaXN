@@ -120,6 +120,7 @@ COLORMAP = "YlGnBu_r"
 LINE_WIDTH = 1.5
 GRID_ALPHA = 0.3
 PLOT_UPDATE_DELAY_MS = 50
+MASS_REPLOT_DELAY_MS = 150  # debounce for live redraws while a sample mass is typed (Capacity, ICI)
 MAX_LEGEND_CYCLES = 10  # analysis legends name every cycle up to this many (tab10's size)
 
 # Plot Font Sizes (points)

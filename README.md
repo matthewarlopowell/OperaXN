@@ -111,7 +111,7 @@ stored by reference stay outside the `.nxs`: to share an experiment with its
 it (for a ZIP upload, the `<name>_images` folder written beside the export).
 
 No data to hand? [examples/](examples) generates a small synthetic operando
-dataset and walks through loading it.
+dataset and an ICI cycling log, and walks through loading them.
 
 ### Command line options
 
@@ -210,7 +210,7 @@ file alongside the full cycling record.
 
 ## Analysis windows
 
-The **Heatmap** and **Capacity** buttons open analysis windows on the
+The **Heatmap**, **Capacity** and **ICI** buttons open analysis windows on the
 loaded experiment. `<name>` below is the experiment name: the opened `.nxs`
 file's name, or the name of the first uploaded folder or file.
 
@@ -231,10 +231,10 @@ the **Apply All** beside it gives every bank the shown title. Text between
 (`<name>_heatmap_bank1.png`), and **Export all banks...** saves one figure per
 bank, each with its own limits and title.
 
-**Capacity** needs electrochemistry with a current column. It offers the
-operando record and every standard electrochemistry file that has current;
-the **Echem** menu switches between them and **Add echem...** adds a file.
-It applies these rules:
+**Capacity** and **ICI** need electrochemistry with a current column. They
+offer the operando record and every standard electrochemistry file that has
+current; the **Echem** menu switches between them and **Add echem...** adds a
+file. Both apply these rules:
 
 - Current is in mA. A current column labelled in another unit, such as
   `Current(A)`, `I/A`, `Current [A]`, `I/uA` or `I/nA`, is converted when the
@@ -244,8 +244,10 @@ It applies these rules:
   potentiostat uses the opposite sign, charge and discharge are swapped.
 - A rest (zero current, or a blank current cell) belongs to the phase before
   it, so the rest after a charge pulse is part of that charge.
-- The first charge starts cycle 1, and each charge that follows a discharge
-  starts the next cycle.
+- The first current starts cycle 1, and each return to that phase starts the
+  next cycle: charge then discharge for a cell that starts on charge,
+  discharge then charge for one that starts on discharge. Rests before the
+  first current belong to no cycle.
 - Capacity is the integral of |current| over time (trapezoidal rule), in mAh.
   It starts again from 0 for the charge and for the discharge of every
   cycle. With a mass in mg entered, specific capacity is capacity divided by
@@ -258,6 +260,52 @@ legend names only the first and last), for all cycles or one at a time.
 `<name>_capacity.csv`), one row per point, with the columns `Cycle`, `Phase`,
 `Time (s)` (seconds from the first point of the record), `Voltage (V)`,
 `Capacity (mAh)` and `Specific Capacity (mAh/g)` (empty without a mass).
+
+**ICI** applies the intermittent current interruption method (Lacey,
+ChemElectroChem 2017, 4, 1997–2004,
+[doi:10.1002/celc.201700129](https://doi.org/10.1002/celc.201700129); Chien et
+al., Nat. Commun. 2023, 14, 2289,
+[doi:10.1038/s41467-023-37989-6](https://doi.org/10.1038/s41467-023-37989-6)).
+ICI analysis follows the conventions of
+[pyICI](https://github.com/Joe-Arroyo/pyICI) (Arroyo-Gómez et al.). The echem
+log needs dates with clock times, as for every echem file: an EC-Lab file
+exported with elapsed `time/s`, the format pyICI reads, is skipped; export it
+with absolute time.
+
+- A pulse is a run of non-zero current followed by a rest of exactly zero
+  current. Pulses are found separately in the charge and in the discharge of
+  each cycle. A pulse counts only when its rest, from the first to the last
+  zero-current point, lasts more than 0 s and at most **Max rest** (300 s by
+  default), so the pulse before a longer rest, such as the rest between
+  charge and discharge, is not analysed. Changing Max rest finds the pulses
+  again; the selected pulse and a window set on a pulse stay with that pulse.
+- V0 and I are the voltage and current at the last point of the pulse, with I
+  in A. Δt is the time since the first zero-current point and ΔV = V - V0.
+- ΔV is fitted against √Δt by least squares over Start ≤ Δt < Start + Length,
+  each edge moved to the nearest rest point (**Start** 0.5 s and **Length**
+  1.0 s by default); a window of fewer than three points gives no fit. With
+  fitted intercept a and slope b, R = -a/I in Ω and k = -b/I in Ω s^-1/2, so a
+  normal relaxation gives positive R and k on both charge and discharge.
+  Their errors are the standard errors of a and b divided by |I|, and R² is
+  the fit's coefficient of determination.
+- Negative R and k mean the current's sign is reversed (discharge logged as
+  positive) or the file logs only its size; ICI needs signed current,
+  positive on charge.
+- The regression bar shows the window of the selected pulse. Editing Start or
+  Length applies to that pulse; **Apply All** sets the window for every pulse,
+  cycle and phase.
+- The R and k panels plot each fit against V0, against the capacity at the end
+  of the pulse, or against specific capacity (a mass is needed).
+
+ICI **Export CSV** asks for a folder and writes `<name>_ici_charge.csv` and
+`<name>_ici_discharge.csv`, asking before it replaces files of those names;
+with no fitted pulse there is nothing to export. Each file has one row per
+fitted pulse over every cycle, with the columns `Cycle`, `Pulse` (a pulse
+whose fit failed has no row), `Voltage (V)` (V0), `Capacity (mAh)` (at the end
+of the pulse), `Specific Capacity (mAh/g)` (empty without a mass), `R (Ohm)`,
+`R Error (Ohm)`, `k (Ohm s^-1/2)`, `k Error (Ohm s^-1/2)`, `R2`,
+`Window Start (s)` and `Window Length (s)` (the regression window the pulse
+was fitted with).
 
 ## NeXus files
 

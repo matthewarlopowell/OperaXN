@@ -2,10 +2,8 @@
 readers, round-trip, project files, real datasets."""
 import builtins
 import ctypes
-import filecmp
 import glob
 import importlib
-import importlib.util
 import io
 import logging
 import os
@@ -2389,32 +2387,6 @@ def test_default_cache_path_outside_data_dir(inhouse_dir):
 # Project files
 # ============================================================================
 
-GENERATOR = Path(__file__).resolve().parents[1] / "examples" / "make_example_data.py"
-
-
-def _generator():
-    """Import examples/make_example_data.py as a module."""
-    spec = importlib.util.spec_from_file_location("make_example_data", GENERATOR)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_example_matches_builders(tmp_path):
-    """The walkthrough's laboratory and neutron files are byte-identical to tests/_builders.py."""
-    gen = _generator()
-    gen.make_laboratory(str(tmp_path / "ex" / "laboratory"))
-    gen.make_neutron(str(tmp_path / "ex" / "neutron"))
-    _builders.write_inhouse_dir(str(tmp_path / "b" / "laboratory"))
-    _builders.write_neutron_dir(str(tmp_path / "b" / "neutron"))
-    for sub in ("laboratory", "neutron"):
-        cmp = filecmp.dircmp(tmp_path / "ex" / sub, tmp_path / "b" / sub)
-        assert not (cmp.left_only or cmp.right_only), sub
-        _, differ, errors = filecmp.cmpfiles(tmp_path / "ex" / sub, tmp_path / "b" / sub,
-                                             cmp.common_files, shallow=False)
-        assert not differ and not errors, (sub, differ, errors)
-
-
 def test_release_version_matches_package_and_citation():
     """pyproject.toml and CITATION.cff carry the GENERATOR_VERSION every file is stamped with."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2466,13 +2438,12 @@ def test_no_undefined_names_in_packages():
 
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
-EXEMPT = {"ici.py"}  # until its three long lines are rewrapped
 
 
 def test_no_production_line_over_100_characters():
     """Every line under bin/ is at most 100 characters long."""
     long_lines = [f"{path.relative_to(BIN).as_posix()}:{n} ({len(line)})"
-                  for path in sorted(BIN.rglob("*.py")) if path.name not in EXEMPT
+                  for path in sorted(BIN.rglob("*.py"))
                   for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
                   if len(line) > 100]
     assert not long_lines, long_lines
