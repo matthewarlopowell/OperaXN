@@ -4,6 +4,7 @@ The writer stamps timestamps with the generating machine's local UTC
 offset; the reader returns naive local wall time. Assertions therefore
 compare wall-clock strings only, never raw ISO strings.
 """
+import logging
 import os
 import shutil
 import subprocess
@@ -54,6 +55,19 @@ def wall(value):
 def tz_aware(value):
     """True when a stored ISO value carries a UTC offset."""
     return pd.to_datetime(_iso(value)).tzinfo is not None
+
+
+def named_records(caplog, *names, level=logging.WARNING):
+    """Return caplog's records at or above level whose message contains every name."""
+    return [r for r in caplog.records
+            if r.levelno >= level and all(name in r.getMessage() for name in names)]
+
+
+def export_failed(what, error):
+    """Return the decided 'Export failed' box; a list of errors is shown one per line."""
+    if isinstance(error, (list, tuple)):
+        return "Export failed", f"{what} could not be exported:\n" + "\n".join(error)
+    return "Export failed", f"{what} could not be exported: {error}"
 
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

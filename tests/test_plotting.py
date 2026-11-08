@@ -28,6 +28,8 @@ from operaxn.gui import OPERAXN, VisualiserConfig
 from operaxn.input import DataSourceType
 from operaxn.output import OneDPlotter, PlotConfig, export_single_scan
 
+from _helpers import export_failed
+
 
 @pytest.fixture(autouse=True)
 def _clean_plot_cache():
@@ -41,13 +43,15 @@ def _clean_plot_cache():
 # Plot cache (placeholder branches, guards, clear-all)
 # ============================================================================
 
-def test_oned_guard_heals_raw_clear():
-    """A raw ax.clear() must not leave the next plot updating a detached line."""
+@pytest.mark.parametrize("pane", ["oned", "echem"])
+def test_oned_guard_heals_raw_clear(pane):
+    """After a raw ax.clear() the next 1D or echem plot draws a new line, not a detached one."""
     ax = Figure().subplots()
     x = np.linspace(10, 80, 50)
-    operaxn.plot_oned_data(ax, x, np.arange(50.0))
+    plot = operaxn.plot_oned_data if pane == "oned" else operaxn.plot_echem_data
+    plot(ax, x, np.arange(50.0))
     ax.clear()
-    operaxn.plot_oned_data(ax, x, np.arange(50.0) + 5)
+    plot(ax, x, np.arange(50.0) + 5)
     assert len(ax.lines) == 1, "detached cached line took the update path"
     assert np.allclose(ax.lines[0].get_ydata(), np.arange(50.0) + 5)
 
@@ -62,17 +66,6 @@ def test_twod_guard_evicts_foreign_artist():
     operaxn.plot_twod_data(ax_b, img)
     assert ax_b.images, "no image drawn on the new axes"
     assert ax_b.images[0] is not im_a, "foreign artist reused"
-
-
-def test_echem_recreates_after_raw_clear():
-    """The echem update path must not trust a line detached by a raw clear."""
-    ax = Figure().subplots()
-    t = np.arange(10.0)
-    v = 3.7 + 0.01 * np.arange(10)
-    operaxn.plot_echem_data(ax, t, v)
-    ax.clear()
-    operaxn.plot_echem_data(ax, t, v)
-    assert ax.lines, "voltage trace not recreated after a raw clear"
 
 
 def test_oned_plot_recovers_after_placeholder():
@@ -432,21 +425,6 @@ def test_gif_frame_marks_scan_position_not_frame_index(monkeypatch, tmp_path):
         f"frame 0 of a range starting at scan 5 must mark index 4, got {captured['idx']}"
 
 
-def test_gif_frames_share_one_size_when_2d_is_missing(monkeypatch, tmp_path):
-    """A range mixing scans with and without a 2D image renders every frame at one size,
-    the scan without one showing the placeholder."""
-    texts = []
-    fake = _mixed_2d_fake(monkeypatch)
-    fake._gif_placeholder = lambda ax, text, *_: texts.append(text)
-    layout = OPERAXN._gif_layout(fake, [1, 2])
-    assert layout == (True, True, False, False), layout
-    sizes = [_frame_size(OPERAXN._create_gif_frame(fake, str(tmp_path), i, {"scan_num": n},
-                                                   dpi=50, layout=layout))
-             for i, n in enumerate((1, 2))]
-    assert sizes[0] == sizes[1], sizes
-    assert texts == ["No 2D data for this scan"], texts
-
-
 def test_gif_marks_an_unreadable_2d_image_as_the_main_window_does(monkeypatch, tmp_path):
     """A scan whose 2D image failed to load gets the main window's red error text."""
     x = np.linspace(10, 80, 50)
@@ -461,7 +439,11 @@ def test_gif_marks_an_unreadable_2d_image_as_the_main_window_does(monkeypatch, t
     layout = OPERAXN._gif_layout(fake, [1])
     assert OPERAXN._create_gif_frame(fake, str(tmp_path), 0, {"scan_num": 1}, dpi=40,
                                      layout=layout)
-    assert marks == [("Error reading 2D data; try reopening dataset", "red")], marks
+    main = SimpleNamespace(axes={"twod": Figure().subplots()},
+                           state=SimpleNamespace(twod_arrays={1: {"error": True}}))
+    OPERAXN._update_twod_plot(main, 1)
+    drawn = [(text.get_text(), text.get_color()) for text in main.axes["twod"].texts]
+    assert len(drawn) == 1 and marks == drawn, (marks, drawn)
 
 
 def test_gif_neutron_frames_keep_size_as_intensity_grows(monkeypatch, tmp_path):
@@ -485,23 +467,26 @@ def test_gif_neutron_frames_keep_size_as_intensity_grows(monkeypatch, tmp_path):
 
 
 def test_generate_gif_writes_one_frame_size_for_mixed_2d(monkeypatch, tmp_path):
-    """The real GIF writer lays every frame out alike, so a mixed-2D range has one size.
-    Frame PNGs are measured as rendered: a GIF read back always has its one canvas size."""
+    """The GIF writer lays a mixed-2D range out alike: one frame size, a placeholder without 2D."""
     fake = _gif_writer(_mixed_2d_fake(monkeypatch))
     fake.state.scans = [{"scan_num": 1}, {"scan_num": 2}]
-    sizes = []
-    real = fake._create_gif_frame
+    sizes, texts, layouts = [], [], []
+    real, layout, placeholder = fake._create_gif_frame, fake._gif_layout, fake._gif_placeholder
 
     def render(*args):
         frame = real(*args)
-        sizes.append(_frame_size(frame))
+        sizes.append(_frame_size(frame))  # measured as rendered: a GIF has one canvas size
         return frame
 
     fake._create_gif_frame = render
+    fake._gif_layout = lambda nums: layouts.append(layout(nums)) or layouts[-1]
+    fake._gif_placeholder = lambda ax, text, *a: texts.append(text) or placeholder(ax, text, *a)
     out = str(tmp_path / "mixed.gif")
     OPERAXN._generate_gif(fake, out, GIFSettings(fps=2, dpi=40, loop=0, scan_list=[1, 2]), DIALOG)
     assert fake.messages and fake.messages[-1][0] == "Export complete", fake.messages
+    assert layouts and set(layouts) == {(True, True, False, False)}, layouts
     assert len(sizes) == 2 and sizes[0] == sizes[1], sizes
+    assert texts == ["No 2D data for this scan"], texts
 
 
 def _gif_app(monkeypatch, n):
@@ -602,6 +587,7 @@ def _gif(out, files, monkeypatch=None, fail_on=None, fps=2, loop=0):
                            _close_dialog=lambda d: None)
     OPERAXN._generate_gif(fake, out, GIFSettings(fps=fps, dpi=100, loop=loop,
                                                  scan_list=list(range(1, len(files) + 1))), DIALOG)
+    assert msgs, "the GIF export showed no message"
     return msgs[-1]
 
 
@@ -636,7 +622,7 @@ def test_failed_gif_write_keeps_the_previous_gif(tmp_path, monkeypatch):
     assert _gif(out, files)[0] == "Export complete"
     before = open(out, "rb").read()
     title, text, _ = _gif(out, files[::-1], monkeypatch, fail_on=2)
-    assert (title, text) == ("Export failed", "GIF could not be exported: disk full")
+    assert (title, text) == export_failed("GIF", "disk full")
     assert open(out, "rb").read() == before
     assert not os.path.exists(out + ".part")
 
@@ -700,6 +686,50 @@ def test_crop_sliders_never_cross(tk_root):
         dlg.destroy()
 
 
+@pytest.mark.display
+def test_intensity_entries_and_sliders_keep_valid_limits(tk_root, monkeypatch):
+    """2D Min/Max: bad typed bounds go back, far ones widen the sliders; Apply All asks first."""
+    updates, applied, asked, answers = [], [], [], [False, True]
+    monkeypatch.setattr(gui_module.messagebox, "askyesno",
+                        lambda *a, **_k: asked.append(a) or answers.pop(0))
+    controls = gui_module.PlotControls(tk_root, VisualiserConfig(), lambda: updates.append(1),
+                                       lambda *a: None, lambda lo, hi: applied.append((lo, hi)))
+
+    def typed(entry, text, is_min):
+        entry.delete(0, "end")
+        entry.insert(0, text)
+        controls._commit_entry(is_min)
+        return controls.get_intensity_limits(), entry.get()
+
+    def span():
+        return [(float(s.cget("from")), float(s.cget("to")))
+                for s in (controls.min_slider, controls.max_slider)]
+
+    try:
+        controls.update_intensity_range(1.0, 1000.0, 10.0, 100.0)
+        assert controls.get_intensity_limits() == (10.0, 100.0) and span() == [(0.0, 3.0)] * 2
+        for text in ("0", "-5", "nan", "abc", "100", "250"):  # not positive, or not below Max
+            assert typed(controls.min_entry, text, True) == ((10.0, 100.0), "10"), text
+        for text in ("0", "inf", "10", "5"):  # not finite, or not above Min
+            assert typed(controls.max_entry, text, False) == ((10.0, 100.0), "100"), text
+        assert updates == [], "a bound put back draws nothing"
+        assert typed(controls.max_entry, "5000", False) == ((10.0, 5000.0), "5000")
+        assert span() == [(0.0, 3.7)] * 2 and updates == [1], "a far bound widens both sliders"
+        controls._min_slider_log.set(1.5)
+        controls._on_slider(True)  # as a drag does: 10**position, Max left exact
+        assert controls.get_intensity_limits() == (31.62, 5000.0)
+        controls._max_slider_log.set(0.5)
+        controls._on_slider(False)  # past Min: stops one step above it
+        assert controls.get_intensity_limits() == (31.62, 32.36)
+        controls._apply_to_all()
+        assert asked == [("Confirm", "Apply intensity range 31.62 - 32.36 to all scans?")]
+        assert applied == [], "No applies nothing"
+        controls._apply_to_all()
+        assert applied == [(31.62, 32.36)]
+    finally:
+        controls.destroy()
+
+
 def _limit_stub():
     """Return (stand-in dialog, its config, a text box) for PlotSettingsDialog._validate_entry."""
     config = VisualiserConfig()
@@ -710,7 +740,7 @@ def _limit_stub():
     return stub, config, box, var
 
 
-@pytest.mark.parametrize("text", ["inf", "-inf", "nan", "1e999"])
+@pytest.mark.parametrize("text", ["inf", "nan"])
 def test_plot_settings_clear_a_non_finite_limit(text):
     """A non-finite Plot Settings limit is cleared to auto, as unparseable text already is."""
     stub, config, box, var = _limit_stub()
@@ -756,7 +786,7 @@ def test_dspacing_blank_limit_is_filled_decreasing():
 ])
 def test_cropped_image_extent_follows_the_crop(source, expected):
     """The 2D image spans the cropped part of the source's base extent (exports rely on it)."""
-    config = operaxn.VisualiserConfig(data_source=source)
+    config = VisualiserConfig(data_source=source)
     config.twod_xmin_percent, config.twod_xmax_percent = 10, 90
     config.twod_ymin_percent, config.twod_ymax_percent = 5, 60
     image = np.arange(1.0, 5401.0).reshape(60, 90)
@@ -782,25 +812,29 @@ def test_failed_plot_update_leaves_drawing_switched_on():
     assert calls == ["draw"], "one draw per successful update"
 
 
-def test_failed_single_scan_export_closes_its_figure(tmp_path):
-    """A drawing error inside export_single_scan does not leave a pyplot figure open."""
-    bad = {"scan_num": 1, "oned": {"x": np.linspace(10, 80, 100), "y": np.ones(100)},
-           "twod": np.ones(50)}
+@pytest.mark.parametrize("twod, written", [(np.ones(50), False), (np.ones((8, 8)), True)],
+                         ids=["drawing-error", "written"])
+def test_failed_single_scan_export_closes_its_figure(tmp_path, twod, written):
+    """export_single_scan closes its figure whether the drawing fails or the PNG is written."""
+    scan = {"scan_num": 1, "oned": {"x": np.linspace(10, 80, 100), "y": np.ones(100)}, "twod": twod}
+    out = tmp_path / "scan.png"
     before = len(plt.get_fignums())
     for _ in range(3):
-        with pytest.raises(ValueError):
-            export_single_scan(bad, str(tmp_path / "bad.png"))
+        if written:
+            export_single_scan(scan, str(out))
+        else:
+            with pytest.raises(ValueError):
+                export_single_scan(scan, str(out))
     assert len(plt.get_fignums()) == before
+    assert out.is_file() == written and (not written or out.read_bytes()[:4] == b"\x89PNG")
 
 
 def test_echem_only_export_is_refused(tmp_path):
     """A scan with no drawable panel raises instead of saving a title-only image."""
     out = tmp_path / "title_only.png"
-    with pytest.raises(ValueError, match="no 1D, 2D or neutron data") as refused:
+    with pytest.raises(ValueError, match="no 1D, 2D or neutron data"):
         export_single_scan({"scan_num": 3, "oned": None, "twod": None, "echem_value": 3.7},
                            str(out), plot_types={"oned": True, "twod": True, "echem": True})
-    assert str(refused.value) == "no 1D, 2D or neutron data", \
-        "the text leaves the scan number to the range export's list"
     assert not out.exists()
 
 

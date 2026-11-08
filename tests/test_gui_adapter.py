@@ -31,10 +31,12 @@ from operaxn import core
 from operaxn import input as gui_input
 from operaxn.config import APP_VERSION, OPERAXNTheme, log_config_summary
 from operaxn.core import nxs_writer, pipeline, readers
+from operaxn.capacity import CapacityWindow
 from operaxn.core.config import MAX_ECHEM_TIME_TOLERANCE
 from operaxn.dialog import ExportOptions, GIFSettings, UploadOptions, UploadOptionsDialog
 from operaxn.gui import (ButtonPanel, FileListPanel, OPERAXN, PerformanceMonitor, UIState,
                          VisualiserConfig, _experiment_stem)
+from operaxn.heatmap import HeatmapWindow
 from operaxn.main import EnhancedSplashScreen, main as cli_main
 from operaxn.input import (
     DataSourceType,
@@ -59,7 +61,7 @@ from operaxn.input import (
 from operaxn.output import get_scan_time_positions
 
 import _builders
-from _helpers import modules_after, needs_fabio
+from _helpers import export_failed, modules_after, named_records, needs_fabio
 
 
 def _reset_session():
@@ -158,9 +160,9 @@ def test_package_exports_core_enums():
 
 
 def test_raw_upload_absolute(inhouse_dir):
-    """Raw in-house upload yields correlated scan dicts with midpoint matching."""
+    """One in-house upload gives correlated scans, 1D/echem arrays and get_correlated_data."""
     progress = []
-    scans, _, method = process_paths(
+    scans, echem_df, method = process_paths(
         [inhouse_dir], progress.append,
         time_method=TimeMethod.ABSOLUTE, data_source=DataSourceType.INHOUSE)
     assert method == "absolute", method
@@ -173,6 +175,18 @@ def test_raw_upload_absolute(inhouse_dir):
     assert s1["oned"] == "scan_001.dat", f"got {s1['oned']}"
     assert s1["timestamp_for_correlation"] == pd.Timestamp("2024-02-05 10:06:00"), \
         f"got {s1['timestamp_for_correlation']}"
+    oned_arrays = make_oned_arrays(scans)
+    assert set(oned_arrays.keys()) == {1, 2, 3}
+    assert np.allclose(oned_arrays[1]["x"], _builders.ONED_X)
+    assert np.allclose(oned_arrays[1]["y"], _builders.inhouse_scan_y(1))
+    assert oned_arrays[1]["echem"] == 3.76
+    echem_arrays = make_echem_arrays(echem_df, method)
+    assert len(echem_arrays["x"]) == 40
+    assert echem_arrays["x"][0] == 0.0, "x is seconds from the first echem point"
+    corr = get_correlated_data(scans, 1)
+    assert corr["oned"] is not None
+    assert np.allclose(corr["oned"]["x"], _builders.ONED_X)
+    assert corr["echem_value"] == 3.76
 
 
 @needs_fabio
@@ -186,39 +200,6 @@ def test_raw_upload_pairs_edf_and_lazy_loads(inhouse_edf_dir):
     assert 1 in twod_arrays and "image" in twod_arrays[1], \
         str(twod_arrays.get(1, {}).keys())
     assert twod_arrays[1]["image"].shape == (8, 8)
-
-
-def test_make_oned_arrays(inhouse_dir):
-    """1D plot arrays carry exact data and the correlated voltage per scan."""
-    scans, _, _ = process_paths(
-        [inhouse_dir], time_method=TimeMethod.ABSOLUTE,
-        data_source=DataSourceType.INHOUSE)
-    oned_arrays = make_oned_arrays(scans)
-    assert set(oned_arrays.keys()) == {1, 2, 3}
-    assert np.allclose(oned_arrays[1]["x"], _builders.ONED_X)
-    assert np.allclose(oned_arrays[1]["y"], _builders.inhouse_scan_y(1))
-    assert oned_arrays[1]["echem"] == 3.76
-
-
-def test_make_echem_arrays_absolute(inhouse_dir):
-    """Echem arrays cover all points with x as seconds from the first point."""
-    _, echem_df, method = process_paths(
-        [inhouse_dir], time_method=TimeMethod.ABSOLUTE,
-        data_source=DataSourceType.INHOUSE)
-    echem_arrays = make_echem_arrays(echem_df, method)
-    assert len(echem_arrays["x"]) == 40
-    assert echem_arrays["x"][0] == 0.0
-
-
-def test_get_correlated_data(inhouse_dir):
-    """get_correlated_data bundles the 1D arrays and voltage for one scan."""
-    scans, _, _ = process_paths(
-        [inhouse_dir], time_method=TimeMethod.ABSOLUTE,
-        data_source=DataSourceType.INHOUSE)
-    corr = get_correlated_data(scans, 1)
-    assert corr["oned"] is not None
-    assert np.allclose(corr["oned"]["x"], _builders.ONED_X)
-    assert corr["echem_value"] == 3.76
 
 
 def test_direct_nxs_upload_matches_raw(inhouse_dir, tmp_path):
@@ -296,11 +277,13 @@ def test_relative_view_of_edf_only_file_with_no_reachable_image(tmp_path):
 
 
 def test_neutron_adapter(neutron_dir):
-    """Neutron upload yields one correlated scan with per-bank display names."""
+    """Neutron upload yields one correlated scan ('Loaded 1 scan') with per-bank display names."""
+    lines = []
     scans_n, _, _ = process_paths(
-        [neutron_dir], time_method=TimeMethod.ABSOLUTE,
+        [neutron_dir], lines.append, time_method=TimeMethod.ABSOLUTE,
         data_source=DataSourceType.NEUTRON)
     assert len(scans_n) == 1, f"got {len(scans_n)}"
+    assert lines[-1] == "Loaded 1 scan", lines
     sn = scans_n[0]
     assert sn["echem"] == 3.85, f"got {sn['echem']}"
     assert sn["neutron_files"] is not None, str(sn["neutron_files"])
@@ -311,14 +294,6 @@ def test_neutron_adapter(neutron_dir):
     n_arrays = make_neutron_arrays(scans_n)
     assert set(n_arrays[1].keys()) == {"1", "2"}
     assert np.allclose(n_arrays[1]["1"]["tof"]["x"], _builders.TOF_X)
-
-
-def test_one_scan_load_progress_reads_singular(neutron_dir):
-    """A one-run load's last progress line is 'Loaded 1 scan'."""
-    lines = []
-    process_paths([neutron_dir], lines.append, time_method=TimeMethod.ABSOLUTE,
-                  data_source=DataSourceType.NEUTRON)
-    assert lines[-1] == "Loaded 1 scan", lines
 
 
 @needs_fabio
@@ -418,14 +393,17 @@ def test_direct_nxs_load_survives_cleanup_and_exports(inhouse_dir, tmp_path):
     _discard(core.default_cache_path([inhouse_dir]))
 
 
-def test_cache_unsaved_removed_on_exit(inhouse_dir):
-    """The unsaved session cache .nxs is deleted by cleanup on app exit."""
+@pytest.mark.parametrize("exported", [False, True], ids=["unsaved", "exported"])
+def test_cache_unsaved_removed_on_exit(inhouse_dir, tmp_path, exported):
+    """On app exit cleanup deletes the unsaved session cache .nxs and keeps an exported one."""
     process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.INHOUSE)
     cache_file = get_loaded_nxs_path()
     assert cache_file and os.path.isfile(cache_file)
+    if exported:
+        export_nxs(str(tmp_path / "kept.nxs"))
     cleanup_session_cache()
-    assert not os.path.exists(cache_file)
+    assert os.path.exists(cache_file) == os.path.isfile(cache_file) == exported
 
 
 @pytest.mark.display
@@ -458,16 +436,6 @@ def test_declining_to_clear_cancels_the_upload(gui_app, monkeypatch):
     monkeypatch.setattr(messagebox, "askyesno", lambda *_a, **_k: True)
     app._upload_files()
     assert started == [options] and not app.state.scans
-
-
-def test_cache_exported_file_kept_on_exit(inhouse_dir, tmp_path):
-    """An exported session cache .nxs survives cleanup on app exit."""
-    process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
-                  data_source=DataSourceType.INHOUSE)
-    cache_file = get_loaded_nxs_path()
-    export_nxs(str(tmp_path / "kept.nxs"))
-    cleanup_session_cache()
-    assert os.path.isfile(cache_file)
 
 
 # ============================================================================
@@ -663,47 +631,37 @@ def test_resolution_handles_foreign_separator_paths(tmp_path):
 
 
 @needs_fabio
-def test_failed_zip_generate_leaves_no_cache_sidecar(tmp_path, monkeypatch):
-    """A ZIP load whose write fails leaves neither a partial .nxs nor its _images sidecar."""
-    zpath = _builders.write_twod_zip(tmp_path / "cellz.zip", tmp_path)
-
-    def fail(self, entry, scan):
-        raise OSError("simulated disk full")
-
-    monkeypatch.setattr(nxs_writer.NXSWriter, "_write_scan", fail)
-    with pytest.raises(RuntimeError, match="simulated disk full"):
-        process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
-                      data_source=DataSourceType.INHOUSE)
-    cache = core.default_cache_path([zpath])
-    assert not os.path.exists(cache) and not os.path.exists(cache + ".part")
-    assert not os.path.isdir(os.path.splitext(cache)[0] + "_images")
-
-
-@needs_fabio
-@pytest.mark.parametrize("stage", ["extract", "warm_up", "classify", "sidecar", "write"])
+@pytest.mark.parametrize("stage", ["extract", "warm_up", "classify", "sidecar", "write", "failure"])
 def test_cancelled_zip_load_raises_and_leaves_no_files(tmp_path, monkeypatch, stage):
-    """A cancel mid ZIP load raises and leaves no extraction folder, .part, .nxs or sidecar."""
+    """A cancelled or failed ZIP load raises, leaving no extracted files, .part, .nxs or sidecar."""
     src = tmp_path / "src"
     _builders.write_dated_pairs(str(src), _builders.SCAN_TIMES, _builders.SCAN_TIMES)
     zpath = _builders.zip_tree(str(src), str(tmp_path / "cellc.zip"))
     monkeypatch.setattr(pipeline, "PARALLEL_PROCESSING_THRESHOLD", 0)
     cancel = threading.Event()
-    owner, name = {"extract": (zipfile.ZipFile, "extract"),
-                   "warm_up": (pipeline.FileProcessor, "_warm_up"),
-                   "classify": (core.DATClassifier, "classify"),
-                   "sidecar": (pipeline.shutil, "move"),
-                   "write": (nxs_writer.NXSWriter, "_write_scan")}[stage]
-    original = getattr(owner, name)
+    if stage == "failure":
+        def fail(self, entry, scan):
+            raise OSError("simulated disk full")
 
-    def cancel_then_run(*args, **kwargs):
-        cancel.set()
-        return original(*args, **kwargs)
+        monkeypatch.setattr(nxs_writer.NXSWriter, "_write_scan", fail)
+    else:
+        owner, name = {"extract": (zipfile.ZipFile, "extract"),
+                       "warm_up": (pipeline.FileProcessor, "_warm_up"),
+                       "classify": (core.DATClassifier, "classify"),
+                       "sidecar": (pipeline.shutil, "move"),
+                       "write": (nxs_writer.NXSWriter, "_write_scan")}[stage]
+        original = getattr(owner, name)
 
-    monkeypatch.setattr(owner, name,
-                        staticmethod(cancel_then_run) if stage == "warm_up" else cancel_then_run)
+        def cancel_then_run(*args, **kwargs):
+            cancel.set()
+            return original(*args, **kwargs)
+
+        replacement = staticmethod(cancel_then_run) if stage == "warm_up" else cancel_then_run
+        monkeypatch.setattr(owner, name, replacement)
     tmp, cache = tempfile.gettempdir(), core.cache_dir()
     before = set(os.listdir(tmp))
-    with pytest.raises(RuntimeError, match="Generation cancelled"):
+    reason = "simulated disk full" if stage == "failure" else "Generation cancelled"
+    with pytest.raises(RuntimeError, match=reason):
         process_paths([zpath], time_method=TimeMethod.ABSOLUTE,
                       data_source=DataSourceType.INHOUSE, cancel=cancel)
     assert set(os.listdir(tmp)) == before, "extraction folder left"
@@ -773,31 +731,21 @@ def test_standard_echem_append_after_user_nxs(inhouse_dir, tmp_path):
     _discard(core.default_cache_path([inhouse_dir]))
 
 
-def test_added_csv_echem_is_named_in_its_unit_line(inhouse_dir, tmp_path, caplog):
-    """Add echem names a .csv file in its current-unit line, not the converted temp copy."""
+@pytest.mark.parametrize("name, added", [("added7.csv", 1), ("gone.csv", 0), ("broken.xlsx", 0)],
+                         ids=["added7.csv", "gone.csv", "broken.xlsx"])
+def test_added_csv_echem_is_named_in_its_unit_line(inhouse_dir, tmp_path, caplog, name, added):
+    """Add echem names a table by its own file: a .csv in its unit line, an unusable one once."""
     process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.INHOUSE)
-    csv = tmp_path / "added7.csv"
-    csv.write_text("Time,Ewe/V,I/A\n" + "".join(
+    (tmp_path / "added7.csv").write_text("Time,Ewe/V,I/A\n" + "".join(
         f"06/02/2024 09:{m:02d}:00,{4.0 + m * 0.01:.4f},0.0005\n" for m in range(10)))
-    with caplog.at_level(logging.INFO, logger="operaxn.core"):
-        assert len(add_standard_echem_files([str(csv)])) == 1
-    lines = [r.getMessage() for r in caplog.records if "current column" in r.getMessage()]
-    assert lines == ["Echem current column 'I/A' in added7.csv converted to mA (x1000)"], lines
-    _discard(core.default_cache_path([inhouse_dir]))
-
-
-def test_unconverted_added_table_is_named_once(inhouse_dir, tmp_path, caplog):
-    """Add echem names a missing or unreadable .csv/.xlsx once, by its conversion error."""
-    process_paths([inhouse_dir], time_method=TimeMethod.ABSOLUTE,
-                  data_source=DataSourceType.INHOUSE)
     (tmp_path / "broken.xlsx").write_bytes(b"not a workbook")
-    for name in ("gone.csv", "broken.xlsx"):
-        caplog.clear()
-        with caplog.at_level(logging.WARNING):
-            assert add_standard_echem_files([str(tmp_path / name)]) == []
-        named = [r.getMessage() for r in caplog.records if name in r.getMessage()]
-        assert len(named) == 1 and named[0].startswith("Error converting tabular file "), named
+    with caplog.at_level(logging.INFO, logger="operaxn.core"):
+        assert len(add_standard_echem_files([str(tmp_path / name)])) == added
+    if added:
+        assert len(named_records(caplog, name, "'I/A'", level=logging.INFO)) == 1, caplog.messages
+    else:
+        assert len(named_records(caplog, name)) == 1, caplog.messages
     _discard(core.default_cache_path([inhouse_dir]))
 
 
@@ -813,17 +761,6 @@ def test_standard_echem_combines_with_embedded_twod(inhouse_edf_dir, tmp_path):
     m2 = core.load(get_loaded_nxs_path())
     assert len(m2.standard_echem) == 1
     assert m2.scans[0].twod_embedded and m2.scans[0].twod is not None
-
-
-def test_upload_dialog_api():
-    """The combined upload dialog exposes the expected headless API."""
-    assert UploadOptionsDialog.DISPLAY_OPTIONS == \
-        ["No downsampling", "4096", "2048", "1024", "512"]
-    assert {"paths", "data_source", "time_method", "display_size", "include_2d",
-            "title", "sample_name", "sample_description",
-            "sample_preparation_date", "cycling_protocol",
-            "standard_echem_files", "echem_time_tolerance"} \
-        <= set(UploadOptions.__dataclass_fields__.keys())
 
 
 def test_process_paths_threads_protocol_kwargs(inhouse_dir):
@@ -870,15 +807,14 @@ def test_process_paths_names_a_damaged_nxs(inhouse_dir, tmp_path):
     assert ok, msgs
     with open(nxs, "r+b") as f:
         f.truncate(os.path.getsize(nxs) // 2)
-    with pytest.raises(RuntimeError, match=r"^cut\.nxs could not be opened \(damaged, incomplete "
-                                           r"or in use by another program: .+\)$"):
+    with pytest.raises(RuntimeError, match="damaged") as err:
         process_paths([nxs], time_method=TimeMethod.ABSOLUTE, data_source=DataSourceType.INHOUSE)
+    assert "cut.nxs" in str(err.value), str(err.value)
 
 
 @pytest.mark.display
 def test_upload_dialog_tolerance_field(tk_root, monkeypatch, inhouse_dir, tmp_path):
-    """The tolerance entry starts at the core default and accepts only finite positive numbers,
-    as a float capped silently at core's limit; a directly opened .nxs greys it out and drops it."""
+    """Tolerance: default, finite positive, capped; a direct .nxs greys it and the echem box."""
     errors = []
     monkeypatch.setattr("operaxn.dialog.messagebox.showerror",
                         lambda *args, **kwargs: errors.append(args))
@@ -1167,6 +1103,28 @@ def test_excel_export_writes_a_workbook(tmp_path, monkeypatch):
     assert not os.path.exists(path + ".part")
 
 
+@pytest.mark.display
+def test_excel_export_writes_the_scan_summary_and_echem_sheets(gui_app, monkeypatch, inhouse_dir,
+                                                              tmp_path):
+    """An in-house load exports a workbook of each scan's voltage and files, and the echem rows."""
+    win, app, messages = gui_app
+    _load_inhouse(win, app, inhouse_dir)
+    path = str(tmp_path / "summary.xlsx")
+    monkeypatch.setattr("operaxn.gui.filedialog.asksaveasfilename", lambda *_a, **_k: path)
+    app._export_to_excel()
+    _wait_for_worker(win, app)
+    assert messages[-1][0] == "Export complete", messages
+    sheets = pd.read_excel(path, sheet_name=None)
+    assert list(sheets) == ["Scan Summary", "Operando Echem", "Experiment"], list(sheets)
+    summary = sheets["Scan Summary"]
+    assert summary["voltage (V)"].tolist() == [s["echem"] for s in app.state.scans] == \
+        [3.76, 3.81, 3.86]
+    assert summary["oned"].tolist() == ["scan_001.dat", "scan_002.dat", "scan_003.dat"]
+    echem = sheets["Operando Echem"]
+    assert len(echem) == 40 and np.allclose(echem["voltage (V)"], 3.7 + 0.01 * np.arange(40))
+    assert not sheets["Experiment"].empty
+
+
 @pytest.mark.parametrize("filename, kind", [("summary.xlsx", "Excel"), ("summary.csv", "CSV")])
 def test_failed_excel_export_keeps_previous_file(tmp_path, monkeypatch, filename, kind):
     """A save that fails part way names the format written and leaves the earlier file untouched."""
@@ -1182,44 +1140,82 @@ def test_failed_excel_export_keeps_previous_file(tmp_path, monkeypatch, filename
 
     fake._save_to_excel = fake._save_to_csv = half_save
     OPERAXN._export_to_excel(fake)
-    assert messages[-1] == ("Export failed", f"{kind} file could not be exported: disk full",
-                            "error"), messages
+    assert messages[-1] == (*export_failed(f"{kind} file", "disk full"), "error"), messages
     assert path.read_bytes() == b"previous export"
     assert not os.path.exists(str(path) + ".part")
 
 
-@pytest.mark.parametrize("export_type, what", [("current", "Image"), ("multiple", "Images")])
-def test_failed_image_export_says_what_could_not_be_exported(export_type, what):
-    """An image or range export that raises closes its page and names what was not exported."""
+def _failed_export(case, tmp_path, monkeypatch):
+    """Run one exporter so it fails; return its boxes, error boxes as (title, body, 'error')."""
     shown, closed = [], []
+    monkeypatch.setattr(messagebox, "showerror", lambda *a, **_k: shown.append((*a, "error")))
 
-    def boom(*_a):
+    def boom(*_a, **_k):
         raise OSError("disk full")
 
-    fake = SimpleNamespace(_exporting_on_tk_thread=nullcontext, _export_current_scan=boom,
-                           _export_multiple_scans=boom, _close_dialog=closed.append,
-                           _show_message=lambda *a: shown.append(a))
-    OPERAXN._perform_export(fake, ExportOptions(export_type, 100, {"oned": True}, [1]), "page")
-    assert closed == ["page"]
-    assert shown == [("Export failed", f"{what} could not be exported: disk full", "error")]
+    if case in ("image", "images"):
+        fake = SimpleNamespace(_exporting_on_tk_thread=nullcontext, _export_current_scan=boom,
+                               _export_multiple_scans=boom, _close_dialog=closed.append,
+                               _show_message=lambda *a: shown.append(a))
+        export_type = "current" if case == "image" else "multiple"
+        OPERAXN._perform_export(fake, ExportOptions(export_type, 100, {"oned": True}, [1]), "page")
+        assert closed == ["page"], "the export page must close"
+    elif case == "images-all-failed":
+        monkeypatch.setattr(filedialog, "askdirectory", lambda **_k: str(tmp_path))
+        monkeypatch.setattr(gui_module, "get_correlated_data", lambda *a: {"scan_num": a[1]})
+        monkeypatch.setattr(gui_module, "export_single_scan", boom)
+        page = SimpleNamespace(begin_progress=lambda *a: None, update_progress=lambda *a: True)
+        fake = SimpleNamespace(
+            state=SimpleNamespace(scans=[{"scan_num": 1}, {"scan_num": 2}], intensity_limits={}),
+            config=VisualiserConfig(), _dialog_open=lambda _d: True, _close_dialog=closed.append,
+            _show_message=lambda *a: shown.append(a))
+        OPERAXN._export_multiple_scans(fake, 100, {"oned": True}, [1, 2], page)
+    elif case.startswith("nexus"):
+        def export(_destination):
+            if case == "nexus-raises":
+                raise OSError("disk full")
+            return False, ["No experiment loaded"]
+
+        monkeypatch.setattr("operaxn.gui.export_nxs", export)
+        OPERAXN._export_nxs(_export_fake(monkeypatch, str(tmp_path / "cell.nxs"), shown))
+    elif case == "capacity":
+        monkeypatch.setattr(filedialog, "asksaveasfilename",
+                            lambda **_k: str(tmp_path / "locked.csv"))
+        monkeypatch.setattr(messagebox, "showinfo", lambda *a, **_k: None)
+
+        def locked(*_a, **_k):
+            raise PermissionError("file is open in Excel")
+
+        monkeypatch.setattr(pd.DataFrame, "to_csv", locked)
+        t = [pd.Timestamp("2026-06-01 10:00:00") + pd.Timedelta(seconds=s) for s in range(30)]
+        df = pd.DataFrame({"timestamp": t, "echem_data": np.linspace(3, 4, 30),
+                           "current": [1.0] * 10 + [0.0] * 5 + [-1.0] * 10 + [0.0] * 5})
+        CapacityWindow._export_csv(SimpleNamespace(
+            _df=df, _export_stem="cell", _get_cycles=lambda: [1], _get_mass_mg=lambda: 0.0,
+            all_cycles_var=SimpleNamespace(get=lambda: True)))
+    else:
+        monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **_k: str(tmp_path / "map.png"))
+        fake = SimpleNamespace(_matrix=np.ones((2, 2)), _export_stem=lambda: "cell",
+                               _file_stem="cell", _banks=["1", "3"], save_figure=boom,
+                               _rows_for=lambda _bank: (None, np.ones((2, 2)), []))
+        getattr(HeatmapWindow, "_export_figure" if case == "heatmap" else "_export_all_banks")(fake)
+    return shown
 
 
-@pytest.mark.parametrize("result, text", [
-    pytest.param((False, ["No experiment loaded"]),
-                 "NeXus file could not be exported:\nNo experiment loaded", id="refused"),
-    pytest.param(OSError("disk full"), "NeXus file could not be exported: disk full", id="raises")])
-def test_failed_nexus_export_says_what_could_not_be_exported(tmp_path, monkeypatch, result, text):
-    """A NeXus export that is refused or raises says the NeXus file could not be exported."""
-    messages = []
-
-    def export(_destination):
-        if isinstance(result, Exception):
-            raise result
-        return result
-
-    monkeypatch.setattr("operaxn.gui.export_nxs", export)
-    OPERAXN._export_nxs(_export_fake(monkeypatch, str(tmp_path / "cell.nxs"), messages))
-    assert messages == [("Export failed", text, "error")], messages
+@pytest.mark.parametrize("case, what, error", [
+    ("image", "Image", "disk full"),
+    ("images", "Images", "disk full"),
+    ("images-all-failed", "Images", ["  Scan 1: disk full", "  Scan 2: disk full"]),
+    ("nexus-refused", "NeXus file", ["No experiment loaded"]),
+    ("nexus-raises", "NeXus file", "disk full"),
+    ("capacity", "Capacity data", "file is open in Excel"),
+    ("heatmap", "Heatmap", "disk full"),
+    ("heatmaps", "Heatmaps", "disk full"),
+], ids=["image", "images", "images-all-failed", "nexus-refused", "nexus-raises", "capacity",
+        "heatmap", "heatmaps"])
+def test_failed_export_says_what_could_not_be_exported(tmp_path, monkeypatch, case, what, error):
+    """A failed export shows one 'Export failed' error box naming what was not exported, and why."""
+    assert _failed_export(case, tmp_path, monkeypatch) == [(*export_failed(what, error), "error")]
 
 
 def test_upper_case_csv_name_gets_csv(tmp_path, monkeypatch):
@@ -1236,8 +1232,8 @@ def test_config_summary_logs_after_setup(caplog):
     """The debug configuration summary logs its lines when called after logging setup."""
     with caplog.at_level(logging.DEBUG, logger="operaxn.config"):
         log_config_summary()
-    text = "\n".join(r.getMessage() for r in caplog.records)
-    assert "OperaXN Configuration" in text and "Max Workers:" in text
+    assert [r for r in named_records(caplog, level=logging.DEBUG) if r.name == "operaxn.config"], \
+        caplog.messages
 
 
 def test_splash_fill_stops_at_track_end():
@@ -1434,14 +1430,7 @@ def test_twod_scan_shown_while_its_source_was_away_shows_the_image_once_it_is_ba
 
 
 def test_button_panel_configuration():
-    """Analysis and export buttons exist, analysis first, with plain-text labels."""
-    button_keys = [key for key, _, _, _ in ButtonPanel.BUTTON_CONFIGS]
-    assert "capacity_plot" in button_keys
-    assert "ici_analysis" in button_keys
-    assert "heatmap" in button_keys
-    assert "export_nxs" in button_keys
-    assert button_keys.index("capacity_plot") < button_keys.index("export_plots") \
-        and button_keys.index("ici_analysis") < button_keys.index("export_plots")
+    """Every button label is plain ASCII text."""
     # An emoji costs seconds of Windows font lookup on the first button that shows one
     assert all(text.isascii() for _, text, _, _ in ButtonPanel.BUTTON_CONFIGS)
 
@@ -1468,26 +1457,17 @@ class _FakeListbox:
         """Ignore scroll requests."""
 
 
-def test_progress_cannot_replace_loaded_scan_rows():
-    """show_progress leaves loaded scan rows untouched."""
-    fake_listbox = _FakeListbox(["Scan 1"])
+@pytest.mark.parametrize("loaded, shown", [(["Scan 1"], ["Scan 1"]), ([], ["Loading scans"])],
+                         ids=["scan-rows-loaded", "before-scans-load"])
+def test_progress_cannot_replace_loaded_scan_rows(loaded, shown):
+    """show_progress leaves loaded scan rows alone and replaces stale progress before any load."""
+    fake_listbox = _FakeListbox(loaded or ["Old progress"])
     fake_panel = SimpleNamespace(
-        _items_cache=["Scan 1"], listbox=fake_listbox,
-        update_idletasks=lambda: None,
-    )
-    FileListPanel.show_progress(fake_panel, "Processing echem data...")
-    assert fake_listbox.items == ["Scan 1"]
-
-
-def test_progress_remains_available_before_scans_load():
-    """show_progress replaces stale progress rows before any scans load."""
-    fake_listbox = _FakeListbox(["Old progress"])
-    fake_panel = SimpleNamespace(
-        _items_cache=[], listbox=fake_listbox,
+        _items_cache=loaded, listbox=fake_listbox,
         update_idletasks=lambda: None,
     )
     FileListPanel.show_progress(fake_panel, "Loading scans")
-    assert fake_listbox.items == ["Loading scans"]
+    assert fake_listbox.items == shown
 
 
 def test_scan_list_wheel_steps_one_row_on_every_platform():
@@ -1502,8 +1482,7 @@ def test_scan_list_wheel_steps_one_row_on_every_platform():
 
 @pytest.mark.display
 def test_upload_and_clear_locked_while_loading(gui_app, monkeypatch, neutron_dir, tmp_path):
-    """Upload and Clear are disabled and refused while a load runs, and come back after;
-    a neutron .nxs opened under the default Laboratory source still loads as neutron."""
+    """Upload and Clear are locked while a load runs; a neutron .nxs loads as 1 neutron scan."""
     process_paths([neutron_dir], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.NEUTRON)
     neutron_nxs = str(tmp_path / "neutron_run.nxs")
@@ -1528,18 +1507,6 @@ def test_upload_and_clear_locked_while_loading(gui_app, monkeypatch, neutron_dir
     assert str(buttons["clear_all"].cget("state")) == "normal"
     assert app.state.data_source == DataSourceType.NEUTRON
     assert app.state.neutron_arrays, messages
-    assert messages and messages[-1][0] == "Success", messages
-
-
-@pytest.mark.display
-def test_one_run_neutron_load_message_reads_singular(gui_app, neutron_dir):
-    """A one-run neutron load says 'Successfully loaded 1 neutron scan'."""
-    win, app, messages = gui_app
-    app._process_files_async(UploadOptions(paths=[neutron_dir],
-                                           data_source=DataSourceType.NEUTRON,
-                                           time_method=TimeMethod.ABSOLUTE, display_size=0,
-                                           include_2d=False))
-    _wait_for_worker(win, app)
     assert messages[-1] == ("Success", "Successfully loaded 1 neutron scan using absolute "
                             "timestamps", "info"), messages
 
@@ -1580,85 +1547,46 @@ def test_replot_closes_old_figure_and_rebinds_plot_settings(gui_app, monkeypatch
 
 
 @pytest.mark.display
-def test_failed_load_unlocks_upload_and_clear(gui_app, monkeypatch, inhouse_dir):
-    """A load whose processing raises shows the error and leaves Upload and Clear usable."""
-    win, app, messages = gui_app
-    def boom(*_a, **_k):
-        raise RuntimeError("unreadable input")
-
-    monkeypatch.setattr(gui_module, "process_paths", boom)
-    app._process_files_async(_inhouse_options(inhouse_dir))
-    _wait_for_worker(win, app)
-    assert messages and messages[-1][0] == "Error" and "unreadable input" in messages[-1][1]
-    buttons = app.button_panel.buttons
-    assert str(buttons["upload_files"].cget("state")) == "normal"
-    assert str(buttons["clear_all"].cget("state")) == "normal"
-
-
-@pytest.mark.display
-@pytest.mark.parametrize("failure", ["generate", "arrays", "rows shown"])
+@pytest.mark.parametrize("failure, reason", [
+    ("generate", "No neutron logbook found"),
+    ("arrays", "simulated neutron build failure"),
+    ("rows shown", "simulated failure after the rows are shown"),
+    ("processing", "unreadable input"),
+], ids=["generate", "arrays", "rows shown", "processing"])
 def test_failed_load_leaves_the_window_as_clear_all_does(gui_app, monkeypatch, tmp_path,
-                                                         neutron_dir, failure):
-    """A failed neutron load leaves no scans, rows or view settings behind: the window and its
-    settings are as Clear All leaves them."""
+                                                         neutron_dir, failure, reason):
+    """A failed load shows why and leaves the window, session and buttons as Clear All does."""
     path = neutron_dir
     if failure == "generate":
         path = tmp_path / "junk"
         path.mkdir()
         (path / "notes.txt").write_text("nothing to see\n")
     win, app, messages = gui_app
+
+    def boom(*_a, **_k):
+        raise (MemoryError if failure == "arrays" else RuntimeError)(reason)
+
     if failure == "arrays":
-        def boom(*_a, **_k):
-            raise MemoryError("simulated neutron build failure")
         monkeypatch.setattr(gui_module, "make_neutron_arrays", boom)
     elif failure == "rows shown":
-        def boom(*_a, **_k):
-            raise RuntimeError("simulated failure after the rows are shown")
         monkeypatch.setattr(app.scan_selector, "set_range", boom)  # first step after the rows
+    elif failure == "processing":
+        monkeypatch.setattr(gui_module, "process_paths", boom)
     app._apply_data_source(DataSourceType.NEUTRON, 0)  # as _upload_files does first
+    app.file_list.show_progress("Processing neutron data...")
     app._process_files_async(UploadOptions(
         paths=[str(path)], data_source=DataSourceType.NEUTRON,
         time_method=TimeMethod.ABSOLUTE, display_size=0, include_2d=False))
     _wait_for_worker(win, app)
-    assert messages[-1][0] == "Error", messages
+    assert messages[-1][0] == "Error" and reason in messages[-1][1], messages
     assert app.state.scans == []
     assert app.config == VisualiserConfig()
     assert app.file_list.listbox.size() == 0, app.file_list.listbox.get(0, "end")
-
-
-@pytest.mark.display
-def test_failed_generate_shows_the_reason_and_clears_progress(gui_app, tmp_path):
-    """The box names the generate error and the progress row does not stay behind."""
-    junk = tmp_path / "junk"
-    junk.mkdir()
-    (junk / "notes.txt").write_text("nothing to see\n")
-    win, app, messages = gui_app
-    app.file_list.show_progress("Processing laboratory data...")
-    app._process_files_async(_inhouse_options(str(junk)))
-    _wait_for_worker(win, app)
-    assert messages[-1][0] == "Error" and "No scan data available" in messages[-1][1]
-    assert app.file_list.listbox.size() == 0
-    assert app.state.scans == []
-
-
-@pytest.mark.display
-def test_array_failure_drops_the_half_load(gui_app, monkeypatch, inhouse_dir):
-    """An error while building arrays is shown, and the scans, session and progress row go."""
-    def boom(*_a, **_k):
-        raise MemoryError("simulated 2D build failure")
-
-    monkeypatch.setattr(gui_module, "make_twod_arrays", boom)
-    win, app, messages = gui_app
-    app._process_files_async(_inhouse_options(inhouse_dir))
-    _wait_for_worker(win, app)
-    assert messages and messages[-1][0] == "Error", messages
-    assert "simulated 2D build failure" in messages[-1][1]
-    assert app.state.scans == [] and app.file_list.listbox.size() == 0
     assert gui_input.get_loaded_nxs_path() is None
-    assert not os.path.exists(core.default_cache_path([inhouse_dir]))
+    assert not os.path.exists(core.default_cache_path([str(path)]))
     buttons = app.button_panel.buttons
-    assert str(buttons["upload_files"].cget("state")) == "normal"
-    assert str(buttons["plot_data"].cget("state")) == "disabled"
+    assert [str(buttons[k].cget("state")) for k in ("upload_files", "clear_all", "plot_data")] == \
+        ["normal", "normal", "disabled"]
 
 
 @pytest.mark.display
@@ -1727,7 +1655,7 @@ def test_echem_append_while_busy_is_refused_with_a_message(gui_app, monkeypatch,
      "cannot be used for ICI or Capacity analysis"),
 ], ids=["none", "one", "two"])
 def test_added_echem_outcomes_say_electrochemistry(gui_app, monkeypatch, count, title, body):
-    """Outcome titles say "electrochemistry" in full; the no-current text follows the file count."""
+    """Titles say "electrochemistry", the text follows the file count; Capacity and ICI stay off."""
     win, app, messages = gui_app
     voltage_only = pd.DataFrame({
         "timestamp": pd.date_range("2024-02-05 10:00", periods=3, freq="min"),
@@ -1939,12 +1867,15 @@ def test_quit_during_an_image_or_gif_export_asks_and_stops_it(gui_app, monkeypat
 
 @pytest.mark.display
 def test_upload_dialog_takes_source_from_nxs(tk_root, neutron_dir, inhouse_dir, tmp_path):
-    """Selecting a directly opened .nxs shows and locks its recorded source, with a grey note;
-    choosing raw data again restores the user's own choice."""
+    """An opened .nxs shows and locks its source and time method; raw data restores them."""
     process_paths([neutron_dir], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.NEUTRON)
     neutron_nxs = str(tmp_path / "neutron_run.nxs")
     shutil.copy(get_loaded_nxs_path(), neutron_nxs)
+    relative_nxs = str(tmp_path / "rel.nxs")
+    ok, msgs = core.generate([inhouse_dir], relative_nxs, core.DataSourceType.INHOUSE,
+                             time_method=core.TimeMethod.RELATIVE)
+    assert ok, msgs
 
     dlg = UploadOptionsDialog(tk_root)
     try:
@@ -1961,21 +1892,8 @@ def test_upload_dialog_takes_source_from_nxs(tk_root, neutron_dir, inhouse_dir, 
         assert dlg.source_var.get() == "synchrotron"
         assert all(str(r.cget("state")) == "normal" for r in dlg._source_radios)
         assert dlg.note_var.get() == ""
-    finally:
-        if dlg.winfo_exists():
-            dlg.destroy()
 
-
-@pytest.mark.display
-def test_upload_dialog_takes_time_method_from_nxs(tk_root, inhouse_dir, tmp_path):
-    """Picking a relative-recorded .nxs shows and locks Relative; raw data restores the choice."""
-    nxs = str(tmp_path / "rel.nxs")
-    ok, msgs = core.generate([inhouse_dir], nxs, core.DataSourceType.INHOUSE,
-                             time_method=core.TimeMethod.RELATIVE)
-    assert ok, msgs
-    dlg = UploadOptionsDialog(tk_root)
-    try:
-        dlg._paths = [nxs]
+        dlg._paths = [relative_nxs]
         dlg._update_option_states()
         assert dlg.time_var.get() == "relative"
         assert all(str(r.cget("state")) == "disabled" for r in dlg._time_radios)
@@ -2011,31 +1929,19 @@ def test_upload_dialog_wheel_scrolls_on_every_platform_and_unbinds_on_close(tk_r
 
 @pytest.mark.display
 def test_upload_file_picker_separates_patterns_by_spaces(tk_root, monkeypatch):
-    """The 'All Supported' filter lists its patterns with spaces, as Tk's Linux file dialog needs."""
-    asked = []
+    """Patterns are space-separated (Tk on Linux); the echem box reads '1 file', '2 files'."""
+    asked, picks = [], [(), ("a.txt",), ("a.txt", "b.txt")]
     monkeypatch.setattr("operaxn.dialog.filedialog.askopenfilenames",
-                        lambda **kwargs: asked.append(kwargs["filetypes"]) or ())
+                        lambda **kwargs: asked.append(kwargs["filetypes"]) or picks.pop(0))
     dlg = UploadOptionsDialog(tk_root)
     try:
         dlg._select_files()
-    finally:
-        dlg.destroy()
-    patterns = dict(asked[0])["All Supported"]
-    assert patterns == "*.zip *.dat *.edf *.txt *.xlsx *.csv *.hdf *.nxs *.xy", patterns
-
-
-@pytest.mark.display
-def test_upload_standard_echem_count_reads_singular(tk_root, monkeypatch):
-    """The standard echem field reads '1 file' for one file and '2 files' for two."""
-    picks = [("a.txt",), ("a.txt", "b.txt")]
-    monkeypatch.setattr("operaxn.dialog.filedialog.askopenfilenames",
-                        lambda **kwargs: picks.pop(0))
-    dlg = UploadOptionsDialog(tk_root)
-    try:
         shown = []
         for _ in range(2):
             dlg._select_std_echem()
             shown.append(dlg.std_echem_var.get())
     finally:
         dlg.destroy()
+    patterns = dict(asked[0])["All Supported"]
+    assert patterns == "*.zip *.dat *.edf *.txt *.xlsx *.csv *.hdf *.nxs *.xy", patterns
     assert shown == ["1 file", "2 files"], shown

@@ -36,10 +36,13 @@ def inhouse_scan_y(i):
 
 
 def write_xrd_dat(path, timestamp, exposure="120.0", y=None):
-    """Write an XRD .dat: '# Date <timestamp>', '# ExposureTime', a column header, x/y rows."""
+    """Write an XRD .dat: '# Date', '# ExposureTime' (none for None), a column header, x/y rows."""
     if y is None:
         y = inhouse_scan_y(1)
-    lines = [f"# Date {timestamp}", f"# ExposureTime {exposure}", "# tth Intensity"]
+    lines = [f"# Date {timestamp}"]
+    if exposure is not None:
+        lines.append(f"# ExposureTime {exposure}")
+    lines.append("# tth Intensity")
     lines += [f"{x:.4f} {v:.4f}" for x, v in zip(ONED_X, y)]
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")

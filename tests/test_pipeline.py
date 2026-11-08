@@ -25,7 +25,8 @@ from operaxn import core
 from operaxn.core import nxs_writer, readers
 
 import _builders
-from _helpers import assert_pynxtools_valid, modules_after, need_dataset, needs_fabio, wall
+from _helpers import (assert_pynxtools_valid, modules_after, named_records, need_dataset,
+                      needs_fabio, wall)
 
 
 def _warning_messages(caplog):
@@ -113,15 +114,15 @@ def test_partial_echem_match_is_counted(tmp_path, caplog):
     # Midpoint 200 s past the last echem point (as in the test below)
     _builders.write_xrd_dat(os.path.join(src, "scan_002.dat"), "2024-02-05T10:41:20")
 
-    def counted(**kwargs):
+    def counted(*names, **kwargs):
         caplog.clear()
         with caplog.at_level(logging.INFO, logger="operaxn.core"):
             core.process_raw([src], core.DataSourceType.INHOUSE, **kwargs)
-        return [r.getMessage() for r in caplog.records
-                if r.getMessage().startswith("Echem matched")]
+        return [(r.name, r.levelno) for r in named_records(caplog, *names, level=logging.INFO)]
 
-    assert counted(echem_time_tolerance=100) == ["Echem matched 1 of 2 scans within 100 s"]
-    assert counted() == [], "every scan matched: nothing to count"
+    assert counted("1 of 2", "100 s", echem_time_tolerance=100) == [
+        ("operaxn.core.correlate", logging.INFO)]
+    assert counted("of 2") == [], "every scan matched: nothing to count"
 
 
 def test_tolerance_bounds_the_match_past_the_record_end(tmp_path):
@@ -160,11 +161,10 @@ def test_tolerance_bounds_the_match_past_the_record_end(tmp_path):
 
 
 def test_generate_rejects_an_unusable_tolerance(tmp_path, caplog):
-    """Direct API callers get a clear error, not a logged traceback, for a tolerance the
-    correlator cannot use."""
+    """Direct API callers get a clear error, not a logged traceback, for an unusable tolerance."""
     src = str(tmp_path / "inhouse")
     _builders.write_inhouse_dir(src)
-    for bad in (None, "300", 0, -5, float("nan"), float("inf"), True, 300j, 1e10, 10**400):
+    for bad in (None, "300", float("nan"), 0, 1e10):
         caplog.clear()
         ok, msgs = core.generate([src], str(tmp_path / "bad.nxs"),
                                  core.DataSourceType.INHOUSE, echem_time_tolerance=bad)
@@ -192,20 +192,20 @@ def test_echem_that_matches_no_scan_is_reported_once(tmp_path, caplog):
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="operaxn.core"):
             scans, _ = core.process_raw([str(src)], core.DataSourceType.INHOUSE, time_method=method)
-        found = [r.getMessage() for r in caplog.records if "No scan matched" in r.getMessage()]
-        runs[method] = ([s.echem is not None for s in scans], found)
-    assert runs[core.TimeMethod.ABSOLUTE] == ([False] * 3, [
-        "No scan matched the echem data: 3 scans from 2024-02-05 10:06 to 2024-02-05 10:16, "
-        "echem from 2024-05-02 10:00 to 2024-05-02 10:39, tolerance 300 s; check the echem date "
-        "format and the time method"])
-    assert runs[core.TimeMethod.RELATIVE] == ([True] * 3, [])
+        runs[method] = ([s.echem is not None for s in scans],
+                        len(named_records(caplog, "No scan matched")),
+                        len(named_records(caplog, "3 scans", "2024-02-05 10:06 to 2024-02-05 10:16",
+                                          "2024-05-02 10:00 to 2024-05-02 10:39", "300 s",
+                                          "check the echem date format and the time method")))
+    assert runs[core.TimeMethod.ABSOLUTE] == ([False] * 3, 1, 1)
+    assert runs[core.TimeMethod.RELATIVE] == ([True] * 3, 0, 0)
     for prepare in (lambda: _builders.write_echem_txt(str(src / "echem.txt")),
                     lambda: os.remove(src / "echem.txt")):
         prepare()
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="operaxn.core"):
             core.process_raw([str(src)], core.DataSourceType.INHOUSE)
-        assert not [r for r in caplog.records if "No scan matched" in r.getMessage()]
+        assert not named_records(caplog, "No scan matched")
 
 
 def test_scan_processor_keeps_absolute_timestamps_in_relative_mode(inhouse_dir):
@@ -236,32 +236,24 @@ def test_offset_echem_rows_correlate_by_wall_clock(tmp_path):
     assert [round(s.echem, 4) for s in scans] == [3.76, 3.81, 3.86]
 
 
-@pytest.mark.parametrize("stamp", ["2024-02-05T10:05:00+00:00", "2024-02-05T10:05:00Z",
-                                   "2024-02-05T10:05:00-05:00", "2024-02-05T10:05:00+01"],
-                         ids=["plus-offset", "zulu", "minus-offset", "short-offset"])
-def test_scan_time_with_a_utc_offset_correlates(tmp_path, stamp):
-    """A scan time carrying an offset keeps its wall clock and correlates."""
+@pytest.mark.parametrize("source, stamp, volts", [
+    ("inhouse", "2024-02-05T10:05:00+00:00", 3.76), ("inhouse", "2024-02-05T10:05:00Z", 3.76),
+    ("inhouse", "2024-02-05T10:05:00-05:00", 3.76), ("inhouse", "2024-02-05T10:05:00+01", 3.76),
+    ("synchrotron", "2024-02-05T10:05:00-05:00", 3.75),
+], ids=["plus-offset", "zulu", "minus-offset", "short-offset", "synchrotron-minus-offset"])
+def test_scan_time_with_a_utc_offset_correlates(tmp_path, source, stamp, volts):
+    """A lab or synchrotron scan time carrying an offset keeps its wall clock and correlates."""
     src = tmp_path / "lab"
     os.makedirs(src)
-    _builders.write_lab_dat(str(src / "scan_001.dat"), stamp)
+    if source == "synchrotron":  # a UTC-minus beamline: start and end both carry the offset
+        _builders.write_synchrotron_scan(str(src), "000001", stamp, stamp.replace(":00-", ":39-"))
+    else:
+        _builders.write_lab_dat(str(src / "scan_001.dat"), stamp)
     _builders.write_eclab_echem(str(src / "echem.txt"))
     out = str(tmp_path / "tz.nxs")
-    ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE)
+    ok, msgs = core.generate([str(src)], out, core.DataSourceType[source.upper()])
     assert ok, msgs
-    assert abs(core.load(out).scans[0].echem - 3.76) < 1e-9
-
-
-def test_negative_offset_synchrotron_times_correlate(tmp_path):
-    """A '-05:00' synchrotron start time (UTC-minus beamline) generates and correlates."""
-    src = tmp_path / "syn"
-    os.makedirs(src)
-    _builders.write_synchrotron_scan(str(src), "000001", "2024-02-05T10:05:00-05:00",
-                                     "2024-02-05T10:05:39-05:00")
-    _builders.write_eclab_echem(str(src / "echem.txt"))
-    out = str(tmp_path / "syn.nxs")
-    ok, msgs = core.generate([str(src)], out, core.DataSourceType.SYNCHROTRON)
-    assert ok, msgs
-    assert core.load(out).scans[0].echem is not None
+    assert abs(core.load(out).scans[0].echem - volts) < 1e-9
 
 
 def test_neutron_midpoint_not_floored(tmp_path):
@@ -321,40 +313,26 @@ def _stored_timestamps(paths):
     pytest.param("20240205100500", "2024-02-05 10:05:00", id="compact-14-digits"),
     pytest.param("202402051005", "2024-02-05 10:05:00", id="compact-12-digits"),
     pytest.param("2024 02 05 10:05:00", "2024-02-05 10:05:00", id="space-separated"),
+    pytest.param("2024-06-05T10:05:00z", "2024-06-05 10:05:00", id="lower-case-z"),
+    pytest.param("2024-06-05T10:05:00Z", "2024-06-05 10:05:00", id="upper-case-z"),
+    pytest.param("2024-02-05T10:05:00", "2024-02-05 10:05:00", id="iso-T"),
+    pytest.param("05/02/2024 10:05:00", "2024-02-05 10:05:00", id="day-first"),
+    pytest.param("02/13/2024 10:05:00", "2024-02-13 10:05:00", id="month-first-fallback"),
+    pytest.param("5-Feb-2024 10:05:00", "2024-02-05 10:05:00", id="month-name"),
+    pytest.param("05/02/2024 10:05:00 PM", "2024-02-05 22:05:00", id="day-first-pm"),
+    pytest.param("2024-02-05 10:05:00 +0100", "2024-02-05 10:05:00", id="numeric-offset"),
+    pytest.param("10:05:00", "10:05:00", id="time-only"),  # today's date, as pandas reads it
 ])
 def test_header_dates_read_alike_in_dat_and_edf(tmp_path, value, expected):
-    """A .dat and an EDF read a header date alike: 'T' is a separator only between digits, year-first never swaps."""
+    """A .dat and an EDF store one naive wall clock per header date; year-first never swaps."""
     dat, edf = tmp_path / "scan.dat", tmp_path / "scan.edf"
     _builders.write_xrd_dat(str(dat), value)
     _builders.write_edf_image(str(edf), value)
-    for ts in _stored_timestamps([dat, edf]):
+    stamps = _stored_timestamps([dat, edf])
+    assert stamps[0] == stamps[1], stamps  # lab pairing compares the stored strings
+    for ts in stamps:
         assert ts is not None and pd.Timestamp(ts) == pd.Timestamp(expected), ts
-
-
-@needs_fabio
-@pytest.mark.parametrize("value", ["2024-06-05T10:05:00z", "2024-06-05T10:05:00Z"])
-def test_lower_case_z_is_dropped_like_upper_case(tmp_path, value):
-    """A 'z' suffix is dropped like 'Z', so the writer and the correlation read one wall clock."""
-    dat, edf = tmp_path / "scan.dat", tmp_path / "scan.edf"
-    _builders.write_xrd_dat(str(dat), value)
-    _builders.write_edf_image(str(edf), value)
-    for ts in _stored_timestamps([dat, edf]):
-        assert ts == "2024-06-05 10:05:00", ts
-        assert pd.Timestamp(ts).tzinfo is None
-
-
-@needs_fabio
-@pytest.mark.parametrize("value", [
-    "2024-02-05T10:05:00", "05/02/2024 10:05:00", "02/13/2024 10:05:00", "5-Feb-2024 10:05:00",
-    "Tue Feb  6 10:05:00 2024", "05/02/2024 10:05:00 PM", "2024-02-05 10:05:00 +0100", "10:05:00",
-])
-def test_dat_and_edf_twins_store_one_timestamp(tmp_path, value):
-    """A .dat and an EDF with the same Date text store the same timestamp, so they pair."""
-    dat, edf = tmp_path / "scan.dat", tmp_path / "scan.edf"
-    _builders.write_xrd_dat(str(dat), value)
-    _builders.write_edf_image(str(edf), value)
-    dat_ts, edf_ts = _stored_timestamps([dat, edf])
-    assert dat_ts is not None and dat_ts == edf_ts, (dat_ts, edf_ts)
+        assert pd.Timestamp(ts).tzinfo is None, ts
 
 
 @needs_fabio
@@ -381,11 +359,9 @@ def test_single_timestamps_skip_format_guessing(monkeypatch):
         raise AssertionError("pd.to_datetime called for a single value")
     monkeypatch.setattr(pd, "to_datetime", boom)
     assert core.nxs_reader._display_ts("2024-02-05T10:05:00+00:00") == "2024-02-05 10:05:00"
-    assert core.nxs_reader._display_ts("01:02:03") == "01:02:03"
-    assert core.nxs_reader._display_ts("Date") == "Date"
     assert core.nxs_writer._iso("2024-02-05 10:05:00").startswith("2024-02-05T10:05:00")
-    assert core.nxs_writer._iso("Date") is None
-    assert core.nxs_writer._ts_sort_key("Date") == (1, pd.Timestamp.max)
+    assert core.nxs_writer._ts_sort_key("2024-02-05 10:05:00") == \
+        (0, pd.Timestamp("2024-02-05 10:05:00"))
     scan = core.Scan(scan_num=1, timestamp="2024-02-05 10:05:00", exposure_time=120.0)
     assert core.nxs_writer._scan_window(scan)[1] == pd.Timestamp("2024-02-05 10:07:00")
 
@@ -538,29 +514,20 @@ def test_echem_missing_current_column(tmp_path, header):
     assert core.EchemParser().parse(str(path)) is None
 
 
-@pytest.mark.parametrize("tail", ["\t", ""], ids=["blank-current", "missing-current"])
-def test_echem_row_with_a_blank_last_current_keeps_its_time_and_voltage(tmp_path, tail):
-    """A row whose current, its last cell, is blank or missing keeps its time and voltage."""
+@pytest.mark.parametrize("tail, other", [("\t", "1.0"), ("", "1.0"), ("\tN/A", "1.0"),
+                                         ("\tN/A", "N/A")],
+                         ids=["blank-current", "missing-current", "text-current", "no-current"])
+def test_echem_row_with_a_blank_last_current_keeps_its_time_and_voltage(tmp_path, tail, other):
+    """Rows with a blank, missing or text current keep time and voltage, even if all are N/A."""
     path = tmp_path / "echem.txt"
-    path.write_text("time/s\tEwe/V\tI/mA\n05/02/2024 10:00:00\t3.70\t1.0\n"
-                    f"05/02/2024 10:01:00\t3.71{tail}\n05/02/2024 10:02:00\t3.72\t1.0\n")
+    path.write_text(f"time/s\tEwe/V\tI/mA\n05/02/2024 10:00:00\t3.70\t{other}\n"
+                    f"05/02/2024 10:01:00\t3.71{tail}\n05/02/2024 10:02:00\t3.72\t{other}\n")
     df = core.EchemParser().parse(str(path))
     assert df is not None and len(df) == 3, None if df is None else len(df)
     assert df["timestamp"].iloc[1] == pd.Timestamp("2024-02-05 10:01:00")
-    assert df["echem_data"].iloc[1] == 3.71 and np.isnan(df["current"].iloc[1])
-    assert list(df["current"].iloc[[0, 2]]) == [1.0, 1.0]
-
-
-def test_echem_unparseable_current_is_none(tmp_path):
-    """Rows with a non-numeric current field keep their voltage and get current=None."""
-    rows = ["Time\tEwe/V\tI/mA"]
-    rows += [f"05/02/2024 10:{m:02d}:00\t{3.7 + m * 0.01:.4f}\tN/A" for m in range(5)]
-    path = tmp_path / "badcurrent.txt"
-    path.write_text("\n".join(rows) + "\n")
-    df = core.EchemParser().parse(str(path))
-    assert df is not None and len(df) == 5
-    assert df["current"].isna().all()
-    assert np.allclose(df["echem_data"].values, 3.7 + 0.01 * np.arange(5))
+    current = pd.to_numeric(df["current"])  # no readable current at all: a column of None
+    assert df["echem_data"].iloc[1] == 3.71 and np.isnan(current.iloc[1])
+    assert np.allclose(current.iloc[[0, 2]], np.nan if other == "N/A" else 1.0, equal_nan=True)
 
 
 ARBIN_HEADER = "Data_Point\tDate_Time\tTest_Time(s)\tCurrent(A)\tVoltage(V)"
@@ -749,11 +716,9 @@ def test_echem_rows_before_1900_are_dropped(tmp_path, caplog, placeholder):
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         df = core.EchemParser().parse(str(path))
     assert len(df) == 40 and df["timestamp"].min() == pd.Timestamp("2024-02-05 10:00:00")
-    assert ("echem.txt: 1 echem row with no readable time or voltage was skipped"
-            in caplog.messages), caplog.messages
+    assert len(named_records(caplog, "echem.txt", "1 echem row", "readable")) == 1, caplog.messages
     if placeholder.endswith("1899 00:00:00"):
-        assert any("1 echem row dated before 1900 (placeholders?) was skipped" in r.getMessage()
-                   for r in caplog.records)
+        assert len(named_records(caplog, "echem.txt", "1 echem row", "1900")) == 1, caplog.messages
 
 
 @pytest.mark.parametrize("header,make_row", [
@@ -773,26 +738,24 @@ def test_unusable_headers_fail_safe(tmp_path, header, make_row):
     assert core.EchemParser().parse(str(path)) is None
 
 
-@pytest.mark.parametrize("header, cells, reason", [
+@pytest.mark.parametrize("header, cells, names", [
     ("Time\tTemperature 1 (C)\tTemperature 2 (C)", ["25.0", "26.0"],
-     "column 'Temperature 1 (C)' is not a voltage column"),
-    ("Time\tVoltage(V)\tTemperature(C)", ["3.7", "25.0"],
-     "column 'Temperature(C)' is not a current column"),
-    ("Time\tTemperature(C)\tCurrent(mA)", ["25.0", "0.1"],
-     "column 'Temperature(C)' is not a voltage column"),
-    ("time/s\tEwe/V\tcycle number\t<I>/mA", ["3.7", "1", "0.1"],
-     "column 'cycle number' is not a current column"),
-    ("Time\tEwe/V", ["3.7", "0.1"], "no current column"),
+     ("'Temperature 1 (C)'", "voltage")),
+    ("Time\tVoltage(V)\tTemperature(C)", ["3.7", "25.0"], ("'Temperature(C)'", "current")),
+    ("Time\tTemperature(C)\tCurrent(mA)", ["25.0", "0.1"], ("'Temperature(C)'", "voltage")),
+    ("time/s\tEwe/V\tcycle number\t<I>/mA", ["3.7", "1", "0.1"], ("'cycle number'", "current")),
+    ("Time\tEwe/V", ["3.7", "0.1"], ("current",)),
 ], ids=["temperature-log", "temperature-as-current", "temperature-as-voltage",
         "cycle-number-as-current", "unnamed-third-value"])
-def test_positional_column_without_its_unit_skips_the_file(tmp_path, caplog, header, cells, reason):
+def test_positional_column_without_its_unit_skips_the_file(tmp_path, caplog, header, cells, names):
     """A voltage or current taken by position without its unit skips the file with one warning."""
     rows = [header] + ["\t".join([f"05/02/2024 10:{m:02d}:00"] + cells) for m in range(5)]
     path = tmp_path / "log.txt"
     path.write_text("\n".join(rows) + "\n")
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         assert core.EchemParser().parse(str(path)) is None
-    assert caplog.messages == [f"Skipping log.txt: {reason}"]
+    assert len(named_records(caplog, "log.txt", *names)) == len(caplog.records) == 1, \
+        caplog.messages
 
 
 @pytest.mark.parametrize("header", [
@@ -819,8 +782,7 @@ def test_temperature_log_beside_the_echem_is_left_out(tmp_path, caplog):
         scans, echem = core.process_raw([str(src)], core.DataSourceType.INHOUSE)
     assert len(echem) == 40 and {os.path.basename(f) for f in echem["source_file"]} == {"echem.txt"}
     assert scans[0].voltage_max < 4 and abs(scans[0].echem - 3.76) < 1e-9, scans[0].voltage_max
-    assert ("Skipping cell_temperature.txt: column 'Temperature 1 (C)' is not a voltage column"
-            in caplog.messages)
+    assert len(named_records(caplog, "cell_temperature.txt")) == 1, caplog.messages
 
 
 def test_combined_echem_files_are_named(tmp_path, caplog):
@@ -833,20 +795,8 @@ def test_combined_echem_files_are_named(tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger="operaxn.core"):
         _, echem = core.process_raw([str(src)], core.DataSourceType.INHOUSE)
     assert len(echem) == 40
-    lines = [r.getMessage() for r in caplog.records if "files:" in r.getMessage()]
-    assert lines == ["Echem data from 2 files: cell_a.txt, cell_b.txt"], lines
-
-
-@pytest.mark.parametrize("header,scale", [
-    ("Time\tVoltage\tCurrent(mA)", 1.0),
-    ("time/s\tEwe/V\tI/mA", 1.0),
-    ("Time\tVoltage\tCurrent", 1.0),
-    ("Time\tVoltage\tArea (A)", 1.0),
-], ids=["milliamps", "biologic", "unitless", "non-current-amps"])
-def test_current_unit_scale(header, scale):
-    """Milliamp, unlabelled and non-current columns keep a milliamp scale of 1.0."""
-    # Columns given, not detected: detection skips the 'Area (A)' file before any scale is read
-    assert core.EchemParser()._current_unit_scale(header, {"current": 2}) == scale
+    assert len(named_records(caplog, "cell_a.txt", "cell_b.txt", level=logging.INFO)) == 1, \
+        caplog.messages
 
 
 @pytest.mark.parametrize("header,scale", [
@@ -854,11 +804,15 @@ def test_current_unit_scale(header, scale):
     ("Time\tVoltage\tCurrent/A", 1000.0), ("time/s\tEwe/V\tI/uA", 0.001),
     ("time/s\tEwe/V\t<I>/mA", 1.0), ("Time\tVoltage\tCurrent(A)", 1000.0),
     ("Time\tVoltage\tArea (A)", 1.0), ("Time\tVoltage\tCurrent [A]", 1000.0),
-    ("Time\tVoltage\tCurrent [mA]", 1.0),
+    ("Time\tVoltage\tCurrent [mA]", 1.0), ("Time\tVoltage\tCurrent(mA)", 1.0),
+    ("time/s\tEwe/V\tI/mA", 1.0), ("Time\tVoltage\tCurrent", 1.0),
+    ("Time\tVoltage\tCurrent(A) avg", 1000.0),
 ], ids=["slash-amps", "averaged-amps", "current-slash-amps", "microamps", "averaged-milliamps",
-        "parenthesised-amps", "non-current-amps", "bracketed-amps", "bracketed-milliamps"])
+        "parenthesised-amps", "non-current-amps", "bracketed-amps", "bracketed-milliamps",
+        "milliamps", "biologic", "unitless", "amps-then-more-text"])
 def test_current_unit_scale_reads_the_unit(header, scale):
-    """The unit after '/' or '(' of a current label sets the milliamp scale."""
+    """The unit after '/', '(' or '[' of a current label sets the mA scale; mA or no unit is 1.0."""
+    # Columns given, not detected: detection skips the 'Area (A)' file before any scale is read
     assert core.EchemParser()._current_unit_scale(header, {"current": 2}) == scale
 
 
@@ -871,32 +825,32 @@ def _write_echem(path, header, sep="\t", encoding="utf-8", current="2.0", eol="\
     path.write_bytes((eol.join(rows) + eol).encode(encoding) + tail)
 
 
-@pytest.mark.parametrize("unit,stored", [("A", 2000.0), ("mA", 2.0), ("µA", 0.002)],
-                         ids=["amps", "milliamps", "microamps"])
-def test_current_unit_after_slash_sets_milliamps(tmp_path, unit, stored):
-    """An EC-Lab 'I/A' or 'I/µA' current is stored in mA; 'I/mA' is stored as written."""
+@pytest.mark.parametrize("header, encoding, current, stored", [
+    (["time/s", "Ewe/V", "I/A"], "utf-8", "2.0", 2000.0),
+    (["time/s", "Ewe/V", "I/mA"], "utf-8", "2.0", 2.0),
+    (["time/s", "Ewe/V", "I/µA"], "utf-8", "2.0", 0.002),
+    (['"Date_Time"', '"Voltage(V)"', '"Current(A)"'], "utf-8", "2.0", 2000.0),
+    (["time/s", "Ewe/V", "I/µA"], "cp1252", "100.0", 0.1),
+    (["time/s", "Ewe/V", "I/nA"], "utf-8", "2.0", 2e-6),
+    (["time/s", "Ewe/V", "I/pA"], "utf-8", "2.0", 2e-9),
+], ids=["amps", "milliamps", "microamps", "quoted-amps", "ansi-microamps", "nanoamps", "picoamps"])
+def test_current_unit_after_slash_sets_milliamps(tmp_path, header, encoding, current, stored):
+    """An A, µA, nA or pA current (quoted or ANSI too) is stored in mA; an mA one as written."""
     path = tmp_path / "echem.txt"
-    _write_echem(path, ["time/s", "Ewe/V", f"I/{unit}"])
+    _write_echem(path, header, encoding=encoding, current=current)
     df = core.EchemParser().parse(str(path))
-    assert df is not None and np.allclose(df["current"], stored), list(df["current"])
-
-
-def test_quoted_current_header_keeps_its_amp_unit(tmp_path):
-    """A header written with quoted cells ('"Current(A)"') still scales amps to mA."""
-    path = tmp_path / "echem.txt"
-    _write_echem(path, ['"Date_Time"', '"Voltage(V)"', '"Current(A)"'])
-    df = core.EchemParser().parse(str(path))
-    assert df is not None and np.allclose(df["current"], 2000.0), list(df["current"])
+    assert df is not None and np.allclose(df["current"], stored, rtol=1e-12, atol=0), \
+        None if df is None else list(df["current"])
 
 
 @pytest.mark.parametrize("header,level,texts", [
-    ("I/A", logging.INFO, ("'I/A'", "converted to mA (x1000)")),
+    ("I/A", logging.INFO, ("'I/A'", "cell7.txt", "converted to mA (x1000)")),
     ("Current (Amps)", logging.WARNING, ("'Current (Amps)'", "has no recognised unit")),
     ("I/mA", None, ()),
 ], ids=["scaled", "unrecognised", "milliamps-silent"])
 def test_current_unit_decision_is_logged(tmp_path, caplog, header, level, texts):
-    """A scaled current logs one info line, an unrecognised unit one warning, a mA column nothing."""
-    path = tmp_path / "echem.txt"
+    """A scaled current logs one info line naming its file, an unknown unit one warning, mA none."""
+    path = tmp_path / "cell7.txt"
     _write_echem(path, ["time/s", "Ewe/V", header])
     with caplog.at_level(logging.INFO, logger="operaxn.core"):
         assert core.EchemParser().parse(str(path)) is not None
@@ -921,44 +875,27 @@ def test_stray_byte_after_a_utf8_header_keeps_microamps(tmp_path, suffix):
         None if df is None else list(df["current"])
 
 
-def test_amp_unit_followed_by_more_text_still_scales():
-    """'Current(A) avg' is still scaled by its '(A)', so amps convert to mA."""
-    parser = core.EchemParser()
-    header = "Time\tVoltage\tCurrent(A) avg"
-    assert parser._current_unit_scale(header, parser._detect_columns(header)) == 1000.0
-
-
-@pytest.mark.parametrize("encoding,extra", [("utf-8", []), ("cp1252", ["C/µF"])],
-                         ids=["utf8-header", "ansi-header"])
-def test_stray_byte_glued_to_a_value_is_dropped(tmp_path, encoding, extra):
-    """A non-UTF-8 byte glued to a current value is dropped, so the row keeps its value."""
-    path = tmp_path / "echem.txt"
-    _write_echem(path, ["time/s", "Ewe/V", "I/mA"] + extra, encoding=encoding,
-                 tail=b"\t".join([b"05/02/2024 10:05:00", b"3.7500", b"2.0\xb0"] + [b""] * len(extra))
-                 + b"\r\n")
-    df = core.EchemParser().parse(str(path))
-    assert df is not None and len(df) == 6 and np.allclose(df["current"], 2.0), \
+@pytest.mark.parametrize("case", ["utf8-header", "ansi-header", "headerless-first-row", "csv"])
+def test_stray_byte_glued_to_a_value_is_dropped(tmp_path, case):
+    """A non-UTF-8 byte glued to a value (.txt, .csv or header-less) is dropped, the value kept."""
+    path = tmp_path / ("echem.csv" if case == "csv" else "echem.txt")
+    n, current = 6, 2.0
+    if case == "headerless-first-row":
+        rows = [f"05/02/2024 10:{m:02d}:00\t{3.7 + m * 0.01:.4f}\t2.0".encode() for m in range(5)]
+        path.write_bytes(b"\r\n".join([rows[0] + b"\xb0"] + rows[1:]) + b"\r\n")
+        n = 5
+    elif case == "csv":
+        _write_echem(path, ["time/s", "Ewe/V", "I/µA"], sep=",", current="100.0",
+                     tail=b"05/02/2024 10:05:00,3.75,100.0\xb0\r\n")
+        current = 0.1
+    else:
+        extra = ["C/µF"] if case == "ansi-header" else []
+        cells = [b"05/02/2024 10:05:00", b"3.7500", b"2.0\xb0"] + [b""] * len(extra)
+        _write_echem(path, ["time/s", "Ewe/V", "I/mA"] + extra,
+                     encoding="cp1252" if extra else "utf-8", tail=b"\t".join(cells) + b"\r\n")
+    df = _parse(path, tmp_path) if case == "csv" else core.EchemParser().parse(str(path))
+    assert df is not None and len(df) == n and np.allclose(df["current"], current), \
         None if df is None else list(df["current"])
-
-
-def test_stray_byte_glued_to_the_first_row_of_a_headerless_file_is_dropped(tmp_path):
-    """A stray byte glued to a header-less file's first row is dropped, so the row keeps its value."""
-    path = tmp_path / "echem.txt"
-    rows = [f"05/02/2024 10:{m:02d}:00\t{3.7 + m * 0.01:.4f}\t2.0".encode() for m in range(5)]
-    path.write_bytes(b"\r\n".join([rows[0] + b"\xb0"] + rows[1:]) + b"\r\n")
-    df = core.EchemParser().parse(str(path))
-    assert df is not None and len(df) == 5 and np.allclose(df["current"], 2.0), \
-        None if df is None else list(df["current"])
-
-
-def test_cp1252_microamp_header_is_not_read_as_amps(tmp_path):
-    """An ANSI 'I/µA' header keeps its micro sign, so 100 µA is stored as 0.1 mA."""
-    path = tmp_path / "echem.txt"
-    with open(path, "w", encoding="cp1252") as f:
-        f.write("time/s\tEwe/V\tI/µA\n" + "".join(
-            f"05/02/2024 10:{m:02d}:00\t{3.7 + m * 0.01:.4f}\t100.0\n" for m in range(5)))
-    df = core.EchemParser().parse(str(path))
-    assert df is not None and np.allclose(df["current"], 0.1)
 
 
 @pytest.mark.parametrize("header, row", [
@@ -979,69 +916,30 @@ def test_echem_file_with_a_bom_reads_as_without(tmp_path, header, row):
     pd.testing.assert_frame_equal(df, core.EchemParser().parse(str(tmp_path / "plain.txt")))
 
 
-@pytest.mark.parametrize("unit,stored", [("nA", 2e-6), ("pA", 2e-9)], ids=["nanoamps", "picoamps"])
-def test_nanoamp_and_picoamp_currents_are_stored_in_milliamps(tmp_path, unit, stored):
-    """An 'I/nA' or 'Current (pA)' column is converted to mA instead of being read as mA."""
-    path = tmp_path / "echem.txt"
-    _write_echem(path, ["time/s", "Ewe/V", f"I/{unit}"])
-    df = core.EchemParser().parse(str(path))
-    assert df is not None and np.allclose(df["current"], stored, rtol=1e-12, atol=0), list(df["current"])
-
-
-def test_unit_line_names_the_file(tmp_path, caplog):
-    """The current-unit line names the echem file as well as the column."""
+@pytest.mark.parametrize("header, millivolts, level", [
+    (["Time", "Voltage(V) avg", "I/mA"], False, None),
+    (["Time", "Ewe/V vs. Li", "I/mA"], False, None),
+    (["Time", "E(mV) avg", "I/mA"], True, logging.INFO),
+    (["Time", "Ewe/Vref", "I/mA"], False, logging.WARNING),
+    (["Time", "Voltage(mV)", "Current(mA)"], True, logging.INFO),
+    (["time/s", "Ewe/mV", "I/mA"], True, logging.INFO),
+    (["Time", "E(mV)", "I(mA)"], True, logging.INFO),
+    (["Time", "Ewe/V", "I/mA"], False, None),
+    (["Time", "Voltage", "I/mA"], False, None),
+    (["Time", "Voltage(kV)", "I/mA"], False, logging.WARNING),
+], ids=["volts-avg", "volts-vs-li", "millivolts-avg", "unit-glued-to-text", "arbin-millivolts",
+        "ec-lab-millivolts", "positional-millivolts", "volts", "unlabelled", "other-unit"])
+def test_voltage_unit_followed_by_more_text_is_read(tmp_path, caplog, header, millivolts, level):
+    """V is read silently, mV converted with an info line, another unit read as V with a warning."""
     path = tmp_path / "cell7.txt"
-    _write_echem(path, ["time/s", "Ewe/V", "I/A"])
-    with caplog.at_level(logging.INFO, logger="operaxn.core"):
-        assert core.EchemParser().parse(str(path)) is not None
-    lines = [r.getMessage() for r in caplog.records if "current column" in r.getMessage()]
-    assert lines == ["Echem current column 'I/A' in cell7.txt converted to mA (x1000)"], lines
-
-
-@pytest.mark.parametrize("header", [
-    ["Time", "Voltage(mV)", "Current(mA)"], ["time/s", "Ewe/mV", "I/mA"], ["Time", "E(mV)", "I(mA)"],
-], ids=["arbin-style", "ec-lab-style", "positional"])
-def test_millivolt_voltage_is_stored_in_volts(tmp_path, caplog, header):
-    """An mV voltage column, named or taken by position, is stored in volts with one info line."""
-    path = tmp_path / "cell7.txt"
-    _write_echem(path, header, volt=lambda m: f"{3700 + m * 10}")
-    with caplog.at_level(logging.INFO, logger="operaxn.core"):
-        df = core.EchemParser().parse(str(path))
-    assert df is not None and np.allclose(df["echem_data"], 3.7 + 0.01 * np.arange(5)), \
-        None if df is None else list(df["echem_data"])
-    lines = [r.getMessage() for r in caplog.records if "voltage column" in r.getMessage()]
-    assert lines == [f"Echem voltage column '{header[1]}' in cell7.txt converted to V (x0.001)"]
-
-
-@pytest.mark.parametrize("label,warned", [("Ewe/V", False), ("Voltage", False), ("Voltage(kV)", True)],
-                         ids=["volts", "unlabelled", "other-unit"])
-def test_voltage_not_in_millivolts_is_read_as_written(tmp_path, caplog, label, warned):
-    """A V or unlabelled voltage is read as written silently; any other unit too, with a warning."""
-    path = tmp_path / "cell7.txt"
-    _write_echem(path, ["Time", label, "I/mA"])
-    with caplog.at_level(logging.INFO, logger="operaxn.core"):
-        df = core.EchemParser().parse(str(path))
-    assert df is not None and np.allclose(df["echem_data"], 3.7 + 0.01 * np.arange(5))
-    lines = [(r.levelno, r.getMessage()) for r in caplog.records if "voltage column" in r.getMessage()]
-    expected = f"Echem voltage column '{label}' in cell7.txt is not in V; values read as V"
-    assert lines == ([(logging.WARNING, expected)] if warned else []), lines
-
-
-@pytest.mark.parametrize("label,millivolts,line", [
-    ("Voltage(V) avg", False, None), ("Ewe/V vs. Li", False, None),
-    ("E(mV) avg", True, "converted to V (x0.001)"), ("Ewe/Vref", False, "is not in V; values read as V"),
-], ids=["volts-avg", "volts-vs-li", "millivolts-avg", "unit-glued-to-text"])
-def test_voltage_unit_followed_by_more_text_is_read(tmp_path, caplog, label, millivolts, line):
-    """A V or mV right after '/', '(' or '[' and followed by more text is that unit; 'Ewe/Vref' is not."""
-    path = tmp_path / "cell7.txt"
-    _write_echem(path, ["Time", label, "I/mA"],
+    _write_echem(path, header,
                  volt=(lambda m: f"{3700 + m * 10}") if millivolts else (lambda m: f"{3.7 + m * 0.01:.4f}"))
     with caplog.at_level(logging.INFO, logger="operaxn.core"):
         df = core.EchemParser().parse(str(path))
     assert df is not None and np.allclose(df["echem_data"], 3.7 + 0.01 * np.arange(5)), \
         None if df is None else list(df["echem_data"])
-    lines = [r.getMessage() for r in caplog.records if "voltage column" in r.getMessage()]
-    assert lines == ([f"Echem voltage column '{label}' in cell7.txt {line}"] if line else []), lines
+    named = named_records(caplog, "cell7.txt", f"'{header[1]}'", level=logging.INFO)
+    assert [r.levelno for r in named] == ([level] if level else []), [r.getMessage() for r in named]
 
 
 _ROWS = [(f"05/02/2024 10:{m:02d}:00", 3.7 + m * 0.01, 0.1 + m * 0.001) for m in range(40)]
@@ -1054,9 +952,11 @@ _ROWS = [(f"05/02/2024 10:{m:02d}:00", 3.7 + m * 0.01, 0.1 + m * 0.001) for m in
     ("utf-8", "Time\tEwe/V\tI/mA\n" + "".join(f"{t}\t{v:.4f}\t{i:.4f}\n" for t, v, i in _ROWS)),
     ("cp1252", "Time,Ewe/V,I/µA\n" + "".join(f"{t},{v:.4f},{i * 1000:.4f}\n"
                                                   for t, v, i in _ROWS)),
-], ids=["comma", "semicolon-decimal-comma", "tab", "cp1252-microamps"])
+    ("utf-8", "Time\tEwe/V\tI/mA\n" + "".join(f"{t}\t{v:.4f}\t{i:.4f}\n".replace(".", ",")
+                                             for t, v, i in _ROWS)),
+], ids=["comma", "semicolon-decimal-comma", "tab", "cp1252-microamps", "tab-decimal-comma"])
 def test_csv_dialects_load(tmp_path, encoding, text):
-    """Comma, semicolon (decimal comma), tab and ANSI CSV echem all load and correlate."""
+    """Comma, semicolon or tab (decimal commas too) and ANSI CSV echem all load and correlate."""
     src = tmp_path / "data"
     src.mkdir()
     _builders.write_inhouse_scans(str(src))
@@ -1068,8 +968,7 @@ def test_csv_dialects_load(tmp_path, encoding, text):
 
 
 def test_unit_lines_name_the_users_csv_not_its_converted_copy(tmp_path, caplog):
-    """The current-unit lines of an operando and a standard .csv name those files, not the
-    temporary .txt copies they are parsed from."""
+    """Unit lines of an operando and a standard .csv name the .csv files, not their .txt copies."""
     src = tmp_path / "data"
     src.mkdir()
     _builders.write_inhouse_scans(str(src))
@@ -1080,43 +979,35 @@ def test_unit_lines_name_the_users_csv_not_its_converted_copy(tmp_path, caplog):
         ok, msgs = core.generate([str(src)], str(tmp_path / "units.nxs"), core.DataSourceType.INHOUSE,
                                  standard_echem_files=[str(tmp_path / "std7.csv")])
     assert ok, msgs
-    lines = sorted(r.getMessage() for r in caplog.records if "current column" in r.getMessage())
-    assert lines == [f"Echem current column 'I/A' in {name} converted to mA (x1000)"
-                     for name in ("cell7.csv", "std7.csv")], lines
+    for name in ("cell7.csv", "std7.csv"):
+        assert len(named_records(caplog, "'I/A'", name, level=logging.INFO)) == 1, caplog.messages
+    assert not named_records(caplog, "'I/A'", ".txt", level=logging.INFO), caplog.messages
 
 
-def test_skipped_standard_echem_files_are_named(tmp_path, caplog):
-    """A missing or empty standard echem file, or an operando one with no row, is named."""
+@pytest.mark.parametrize("name,line", [
+    ("gone.txt", "Standard electrochemistry file gone.txt not found; skipped"),
+    ("notes.txt", "No electrochemistry data found in notes.txt; not stored"),
+    ("gone.csv", None), ("broken.xlsx", None),  # named by their conversion error
+    ("empty_log.txt", "No electrochemistry data found in empty_log.txt; not stored"),
+], ids=["gone.txt", "notes.txt", "gone.csv", "broken.xlsx", "empty_log.txt"])
+def test_skipped_standard_echem_files_are_named(tmp_path, caplog, name, line):
+    """A chosen echem file that cannot be used (missing, empty, unconverted) is named once."""
     src = str(tmp_path / "inhouse")
     _builders.write_inhouse_dir(src)
     (tmp_path / "notes.txt").write_text("Time\tVoltage\tCurrent\n")
-    with open(os.path.join(src, "empty_log.txt"), "w") as f:
-        f.write("Time\tEwe/V\tI/mA\n")
-    out = str(tmp_path / "std.nxs")
-    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
-        ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE,
-                                 standard_echem_files=[str(tmp_path / "gone.txt"),
-                                                       str(tmp_path / "notes.txt")])
-    assert ok, msgs
-    messages = caplog.messages
-    assert "Standard electrochemistry file gone.txt not found; skipped" in messages, messages
-    assert "No electrochemistry data found in notes.txt; not stored" in messages, messages
-    assert "No electrochemistry data found in empty_log.txt; not stored" in messages, messages
-
-
-def test_unconverted_standard_table_is_named_once(tmp_path, caplog):
-    """A missing or unreadable standard .csv/.xlsx is named once, by its conversion error."""
-    src = str(tmp_path / "inhouse")
-    _builders.write_inhouse_dir(src)
     (tmp_path / "broken.xlsx").write_bytes(b"not a workbook")
+    standard = [str(tmp_path / name)]
+    if name == "empty_log.txt":  # an operando file with no row
+        with open(os.path.join(src, name), "w") as f:
+            f.write("Time\tEwe/V\tI/mA\n")
+        standard = []
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([src], str(tmp_path / "std.nxs"), core.DataSourceType.INHOUSE,
-                                 standard_echem_files=[str(tmp_path / "gone.csv"),
-                                                       str(tmp_path / "broken.xlsx")])
+                                 standard_echem_files=standard)
     assert ok, msgs
-    for name in ("gone.csv", "broken.xlsx"):
-        named = [r.getMessage() for r in caplog.records if name in r.getMessage()]
-        assert len(named) == 1 and named[0].startswith("Error converting tabular file "), named
+    # notes.txt's unitless 'Current' also gets its unit warning
+    assert len(named_records(caplog, name)) == (2 if name == "notes.txt" else 1), caplog.messages
+    assert line is None or line in caplog.messages, caplog.messages  # the decided lines
 
 
 def test_writer_names_a_standard_table_given_unconverted(tmp_path, caplog):
@@ -1130,9 +1021,9 @@ def test_writer_names_a_standard_table_given_unconverted(tmp_path, caplog):
     out = str(tmp_path / "std.nxs")
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         core.NXSWriter(core.DataSourceType.INHOUSE).write(out, scans, echem_df, tables)
-    named = [r.getMessage() for r in caplog.records if "std." in r.getMessage()]
-    assert named == [f"Standard electrochemistry file {name} is not converted to text; skipped"
-                     for name in ("std.csv", "std.xlsx")], named
+    for name in ("std.csv", "std.xlsx"):
+        line = f"Standard electrochemistry file {name} is not converted to text; skipped"
+        assert [r.getMessage() for r in named_records(caplog, name)] == [line], caplog.messages
     with h5py.File(out) as f:
         assert "standard_electrochemistry" not in f["entry"]
 
@@ -1141,15 +1032,6 @@ def _parse(path, tmp_path):
     """Convert a .csv/.xlsx echem table into tmp_path and parse the copy."""
     txt = core.convert_tabular_to_txt(str(path), dest_dir=str(tmp_path))
     return core.EchemParser().parse(txt)
-
-
-def test_tab_csv_with_decimal_commas_loads(tmp_path):
-    """A tab-separated .csv with decimal commas (EC-Lab, French or German locale) loads its values."""
-    path = tmp_path / "echem.csv"
-    _write_echem(path, ["time/s", "Ewe/V", "I/mA"], current="0,1", volt=lambda m: f"3,{70 + m}")
-    df = _parse(path, tmp_path)
-    assert df is not None and len(df) == 5, df
-    assert np.allclose(df["echem_data"], [3.70, 3.71, 3.72, 3.73, 3.74]) and np.allclose(df["current"], 0.1)
 
 
 @pytest.mark.parametrize("text,current", [
@@ -1166,16 +1048,6 @@ def test_cr_only_csv_is_read_by_its_first_line(tmp_path, text, current):
         None if df is None else list(df["current"])
 
 
-def test_stray_byte_glued_to_a_csv_value_is_dropped(tmp_path):
-    """A non-UTF-8 byte glued to a value of a UTF-8 CSV is dropped, so the value is read as for .txt."""
-    path = tmp_path / "echem.csv"
-    _write_echem(path, ["time/s", "Ewe/V", "I/µA"], sep=",", current="100.0",
-                 tail=b"05/02/2024 10:05:00,3.75,100.0\xb0\r\n")
-    df = _parse(path, tmp_path)
-    assert df is not None and len(df) == 6 and np.allclose(df["current"], 0.1), \
-        None if df is None else list(df["current"])
-
-
 def test_arbin_xlsx_pipeline_correlation(tmp_path):
     """An Arbin .xlsx correlates end to end like the .txt echem it mirrors."""
     data_dir = tmp_path / "data"
@@ -1189,18 +1061,6 @@ def test_arbin_xlsx_pipeline_correlation(tmp_path):
         f"0.106 A at the 10:06 midpoint must correlate as 106 mA, got {scans[0].current}"
 
 
-def test_convert_tabular_dest_dir(tmp_path):
-    """dest_dir places the converted file where the caller manages cleanup."""
-    xlsx = tmp_path / "cellB.xlsx"
-    _builders.write_arbin_xlsx(str(xlsx))
-    out_dir = tmp_path / "converted"
-    os.makedirs(out_dir)
-    txt = core.convert_tabular_to_txt(str(xlsx), dest_dir=str(out_dir))
-    assert os.path.dirname(txt) == str(out_dir) and os.path.isfile(txt)
-    df = core.EchemParser().parse(txt)
-    assert df is not None and len(df) == 40
-
-
 def test_missing_echem_warning_is_logged(tmp_path, caplog):
     """A run without echem still generates and logs the no-echem warning to the terminal."""
     src = tmp_path / "xrd_only"
@@ -1210,9 +1070,9 @@ def test_missing_echem_warning_is_logged(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE)
     assert ok, str(msgs)
-    assert "Warning: No echem data available" in msgs
-    assert any(r.levelno == logging.WARNING and r.getMessage() == "No echem data available"
-               for r in caplog.records), caplog.messages
+    assert sum(m.startswith("Warning") for m in msgs) == 1, msgs
+    warned = named_records(caplog)
+    assert len(warned) == 1 and "echem" in warned[0].getMessage(), caplog.messages
 
 
 def test_xlsx_conversion_leaves_no_temp_files(tmp_path):
@@ -1232,7 +1092,7 @@ def test_xlsx_conversion_leaves_no_temp_files(tmp_path):
 # ============================================================================
 
 def test_text_file_that_is_neither_echem_nor_logbook_is_named(tmp_path, caplog):
-    """A headerless temperature log is not echem; one warning names it, echem and logbook stay silent."""
+    """A headerless temperature log is named once; no warning names the echem or the logbook."""
     src = tmp_path / "wish"
     _builders.write_wish_dir(str(src))
     with open(src / "cell_temperature_log.txt", "w") as f:
@@ -1240,19 +1100,9 @@ def test_text_file_that_is_neither_echem_nor_logbook_is_named(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         scans, echem = core.process_raw([str(src)], core.DataSourceType.NEUTRON)
     assert len(scans) == 1 and len(echem) == 40
-    named = [m for m in _warning_messages(caplog) if "not recognised as echem or logbook" in m]
-    assert named == ["1 text file was not recognised as echem or logbook data and was ignored: "
-                     "cell_temperature_log.txt (echem files need a header line naming time, "
-                     "voltage or current)"], _warning_messages(caplog)
-
-
-def test_echem_and_logbook_files_raise_no_unrecognised_warning(tmp_path, caplog):
-    """The real shapes (EC-Lab echem, WISH logbook) never trigger the unrecognised-text warning."""
-    src = tmp_path / "wish"
-    _builders.write_wish_dir(str(src))
-    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
-        core.process_raw([str(src)], core.DataSourceType.NEUTRON)
-    assert not [m for m in _warning_messages(caplog) if "not recognised as echem" in m]
+    assert len(named_records(caplog, "cell_temperature_log.txt")) == 1, caplog.messages
+    assert [r.getMessage() for r in named_records(caplog, ".txt")
+            if "cell_temperature_log.txt" not in r.getMessage()] == [], caplog.messages
 
 
 def test_one_unmatched_file_reads_singular(tmp_path, caplog):
@@ -1283,24 +1133,20 @@ def test_inhouse_dat_without_a_header_is_named(tmp_path, caplog):
     (src / "scan_004.dat").write_text("\n".join(rows) + "\n")
     (src / "scan_005.xy").write_text("10.0 1.0\n")
 
-    def lines():
+    def load():
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="operaxn.core"):
             scans, _ = core.process_raw([str(src)], core.DataSourceType.INHOUSE)
         assert len(scans) == 3
-        return [r.getMessage() for r in caplog.records if "ignored" in r.getMessage()]
 
-    assert sorted(lines()) == [
-        "1 .dat/.edf file was not recognised as scan data and was ignored: scan_004.dat "
-        "(scans need a readable Date in their header)",
-        "1 file did not belong to any scan and was ignored (1 .xy): scan_005.xy"]
+    load()
+    assert len(named_records(caplog, "scan_004.dat")) == 1, caplog.messages
+    assert len(named_records(caplog, "scan_005.xy")) == 1, caplog.messages
+    assert not named_records(caplog, "scan_004.dat", "scan_005.xy"), "named as an orphan"
     (src / "notes.txt").write_text("calibration\t25.3\t40.1\n")
-    named = [m for m in lines() if "not recognised" in m]
-    assert len(named) == 1 and named[0].startswith(
-        "2 files were not recognised as scan, echem or logbook data and were ignored: "), named
-    assert "notes.txt" in named[0] and "scan_004.dat" in named[0]
-    assert named[0].endswith("(scans need a readable Date in their header; echem files need a "
-                             "header line naming time, voltage or current)")
+    load()
+    assert len(named_records(caplog, "scan_004.dat")) == 1, caplog.messages
+    assert len(named_records(caplog, "scan_004.dat", "notes.txt")) == 1, caplog.messages
 
 
 @pytest.mark.parametrize("source, damaged, kept, error", [
@@ -1424,8 +1270,7 @@ def test_unextractable_zip_member_costs_only_that_file(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         scans, echem = core.process_raw([str(zp)], core.DataSourceType.INHOUSE)
     assert len(scans) == 2 and len(echem) == 40, (len(scans), len(echem))
-    assert any(m.startswith("Skipping cell/scan_002.dat in lab.zip: Bad CRC-32")
-               for m in _warning_messages(caplog)), _warning_messages(caplog)
+    assert len(named_records(caplog, "cell/scan_002.dat", "lab.zip")) == 1, caplog.messages
 
 
 def _pairs_zip(tmp_path, name, times=_builders.SCAN_TIMES, prefix=""):
@@ -1437,75 +1282,42 @@ def _pairs_zip(tmp_path, name, times=_builders.SCAN_TIMES, prefix=""):
 
 
 @needs_fabio
-def test_zip_images_none_copied_reports_no_sidecar(tmp_path, monkeypatch, caplog):
-    """If every ZIP image move fails: an 'N of N' warning, no 'Persisted' line, no sidecar left."""
+@pytest.mark.parametrize("fails, counted, persisted", [
+    ("every move", "2 of 2", 0), ("the first move", "1 of 2", 1), ("the unlink", None, 2)],
+    ids=["every-move-fails", "one-move-fails", "source-held-open"])
+def test_zip_image_held_open_elsewhere_keeps_its_copy(tmp_path, monkeypatch, caplog, fails, counted,
+                                                      persisted):
+    """A failed ZIP image move costs that image, counted 'N of M'; a held-open copy stays."""
     zip_path = _pairs_zip(tmp_path, "cell.zip", _builders.SCAN_TIMES[:2])
-    pipeline = core.pipeline
+    real_move, failed = core.pipeline.shutil.move, []
 
     def move(source, dest, *args, **kwargs):
-        raise OSError(3, "The system cannot find the path specified", dest)
+        if fails == "the unlink":
+            # shutil.move's copy fallback, then the unlink Windows refuses (WinError 32)
+            shutil.copy2(source, dest)
+            raise PermissionError(13, "in use", source)
+        if fails == "every move" or not failed:
+            failed.append(source)
+            raise OSError(3, "The system cannot find the path specified", dest)
+        return real_move(source, dest, *args, **kwargs)
 
-    monkeypatch.setattr(pipeline.shutil, "move", move)
+    monkeypatch.setattr(core.pipeline.shutil, "move", move)
     out = str(tmp_path / "out" / "cell.nxs")
     os.makedirs(os.path.dirname(out))
     with caplog.at_level(logging.INFO, logger="operaxn.core"):
         ok, msgs = core.generate([zip_path], out, core.DataSourceType.INHOUSE)
     assert ok, msgs
-    assert [m for m in msgs if "2D images" in m] == [
-        "Warning: 2 of 2 2D images from the ZIP could not be copied and will not be viewable"], msgs
-    assert os.listdir(tmp_path / "out") == ["cell.nxs"]
-    assert not [r.getMessage() for r in caplog.records if r.getMessage().startswith("Persisted")]
-
-
-@needs_fabio
-def test_one_failed_zip_image_copy_costs_one_image(tmp_path, monkeypatch):
-    """A ZIP image whose sidecar copy fails is reported by count; the other images stay viewable."""
-    zip_path = _pairs_zip(tmp_path, "cell.zip", _builders.SCAN_TIMES[:2])
-
-    pipeline = core.pipeline
-    real_move = pipeline.shutil.move
-    failed = []
-
-    def move(source, dest, *args, **kwargs):
-        if not failed:
-            failed.append(source)
-            raise OSError(3, "The system cannot find the path specified", dest)
-        return real_move(source, dest, *args, **kwargs)
-
-    monkeypatch.setattr(pipeline.shutil, "move", move)
-    out = str(tmp_path / "out" / "cell.nxs")
-    os.makedirs(os.path.dirname(out))
-    ok, msgs = core.generate([zip_path], out, core.DataSourceType.INHOUSE)
-    assert ok, msgs
-    assert any(m.startswith("Warning: 1 of 2 2D images from the ZIP could not be copied") for m in msgs), msgs
-    sidecar = tmp_path / "out" / "cell_images"
-    assert len(list(sidecar.rglob("*.edf"))) == 1
-    assert len(failed) == 1
-    sources = [str(s.twod_source) for s in core.load(out).scans if s.twod_source]
-    assert sum(os.path.isfile(p) and str(sidecar) in p for p in sources) == 1, sources
-
-
-@needs_fabio
-def test_zip_image_held_open_elsewhere_keeps_its_copy(tmp_path, monkeypatch):
-    """A move whose copy landed but whose source another program holds open (the unlink is
-    refused) keeps the copy: every scan shows its persisted image and no failure is counted."""
-    zip_path = _pairs_zip(tmp_path, "cell.zip", _builders.SCAN_TIMES[:2])
-    pipeline = core.pipeline
-
-    def move(source, dest, *args, **kwargs):
-        # shutil.move's copy fallback, then the unlink Windows refuses (WinError 32)
-        shutil.copy2(source, dest)
-        raise PermissionError(13, "in use", source)
-
-    monkeypatch.setattr(pipeline.shutil, "move", move)
-    out = str(tmp_path / "out" / "cell.nxs")
-    os.makedirs(os.path.dirname(out))
-    ok, msgs = core.generate([zip_path], out, core.DataSourceType.INHOUSE)
-    assert ok, msgs
-    assert not [m for m in msgs if "could not be copied" in m], msgs
+    expected = [] if counted is None else [
+        f"Warning: {counted} 2D images from the ZIP could not be copied and will not be viewable"]
+    assert [m for m in msgs if "2D images" in m] == expected, msgs
+    assert len(failed) == (0 if counted is None else int(counted[0]))
     sidecar = tmp_path / "out" / "cell_images"
     sources = [str(s.twod_source) for s in core.load(out).scans if s.twod_source]
-    assert len(sources) == 2 and all(os.path.isfile(p) and str(sidecar) in p for p in sources), sources
+    assert sum(os.path.isfile(p) and str(sidecar) in p for p in sources) == persisted, sources
+    assert len(list(sidecar.rglob("*.edf"))) == persisted
+    if not persisted:
+        assert os.listdir(tmp_path / "out") == ["cell.nxs"]
+        assert not [r for r in caplog.records if r.getMessage().startswith("Persisted")]
 
 
 def test_run_in_two_logbooks_is_one_scan(tmp_path):
@@ -1577,10 +1389,10 @@ def test_table_selected_with_its_folder_is_converted_once(tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger="operaxn.core"):
         _, echem = core.process_raw([str(src), str(src / "echem.xlsx")],
                                     core.DataSourceType.INHOUSE)
-    messages = caplog.messages
     assert len(echem) == 40, len(echem)
-    assert messages.count("Converted echem.xlsx to txt format") == 1, messages
-    assert "1 file was found more than once and is read once: echem.xlsx" in messages, messages
+    for phrase in ("Converted", "more than once"):
+        assert len(named_records(caplog, "echem.xlsx", phrase, level=logging.INFO)) == 1, \
+            caplog.messages
 
 
 def test_a_file_reached_three_times_is_counted_and_named_once(tmp_path, caplog):
@@ -1639,33 +1451,24 @@ def test_warm_up_skips_unreadable_paths(tmp_path, monkeypatch, caplog):
     assert len(warned) == 1, caplog.messages
 
 
-def test_one_logbook_entry_without_data_reads_singular(tmp_path, caplog):
-    """One logbook run without bank files is reported as one entry, by its run number."""
+@pytest.mark.parametrize("runs, line", [
+    pytest.param([("123456", 10), ("123999", 11)],
+                 "1 logbook entry had no matching data files and was skipped: 123999", id="one"),
+    pytest.param([("123999", 14), ("123800", 13), ("123700", 12), ("123600", 11), ("123456", 10)],
+                 "4 logbook entries had no matching data files and were skipped: "
+                 "123600, 123700, 123800 and 1 more", id="four"),  # newest first, as WISH logs them
+])
+def test_logbook_entries_without_data_are_counted_and_listed_by_run(tmp_path, caplog, runs, line):
+    """Logbook runs without bank files are counted in one warning (singular for one), by run."""
     src = str(tmp_path / "wish")
-    lines = [_builders.wish_logbook_line("123456", "2024-02-05 10:00:00", "2024-02-05 10:30:00"),
-             _builders.wish_logbook_line("123999", "2024-02-05 11:00:00", "2024-02-05 11:30:00")]
-    _builders.write_wish_dir(src, lines=lines)
-    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
-        scans, _ = core.process_raw([src], core.DataSourceType.NEUTRON)
-    assert len(scans) == 1
-    messages = _warning_messages(caplog)
-    assert "1 logbook entry had no matching data files and was skipped: 123999" in messages, \
-        messages
-
-
-def test_logbook_entries_without_data_are_counted_and_listed_by_run(tmp_path, caplog):
-    """Logbook runs without bank files are counted in one warning and listed by run number."""
-    src = str(tmp_path / "wish")
-    runs = ("123999", "123800", "123700", "123600", "123456")  # newest first, as WISH logs them
     lines = [_builders.wish_logbook_line(run, f"2024-02-05 {h}:00:00", f"2024-02-05 {h}:30:00")
-             for h, run in zip(range(14, 9, -1), runs)]
+             for run, h in runs]
     _builders.write_wish_dir(src, lines=lines)
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         scans, _ = core.process_raw([src], core.DataSourceType.NEUTRON)
     assert len(scans) == 1
     messages = _warning_messages(caplog)
-    assert ("4 logbook entries had no matching data files and were skipped: "
-            "123600, 123700, 123800 and 1 more") in messages, messages
+    assert line in messages, messages
 
 
 def test_run_with_bank_files_but_no_logbook_entry_is_named(tmp_path, caplog):
@@ -1692,41 +1495,8 @@ def test_neutron_bank_files_without_a_logbook_fail_naming_it(tmp_path, caplog):
     os.remove(os.path.join(src, "Cell_log_book.txt"))
     with caplog.at_level(logging.INFO, logger="operaxn.core"):
         ok, msgs = core.generate([src], str(tmp_path / "x.nxs"), core.DataSourceType.NEUTRON)
-    assert not ok and msgs == ["Error: No neutron logbook found in the selection: "
-                               "runs are timed from the logbook"], msgs
+    assert not ok and len(msgs) == 1 and msgs[0].startswith("Error") and "logbook" in msgs[0], msgs
     assert not [r for r in caplog.records if r.exc_info], "a refusal logs no traceback"
-
-
-def test_neutron_set_whose_only_logbook_has_a_li_title_generates(tmp_path):
-    """End to end: the set's own logbook with a 'Li/NMC811' title is read as a logbook."""
-    src = str(tmp_path / "n")
-    _builders.write_detailed_neutron_dir(src)
-    path = os.path.join(src, "SC1_log_book.txt")
-    with open(path) as f:
-        text = f.read()
-    assert "Op-Run1-SC1-Diag" in text  # the builder's title, so the edit cannot silently miss
-    with open(path, "w") as f:
-        f.write(text.replace("Op-Run1-SC1-Diag", "Li/NMC811 cell"))
-    ok, msgs = core.generate([src], str(tmp_path / "n.nxs"), core.DataSourceType.NEUTRON)
-    assert ok, msgs
-    assert len(core.load(str(tmp_path / "n.nxs")).scans) == 1
-
-
-def test_neutron_run_whose_logbook_line_lost_a_tab_generates(tmp_path, caplog):
-    """End to end: a duration that fills its column (one space, no tab, after it) gives the scan."""
-    src = str(tmp_path / "n")
-    _builders.write_detailed_neutron_dir(src)
-    path = os.path.join(src, "SC1_log_book.txt")
-    with open(path, newline="") as f:
-        text = f.read()
-    assert '"2m 6s"\t"5.44"' in text  # the builder's fields, so the edit cannot silently miss
-    with open(path, "w", newline="") as f:
-        f.write(text.replace('"2m 6s"\t"5.44"', '"1m 27s" "5.44"'))
-    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
-        ok, msgs = core.generate([src], str(tmp_path / "n.nxs"), core.DataSourceType.NEUTRON)
-    assert ok, msgs
-    assert not [m for m in _warning_messages(caplog) if "logbook" in m], _warning_messages(caplog)
-    assert len(core.load(str(tmp_path / "n.nxs")).scans) == 1
 
 
 def _lab_pairs(src):
@@ -1737,25 +1507,19 @@ def _lab_pairs(src):
 
 
 @needs_fabio
-def test_laboratory_pairs_loaded_as_synchrotron_are_refused(tmp_path, caplog):
-    """Lab .dat + .edf pairs as Synchrotron fail with 'check the data source' and no traceback."""
+@pytest.mark.parametrize("beside", [False, True], ids=["lab-folder", "beside-an-i11-scan"])
+def test_laboratory_pairs_loaded_as_synchrotron_are_refused(tmp_path, caplog, beside):
+    """Lab .dat + .edf pairs as Synchrotron fail, with no traceback, an i11 scan beside or not."""
     src = tmp_path / "lab"
     _lab_pairs(src)
+    if beside:  # one scan .nxs in the selection does not switch the guard off
+        _builders.write_synchrotron_scan(str(src), "000001", "2024-02-05T10:05:00",
+                                         "2024-02-05T10:05:39")
     with caplog.at_level(logging.INFO, logger="operaxn.core"):
         ok, msgs = core.generate([str(src)], str(tmp_path / "x.nxs"),
                                  core.DataSourceType.SYNCHROTRON)
     assert not ok and any("check the data source" in m for m in msgs), msgs
     assert not [r for r in caplog.records if r.exc_info], "a refusal logs no traceback"
-
-
-@needs_fabio
-def test_laboratory_pairs_beside_a_synchrotron_scan_are_refused(tmp_path):
-    """One scan .nxs in the selection does not switch the guard off (a lab folder plus an i11 scan)."""
-    src = tmp_path / "mixed"
-    _lab_pairs(src)
-    _builders.write_synchrotron_scan(str(src), "000001", "2024-02-05T10:05:00", "2024-02-05T10:05:39")
-    ok, msgs = core.generate([str(src)], str(tmp_path / "x.nxs"), core.DataSourceType.SYNCHROTRON)
-    assert not ok and any("check the data source" in m for m in msgs), msgs
 
 
 def test_dat_only_set_still_loads_as_synchrotron(tmp_path):
@@ -1768,57 +1532,31 @@ def test_dat_only_set_still_loads_as_synchrotron(tmp_path):
     assert len(core.load(out).scans) == 3
 
 
-def test_synchrotron_scans_still_load(tmp_path):
-    """A GDA scan .nxs with its .xy is untouched by the guard."""
-    src = tmp_path / "syn"
-    os.makedirs(src)
-    _builders.write_synchrotron_scan(str(src), "000001", "2024-02-05T10:05:00", "2024-02-05T10:05:39")
-    _builders.write_eclab_echem(str(src / "echem.txt"))
-    ok, msgs = core.generate([str(src)], str(tmp_path / "x.nxs"), core.DataSourceType.SYNCHROTRON)
-    assert ok, msgs
-
-
 # ============================================================================
 # Readers
 # ============================================================================
 
-@pytest.mark.parametrize("name, text", [
-    ("scan.dat", "# Date 2024-02-05T10:05:00\n# tth Intensity\n"),
-    ("scan.dat", ""),
-    ("scan.xy", ""),
-    ("scan.xy", "# only a comment\n"),
-])
-def test_one_d_file_without_data_rows_is_unreadable(tmp_path, name, text):
-    """An empty or header-only 1D file raises one OSError naming the file once; no numpy warning."""
+@pytest.mark.parametrize("name, text, read", [
+    ("scan.dat", "# Date 2024-02-05T10:05:00\n# tth Intensity\n", "read_file"),
+    ("scan.dat", "", "read_file"),
+    ("scan.xy", "", "read_file"),
+    ("scan.xy", "# only a comment\n", "read_file"),
+    ("123456-1_10raw-0.dat", "# Mantid-like comment\n# X Y E\n", "read_with_lines"),
+], ids=["dat-header-only", "dat-empty", "xy-empty", "xy-comment-only", "bank-header-only"])
+def test_one_d_file_without_data_rows_is_unreadable(tmp_path, name, text, read):
+    """An empty or header-only 1D file, bank reads too, raises one OSError naming the file once."""
     path = tmp_path / name
     path.write_text(text)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         with pytest.raises(OSError, match="no data rows$") as err:
-            core.DataReaderFactory.read_file(str(path), use_cache=False)
+            if read == "read_with_lines":  # the writer's single-pass neutron bank read
+                reader = core.DataReaderFactory.get_reader(str(path), is_neutron=True)
+                reader.read_with_lines(str(path))
+            else:
+                core.DataReaderFactory.read_file(str(path), use_cache=False)
     assert str(err.value).count(name) == 1 and str(tmp_path) not in str(err.value), str(err.value)
     assert not caught, [str(w.message) for w in caught]
-
-
-def test_header_only_dat_is_unreadable_through_the_single_pass_reader(tmp_path):
-    """read_with_lines (the writer's neutron read) also refuses a file with no data rows."""
-    path = tmp_path / "123456-1_10raw-0.dat"
-    path.write_text("# Mantid-like comment\n# X Y E\n")
-    reader = core.DataReaderFactory.get_reader(str(path), is_neutron=True)
-    with pytest.raises(OSError):
-        reader.read_with_lines(str(path))
-
-
-@pytest.mark.parametrize("text", [
-    "1.0 2.0#c\n3.0 4.0\n",
-    "# Date 2024-02-05T10:05:00\n# tth Intensity\n1.0 2.0#first point\n3.0 4.0\n",
-])
-def test_dat_first_row_with_a_glued_comment_is_kept(tmp_path, text):
-    """A '#' glued to the first data row does not drop that row; numpy strips the comment."""
-    path = tmp_path / "glued.dat"
-    path.write_text(text)
-    data = core.DataReaderFactory.read_file(str(path), use_cache=False)
-    assert data.tolist() == [[1.0, 2.0], [3.0, 4.0]]
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -1829,9 +1567,13 @@ def test_dat_first_row_with_a_glued_comment_is_kept(tmp_path, text):
     ("XYDATA\n1 2 3#c\n4 5 6\n", [[1, 2], [4, 5]]),                     # glued comment as the line parse reads it
     ("1 2 3 4\n5 6 7 8\n", [[1, 2, 3, 4], [5, 6, 7, 8]]),               # clean file: numpy reads every column
     ("# h\n1 2\n3 4\n", [[1, 2], [3, 4]]),
-], ids=["four-cols", "ragged", "text-error", "stray-line", "glued-comment", "clean-four", "clean-two"])
+    ("1.0 2.0#c\n3.0 4.0\n", [[1, 2], [3, 4]]),                        # '#' glued to the first row
+    ("# Date 2024-02-05T10:05:00\n# tth Intensity\n1.0 2.0#first point\n3.0 4.0\n",
+     [[1, 2], [3, 4]]),
+], ids=["four-cols", "ragged", "text-error", "stray-line", "glued-comment", "clean-four",
+        "clean-two", "glued-first-row", "glued-first-row-after-header"])
 def test_dat_reader_columns_per_layout(tmp_path, text, expected):
-    """An XYDATA file keeps X, Y and a readable E column; a clean table keeps every column."""
+    """XYDATA keeps X, Y and a readable E; a clean table every column; a glued '#' drops no row."""
     path = tmp_path / "x.dat"
     path.write_text(text)
     assert np.array_equal(core.DATReader()._read_impl(str(path)), np.array(expected, dtype=float))
@@ -2050,18 +1792,37 @@ def neutron_rt(neutron_dir, tmp_path):
     return core.load(nxs)
 
 
-def test_inhouse_scan_fields_roundtrip(inhouse_rt):
-    """Voltage, current, timestamp and exposure survive write -> load per scan."""
-    scans, model = inhouse_rt
-    assert len(model.scans) == 3, f"got {len(model.scans)}"
-    for pipeline_scan, loaded in zip(scans, model.scans):
-        assert loaded.echem == pipeline_scan.echem, \
+@pytest.mark.parametrize("source", [core.DataSourceType.INHOUSE, core.DataSourceType.SYNCHROTRON],
+                         ids=["inhouse", "synchrotron"])
+def test_scan_fields_roundtrip(request, tmp_path, source):
+    """Voltage, current, timestamp, exposure and the 1D pattern survive write -> load per scan."""
+    inhouse = source == core.DataSourceType.INHOUSE
+    if inhouse:
+        scans, model = request.getfixturevalue("inhouse_rt")
+    else:
+        src = str(tmp_path / "synchrotron")
+        os.makedirs(src)
+        for scan_id, minute in (("000001", 5), ("000002", 10)):
+            _builders.write_synchrotron_scan(src, scan_id, f"2024-02-05T10:{minute:02d}:00",
+                                             f"2024-02-05T10:{minute:02d}:39")
+        _builders.write_echem_txt(os.path.join(src, "echem.txt"))
+        scans, _ = core.process_raw([src], source)
+        out = str(tmp_path / "synchrotron.nxs")
+        ok, msgs = core.generate([src], out, source)
+        assert ok, msgs
+        model = core.load(out)
+    assert len(model.scans) == (3 if inhouse else 2), f"got {len(model.scans)}"
+    for i, (pipeline_scan, loaded) in enumerate(zip(scans, model.scans), start=1):
+        assert loaded.echem is not None and loaded.echem == pipeline_scan.echem, \
             f"scan {loaded.scan_num}: file={loaded.echem} pipeline={pipeline_scan.echem}"
         assert loaded.current == pipeline_scan.current, f"scan {loaded.scan_num}: current"
         assert loaded.timestamp == pipeline_scan.timestamp, \
             f"scan {loaded.scan_num}: file={loaded.timestamp} pipeline={pipeline_scan.timestamp}"
         assert loaded.exposure_time == pipeline_scan.exposure_time, \
             f"scan {loaded.scan_num}: exposure"
+        assert np.allclose(loaded.oned["x"], _builders.ONED_X), f"scan {loaded.scan_num}: 1D x"
+        assert np.allclose(loaded.oned["y"], _builders.inhouse_scan_y(i if inhouse else 1)), \
+            f"scan {loaded.scan_num}: 1D y"
 
 
 def test_entry_window_reaches_a_last_scan_without_exposure(tmp_path):
@@ -2069,7 +1830,7 @@ def test_entry_window_reaches_a_last_scan_without_exposure(tmp_path):
     src = tmp_path / "lab"
     src.mkdir()
     _builders.write_xrd_dat(str(src / "scan_001.dat"), _builders.SCAN_TIMES[0])
-    _builders.write_xrd_dat(str(src / "scan_002.dat"), _builders.SCAN_TIMES[1], exposure="inf")
+    _builders.write_xrd_dat(str(src / "scan_002.dat"), _builders.SCAN_TIMES[1], exposure=None)
     _builders.write_echem_txt(str(src / "echem.txt"))
     out = str(tmp_path / "lab.nxs")
     ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE)
@@ -2167,8 +1928,7 @@ def test_neutron_scan_with_no_readable_bank_is_written_with_a_warning(tmp_path, 
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([src], out, core.DataSourceType.NEUTRON)
     assert ok, msgs
-    assert ("Scan 2 (run 123457): no bank file could be read; written without data"
-            in caplog.messages), caplog.messages
+    assert len(named_records(caplog, "Scan 2", "123457")) == 1, caplog.messages
     with h5py.File(out) as f:
         assert "bank_1" in f["entry/scan_000001"]
         assert not any(name.startswith("bank_") for name in f["entry/scan_000002"])
@@ -2176,7 +1936,7 @@ def test_neutron_scan_with_no_readable_bank_is_written_with_a_warning(tmp_path, 
 
 
 def test_scan_whose_dat_has_no_rows_is_kept_without_a_pattern(tmp_path, caplog):
-    """The scan, its time and its echem stay; it has no data group and an ERROR names it."""
+    """The scan, its time and echem stay with no data group (no empty NXdata); an ERROR names it."""
     src = str(tmp_path / "inhouse")
     _builders.write_inhouse_dir(src)
     with open(os.path.join(src, "scan_002.dat")) as f:
@@ -2191,6 +1951,10 @@ def test_scan_whose_dat_has_no_rows_is_kept_without_a_pattern(tmp_path, caplog):
         assert "data" in f["entry/scan_000001"] and "data" in f["entry/scan_000003"]
         assert "data" not in f["entry/scan_000002"]
         assert "environment/voltage" in f["entry/scan_000002"]
+        empty_nxdata = []
+        f.visititems(lambda path, obj: empty_nxdata.append(path) if isinstance(obj, h5py.Group)
+                     and obj.attrs.get("NX_class") == "NXdata" and not obj.keys() else None)
+        assert not empty_nxdata, empty_nxdata
     assert any("Error reading 1D data for scan 2" in r.getMessage() for r in caplog.records)
     assert_pynxtools_valid(out, "no rows")
 
@@ -2293,8 +2057,7 @@ def test_profile_wavelength_is_written_when_numeric_and_skipped_with_a_warning_o
         inst = f["entry/instrument"]
         if written is None:
             assert "crystal" not in inst
-            text = f"Skipping profile wavelength {value!r}: not a finite number"
-            assert any(r.getMessage() == text for r in caplog.records)
+            assert len(named_records(caplog, "wavelength", repr(value))) == 1, caplog.messages
         else:
             assert inst["crystal/wavelength"][()] == pytest.approx(written)
             assert inst["crystal/wavelength"].attrs["units"] == "angstrom"

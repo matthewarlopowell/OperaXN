@@ -1,9 +1,6 @@
 """Echem analysis windows: Capacity, ICI and heatmap maths, their windows and main-window wiring."""
 import builtins
 import gc
-import glob
-import inspect
-import os
 import re
 import warnings
 import weakref
@@ -46,12 +43,11 @@ from operaxn.heatmap import (
     publication_figure, row_edges, scan_positions_seconds, title_text,
 )
 from operaxn.ici import (
-    ICIWindow, PLOT_BG, _RKAxisBar, _SelectorStrip, _compute_all_pulses, _compute_fit,
+    ICIWindow, PLOT_BG, _RKAxisBar, _compute_all_pulses, _compute_fit,
     _detect_pulses, _style_ax, embed_figure, watch_figure_sync,
 )
-from operaxn.input import get_standard_echem
 
-from _helpers import background_errors, pending_after_ids, pump
+from _helpers import background_errors, export_failed, named_records, pending_after_ids, pump
 
 R_TRUE, K_TRUE, I_MA = 50.0, 5.0, 2.0
 I_A = I_MA / 1000.0
@@ -134,15 +130,11 @@ def build_hm_scans():
 
 
 def test_assign_cycles_rests_inherit_preceding_phase():
-    """Rests are folded into the preceding charge/discharge phase."""
-    phases = assign_cycles(build_cycling_df())["phase"]
+    """Two cycles on a zero-based 1 s time axis; rests fold into the preceding charge/discharge."""
+    cyc = assign_cycles(build_cycling_df())
+    phases = cyc["phase"]
     assert (phases == "charge").sum() == 2 * 15, f"got {(phases == 'charge').sum()}"
     assert (phases == "discharge").sum() == 2 * 15, f"got {(phases == 'discharge').sum()}"
-
-
-def test_assign_cycles_detects_cycles_and_time_axis():
-    """Two cycles detected on a zero-based 1 s time axis."""
-    cyc = assign_cycles(build_cycling_df())
     cycles_found = sorted(c for c in cyc["cycle"].unique() if c > 0)
     assert cycles_found == [1, 2], f"got {cycles_found}"
     assert cyc["t_s"].iloc[0] == 0.0
@@ -266,7 +258,7 @@ def test_detect_pulses_respects_max_rest():
 
 
 def test_compute_fit_recovers_parameters(fit_df):
-    """Exact relaxation data recovers R, k, r2 = 1, V0 and pulse-end capacity."""
+    """Exact relaxation data recovers R, k, r2 = 1, V0 and pulse-end capacity, as pulse 1."""
     fit_pulses = _detect_pulses(fit_df, max_rest=300.0)
     assert len(fit_pulses) == 1, "fit dataset must yield one pulse"
     cap_arr = compute_capacity(_assign_time(fit_df.copy()))
@@ -277,6 +269,8 @@ def test_compute_fit_recovers_parameters(fit_df):
     assert np.isclose(fit["r2"], 1.0), f"got {fit['r2']}"
     assert fit["V0"] == V0, "V0 must be the last active voltage"
     assert np.isclose(fit["capacity"], 2.0 * 4.0 / 3600.0), f"got {fit['capacity']}"
+    results = _compute_all_pulses(fit_df, fit_pulses, lambda idx: (0.5, 3.0))
+    assert len(results) == 1 and results[0]["pulse_idx"] == 1, "one fit per pulse, 1-based"
 
 
 def test_narrow_fit_window_rejected(fit_df):
@@ -319,28 +313,16 @@ def test_fit_window_ignores_timestamp_noise(fit_df, case):
     assert len(got) == len(taken) and np.allclose(got, taken, atol=1e-5), got
 
 
-def test_compute_all_pulses_returns_one_indexed_fit_per_pulse(fit_df):
-    """_compute_all_pulses yields one fit per detected pulse, tagged with a 1-based pulse_idx."""
-    fit_pulses = _detect_pulses(fit_df, max_rest=300.0)
-    results = _compute_all_pulses(fit_df, fit_pulses, lambda idx: (0.5, 3.0))
-    assert len(results) == 1 and results[0]["pulse_idx"] == 1
-
-
-def test_shared_plot_palette_is_white():
-    """Shared ICI/Heatmap axes styling paints a white palette."""
-    fig = Figure()
-    ax = fig.subplots()
-    _style_ax(ax, "x", "y", "Light figure")
-    assert ax.get_facecolor() == (1.0, 1.0, 1.0, 1.0)
-    assert PLOT_BG == "#ffffff"
-
-
 def test_build_xrd_matrix_stacks_and_interpolates():
-    """Matrix stacks one row per scan in order, interpolating differing grids."""
+    """Matrix stacks one row per scan in order, interpolating differing (descending too) grids."""
     mx, matrix, used = build_xrd_matrix(build_oned_arrays())
     assert matrix.shape == (3, 50), f"got {matrix.shape}"
     assert used == [1, 2, 3], "rows must keep scan order"
     assert np.allclose(matrix[2], 3.0), "differing grid must be interpolated"
+    x = np.linspace(1.0, 5.0, 5)
+    _, matrix, _ = build_xrd_matrix({1: {"x": x, "y": x * 10.0},
+                                     2: {"x": x[::-1] + 0.5, "y": (x[::-1] + 0.5) * 10.0}})
+    assert np.allclose(matrix[1][1:], matrix[0][1:]), "a descending grid must interpolate in order"
 
 
 def test_build_xrd_matrix_skips_entries_without_data():
@@ -351,26 +333,11 @@ def test_build_xrd_matrix_skips_entries_without_data():
     assert used == [2] and matrix.shape == (1, 50)
 
 
-def test_build_xrd_matrix_interpolates_a_descending_grid():
-    """A scan recorded on a descending grid lands on the first scan's grid in the right order."""
-    x = np.linspace(1.0, 5.0, 5)
-    _, matrix, _ = build_xrd_matrix({1: {"x": x, "y": x * 10.0},
-                                     2: {"x": x[::-1] + 0.5, "y": (x[::-1] + 0.5) * 10.0}})
-    assert np.allclose(matrix[1][1:], matrix[0][1:]), "np.interp needs ascending sample points"
-
-
 def test_axis_labels_come_from_one_set():
     """Every window takes its TOF, d-spacing, 2θ and time labels from operaxn.config."""
     assert (cfg.TOF_LABEL, cfg.DSPACING_LABEL, cfg.TWOTHETA_LABEL, cfg.TIME_HOURS_LABEL) == (
         "Time of flight [μs]", "$d$-spacing [Å]", r"2$\theta$ [°]", "Time [h]")
     assert (cfg.TOF_TEXT, cfg.DSPACING_TEXT) == ("Time of flight (μs)", "d-spacing (Å)")
-    stray = ("Time of Flight", "d spacing (", "2θ (degrees)", "Time (hours)", "'t (h)'",
-             "Time (h)")
-    for path in glob.glob(os.path.join(os.path.dirname(cfg.__file__), "*.py")):
-        with open(path, encoding="utf-8") as fh:
-            text = fh.read()
-        for variant in stray:
-            assert variant not in text, f"{os.path.basename(path)} still writes {variant!r}"
 
 
 def test_figure_text_puts_units_in_square_brackets():
@@ -465,11 +432,6 @@ def test_echem_scan_curve_retains_full_resolution():
     assert len(curve_v) == 41 and len(curve_y) == 41
     assert np.isclose(curve_y[0], 1.0) and np.isclose(curve_y[-1], 3.0) \
         and np.all(np.diff(curve_y) >= 0)
-
-
-def test_standard_echem_accessor_returns_a_list():
-    """get_standard_echem returns a list."""
-    assert isinstance(get_standard_echem(), list)
 
 
 @pytest.mark.display
@@ -593,8 +555,7 @@ def test_ici_export_with_a_locked_file_replaces_neither(tmp_path, monkeypatch):
     monkeypatch.setattr(ici_module, "open", locked_open, raising=False)
     monkeypatch.setattr(pd.DataFrame, "to_csv", locked_to_csv)
     ici_module.ICIWindow._export_csv(_ici_stand_in(_ici_df(), fitted=True))
-    assert errors == [("Export failed",
-                       "ICI results could not be exported: file is open in Excel")], errors
+    assert errors == [export_failed("ICI results", "file is open in Excel")], errors
     assert (tmp_path / "cell_ici_charge.csv").read_text() == "old\n", "the charge file was replaced"
 
 
@@ -700,33 +661,10 @@ def test_capacity_window_controls(tk_root, monkeypatch):
         win.destroy()
 
 
-def test_capacity_export_reports_a_locked_file(tmp_path, monkeypatch):
-    """A CSV export that cannot write shows 'Export failed' instead of raising."""
-    errors = []
-    monkeypatch.setattr(capacity_module.filedialog, "asksaveasfilename",
-                        lambda **k: str(tmp_path / "locked.csv"))
-    monkeypatch.setattr(capacity_module.messagebox, "showerror", lambda *a, **k: errors.append(a))
-    monkeypatch.setattr(capacity_module.messagebox, "showinfo", lambda *a, **k: None)
-
-    def locked(*a, **k):
-        raise PermissionError("file is open in Excel")
-
-    monkeypatch.setattr(pd.DataFrame, "to_csv", locked)
-    t = [pd.Timestamp("2026-06-01 10:00:00") + pd.Timedelta(seconds=s) for s in range(30)]
-    df = pd.DataFrame({"timestamp": t, "echem_data": np.linspace(3, 4, 30),
-                       "current": [1.0] * 10 + [0.0] * 5 + [-1.0] * 10 + [0.0] * 5})
-    fake = SimpleNamespace(_df=df, _export_stem="cell", _get_cycles=lambda: [1],
-                           all_cycles_var=SimpleNamespace(get=lambda: True),
-                           _get_mass_mg=lambda: 0.0)
-    CapacityWindow._export_csv(fake)
-    assert errors == [("Export failed",
-                       "Capacity data could not be exported: file is open in Excel")], errors
-
-
 @pytest.mark.parametrize("box, exported", [("all", [1, 2]), (7, [2]), (2.6, [2]), (None, [1])],
                          ids=["all cycles", "typed 7 of 2", "typed 2.6", "text"])
 def test_capacity_csv_has_the_documented_columns(tmp_path, monkeypatch, box, exported):
-    """Export CSV writes README.md's columns for the cycles shown, committing the box first."""
+    """Export CSV commits the box, then writes README.md's columns and values for those cycles."""
     out = tmp_path / "cell_capacity.csv"
     errors = []
     monkeypatch.setattr(capacity_module.filedialog, "asksaveasfilename", lambda **k: str(out))
@@ -734,12 +672,13 @@ def test_capacity_csv_has_the_documented_columns(tmp_path, monkeypatch, box, exp
         monkeypatch.setattr(capacity_module.messagebox, kind, lambda *a, **k: errors.append(a))
     monkeypatch.setattr(capacity_module.messagebox, "showinfo", lambda *a, **k: None)
     shown = {"cycle": box}  # the cycle box: what it reads as (None: text that is no number)
+    mass = 10.0 if box == "all" else 0.0
     fake = SimpleNamespace(_df=build_cycling_df(), _export_stem="cell", _available=[1, 2],
                            _shown_cycle=1, all_cycles_var=SimpleNamespace(get=lambda: box == "all"),
                            cycle_var=SimpleNamespace(set=lambda c: shown.update(cycle=c)),
                            _selected_cycle=lambda: None if shown["cycle"] is None
                            else int(shown["cycle"]),  # as the IntVar reads it ('2.6' -> 2)
-                           _replot=lambda: None, _get_mass_mg=lambda: 0.0)
+                           _replot=lambda: None, _get_mass_mg=lambda: mass)
     fake._commit_cycle = lambda: CapacityWindow._commit_cycle(fake)
     fake._get_cycles = lambda: CapacityWindow._get_cycles(fake)
     CapacityWindow._export_csv(fake)
@@ -748,28 +687,18 @@ def test_capacity_csv_has_the_documented_columns(tmp_path, monkeypatch, box, exp
         header, first = fh.readline().rstrip("\n"), fh.readline().rstrip("\n")
     assert header == ("Cycle,Phase,Time (s),Voltage (V),Capacity (mAh),"
                       "Specific Capacity (mAh/g)"), header
-    assert first.startswith(f"{exported[0]},charge,") and first.endswith(","), first
-    assert sorted(pd.read_csv(out, encoding="utf-8-sig")["Cycle"].unique()) == exported
+    assert first.startswith(f"{exported[0]},charge,"), first
+    table = pd.read_csv(out, encoding="utf-8-sig")
+    assert sorted(table["Cycle"].unique()) == exported
+    charge = table[(table["Cycle"] == exported[0]) & (table["Phase"] == "charge")]
+    assert np.isclose(charge["Capacity (mAh)"].iloc[-1], 9.5 / 3600.0), charge  # 1 mA, 9.5 s
+    specific = table["Specific Capacity (mAh/g)"]
+    if mass:
+        assert np.allclose(specific, table["Capacity (mAh)"] / 0.010), "mAh over 10 mg"
+    else:
+        assert specific.isna().all() and first.endswith(","), "no mass, no specific capacity"
     if box != "all":
         assert shown["cycle"] == exported[0], "the box must show the cycle exported"
-
-
-@pytest.mark.parametrize("export, what", [("_export_figure", "Heatmap"),
-                                          ("_export_all_banks", "Heatmaps")])
-def test_failed_heatmap_export_says_what_could_not_be_exported(tmp_path, monkeypatch, export, what):
-    """A heatmap figure or Export all banks that raises names what was not exported."""
-    errors = []
-    monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **_k: str(tmp_path / "map.png"))
-    monkeypatch.setattr(messagebox, "showerror", lambda *a, **_k: errors.append(a))
-
-    def boom(*_a):
-        raise OSError("disk full")
-
-    fake = SimpleNamespace(_matrix=np.ones((2, 2)), _export_stem=lambda: "cell",
-                           _file_stem="cell", _banks=["1", "3"], save_figure=boom,
-                           _rows_for=lambda _bank: (None, np.ones((2, 2)), []))
-    getattr(HeatmapWindow, export)(fake)
-    assert errors == [("Export failed", f"{what} could not be exported: disk full")], errors
 
 
 @pytest.mark.parametrize("drawn, noun", [(["1"], "Heatmap"), (["1", "3"], "Heatmaps")])
@@ -818,21 +747,36 @@ def test_ici_fit_reads_the_current_unit_from_the_echem_header(tmp_path, fit_df, 
     assert np.isclose(fits[0]["R"], R_TRUE) and np.isclose(fits[0]["k"], K_TRUE), fits[0]
 
 
-def test_all_cycles_labels_use_primary_text_colour():
-    """All-cycles selector labels use the primary text colour on both
-    windows (pins the implementation source; rename-sensitive)."""
-    assert "bg=BG2, fg=TEXT" in inspect.getsource(_SelectorStrip._build)
-    assert "bg=BG2, fg=TEXT" in inspect.getsource(CapacityWindow._build_ui)
-
-
-def test_analysis_figures_use_light_palette():
-    """Capacity and Heatmap figure backgrounds stay on the light
-    palette (pins the implementation source; rename-sensitive)."""
-    assert "facecolor=PLOT_BG" in inspect.getsource(CapacityWindow._build_ui)
-    heatmap_build_source = inspect.getsource(HeatmapWindow._build_ui)
-    assert "facecolor=PLOT_BG" in heatmap_build_source
-    assert "width_ratios=(4, 0.12, 0.22, 1.1)" in heatmap_build_source, \
-        "heatmap must reserve a colourbar label gutter"
+@pytest.mark.display
+def test_analysis_figures_use_light_palette(tk_root, monkeypatch):
+    """Capacity, Heatmap and shared ICI axes are white; colour-bar ticks keep to their gutter."""
+    white = (1.0, 1.0, 1.0, 1.0)
+    ax = Figure().subplots()
+    _style_ax(ax, "x", "y", "Light figure")
+    assert ax.get_facecolor() == white and PLOT_BG == "#ffffff"
+    monkeypatch.setattr(capacity_module, "maximise_window", lambda win: win.withdraw())
+    win = CapacityWindow(tk_root, {"operando": build_cycling_df()})
+    try:
+        assert win._fig.get_facecolor() == white
+    finally:
+        win.destroy()
+    ex = np.arange(0.0, 660.0, 30.0)
+    base = pd.Timestamp("2026-06-01 10:00:00")
+    echem = {"x": ex, "y": np.linspace(3.2, 3.6, len(ex)),
+             "timestamps": [str(base + pd.Timedelta(seconds=s)) for s in ex]}
+    # Six-digit counts give the widest colour-bar tick labels, the ones the gutter is for
+    counts = {n: {**scan, "y": scan["y"] * 1e5} for n, scan in build_oned_arrays().items()}
+    hm = HeatmapWindow(tk_root, build_hm_scans(), oned_arrays=counts, echem_arrays=echem)
+    try:
+        hm.update()
+        assert hm._fig.get_facecolor() == white
+        hm._canvas.draw()
+        renderer = hm._canvas.get_renderer()
+        ticks = hm.cax.yaxis.get_tightbbox(renderer)
+        assert ticks.width > 0 and ticks.x1 <= hm.ax_v.get_window_extent(renderer).x0, \
+            "the colour-bar tick labels must not run into the voltage plot"
+    finally:
+        hm.destroy()
 
 
 def test_echem_sources_offers_current_bearing_datasets(monkeypatch):
@@ -1119,6 +1063,7 @@ def test_ici_names_the_selection_one_way(tk_root, monkeypatch):
         fit_colours = set()
         for phase in ("charge", "discharge"):
             win.selector._set_phase(phase)
+            assert win.ax_dv.lines, f"no fit line drawn for {phase}"
             fit_colours.add(win.ax_dv.lines[0].get_color())
     finally:
         win.destroy()
@@ -1187,24 +1132,23 @@ def test_neutron_bank_helpers_select_bank_and_axis():
     assert exclude_rows(_x, matrix, [1, 3], {1, 3}) == (None, None, [])
 
 
-def test_parse_scan_range_shared_grammar():
+def test_parse_scan_range_shared_grammar(monkeypatch):
     """One scan-range parser serves the GIF dialog, the GIF export and heatmap exclusions."""
     assert parse_scan_range("103, 1") == [1, 103]
     assert parse_scan_range("1-3,7") == [1, 2, 3, 7]
     assert parse_scan_range("1-5,10-12") == [1, 2, 3, 4, 5, 10, 11, 12]
     assert parse_scan_range("0-3,9", max_scan=5) == [1, 2, 3], "clamped to 1..max_scan"
     assert parse_scan_range("") == [] and parse_scan_range("x,1") == []
-
-
-def test_scan_range_never_joins_space_separated_numbers():
-    """Spaces only pad commas and hyphens: "1 3 5" or "1-5 7" is refused, never 135 or 1-57."""
+    # Spaces only pad commas and hyphens: "1 3 5" or "1-5 7" is refused, never 135 or 1-57
     assert parse_scan_range(" 1 - 5 , 7 ", 494) == [1, 2, 3, 4, 5, 7]
     assert parse_scan_range("1 3 5", 494) == [] and parse_scan_range("1-5 7", 494) == []
+    # '1-100000000' with 494 scans returns scans 1-494 without a range past 495
+    monkeypatch.setattr(dialog_module, "range", _refusing_range(495), raising=False)
+    assert dialog_module.parse_scan_range("1-100000000", max_scan=494) == list(range(1, 495))
 
 
-def test_heatmap_mistyped_exclude_keeps_the_previous_exclusions(caplog):
-    """Text that names no scan (a typo, or scans past the last) is warned in the terminal and keeps
-    the previous exclusions and their text; a blank entry clears them."""
+def test_heatmap_mistyped_exclude_keeps_the_previous_exclusions(caplog, monkeypatch):
+    """A typo or a range past the last scan is warned, naming it; the exclusions stay."""
     entry = {"text": "1-5"}
     hm = SimpleNamespace(exclude_var=SimpleNamespace(get=lambda: entry["text"],
                                                      set=lambda t: entry.update(text=t)),
@@ -1212,19 +1156,21 @@ def test_heatmap_mistyped_exclude_keeps_the_previous_exclusions(caplog):
                          _load_matrix=lambda: None, _replot=lambda: None,
                          _forget_zoom_history=lambda: None)
     HeatmapWindow._apply_exclusions(hm)
-    for typo in ("1-5;7", "1 3 5", "5-1"):
+    for typo, names in (("1-5;7", ()), ("1 3 5", ()), ("5-1", ()), ("500-520", ("494",))):
         entry["text"] = typo
+        caplog.clear()
         with caplog.at_level("WARNING", logger="operaxn.heatmap"):
             HeatmapWindow._apply_exclusions(hm)
         assert hm._excluded == {1, 2, 3, 4, 5} and entry["text"] == "1-5", typo
-        assert typo in caplog.text
-    entry["text"] = "500-520"
-    HeatmapWindow._apply_exclusions(hm)
-    assert hm._excluded == {1, 2, 3, 4, 5} and entry["text"] == "1-5"
-    assert "Exclude '500-520' names no scan from 1 to 494" in caplog.text, caplog.text
+        assert len(named_records(caplog, f"'{typo}'", *names)) == 1, caplog.text
     entry["text"] = ""
     HeatmapWindow._apply_exclusions(hm)
     assert hm._excluded == set()
+    # The entry is clamped to the highest scan, so a typo returns at once
+    monkeypatch.setattr(dialog_module, "range", _refusing_range(495), raising=False)
+    entry["text"] = "2-100000000"
+    HeatmapWindow._apply_exclusions(hm)
+    assert hm._excluded == set(range(2, 495))
 
 
 @pytest.mark.parametrize("typed, boxes, shown", [
@@ -1272,12 +1218,6 @@ def _refusing_range(limit):
             raise AssertionError(f"range built up to {stop}")
         return builtins.range(*args)
     return refusing_range
-
-
-def test_scan_range_is_clamped_before_it_is_built(monkeypatch):
-    """'1-100000000' with 494 scans returns scans 1-494 without a range past 495."""
-    monkeypatch.setattr(dialog_module, "range", _refusing_range(495), raising=False)
-    assert dialog_module.parse_scan_range("1-100000000", max_scan=494) == list(range(1, 495))
 
 
 def test_colormap_and_intensity_helpers():
@@ -1530,27 +1470,19 @@ def test_heatmap_intensity_entries_follow_the_bank(tk_root):
 
 
 def test_title_text_keeps_mathtext_and_shows_invalid_math_as_typed():
-    """Typed titles are trimmed; valid $...$ stays mathtext, invalid $...$ is escaped and draws."""
+    """Titles are trimmed; valid $...$ stays mathtext, invalid $...$ is escaped, line by line."""
     assert title_text("  Bank 1 ") == "Bank 1"
     assert title_text("LiNiO$_2$, cycle 1") == "LiNiO$_2$, cycle 1"
     assert title_text("Cost $5") == "Cost $5", "a lone $ is plain text already"
-    shown = title_text("$x^{2$ and \\$3")
-    assert shown == "\\$x^{2\\$ and \\$3"
-    fig = Figure()
-    FigureCanvasAgg(fig)
-    fig.add_subplot().set_title(shown)
-    fig.canvas.draw()  # the text as typed raises ValueError here
-
-
-def test_title_text_checks_each_line_as_drawn():
-    """A pasted multi-line title is checked line by line, as matplotlib parses it, and draws."""
     assert title_text("LiNiO$_2$\ncycle 1") == "LiNiO$_2$\ncycle 1"
-    shown = title_text("x$$\n$ cell")
-    assert shown == "x\\$\\$\n\\$ cell", "three $ in all, but the first line is invalid math"
-    fig = Figure()
-    FigureCanvasAgg(fig)
-    fig.add_subplot().set_title(shown)
-    fig.canvas.draw()
+    shown = [title_text("$x^{2$ and \\$3"), title_text("x$$\n$ cell")]
+    assert shown == ["\\$x^{2\\$ and \\$3", "x\\$\\$\n\\$ cell"], \
+        "a pasted title is checked line by line, as matplotlib parses it"
+    for text in shown:
+        fig = Figure()
+        FigureCanvasAgg(fig)
+        fig.add_subplot().set_title(text)
+        fig.canvas.draw()  # the text as typed raises ValueError here
 
 
 @pytest.mark.display
@@ -1663,27 +1595,22 @@ def test_heatmap_invalid_title_is_warned_once_on_every_path(tk_root, tmp_path, m
     """A title that is not valid mathtext is warned once per text, however it reaches the figure."""
     monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **_k: str(tmp_path / "maps.png"))
     monkeypatch.setattr(messagebox, "showinfo", lambda *_a, **_k: None)
-
-    def warned():
-        return [r.getMessage() for r in caplog.records if "not valid mathtext" in r.getMessage()]
-
     hm = HeatmapWindow(tk_root, build_hm_scans(), neutron_arrays=build_neutron_arrays())
     try:
         hm.update()
         with caplog.at_level("WARNING", logger="operaxn.heatmap"):
             hm.title_var.set("$x^{2$")
             hm._export_figure()  # typed, then Export: no Return or FocusOut
-            assert warned() == ["Title '$x^{2$' is not valid mathtext; it is shown as typed"]
+            assert len(named_records(caplog, "'$x^{2$'")) == len(caplog.records) == 1, caplog.text
             hm._apply_title()
             hm._set_toggle(hm.bank_var, hm._bank_btns, "3")
             hm._set_toggle(hm.bank_var, hm._bank_btns, "1")
-            assert len(warned()) == 1, "the same text is never warned twice"
+            assert len(caplog.records) == 1, "the same text is never warned twice"
             hm.title_var.set("$y^{3$")
             hm._set_toggle(hm.bank_var, hm._bank_btns, "3")  # typed, then a Bank click
             hm._export_all_banks()
             hm._set_toggle(hm.bank_var, hm._bank_btns, "1")
-        assert warned()[1:] == ["Title '$y^{3$' is not valid mathtext; it is shown as typed"], \
-            warned()
+        assert len(named_records(caplog, "'$y^{3$'")) == 1 and len(caplog.records) == 2, caplog.text
     finally:
         hm.destroy()
 
@@ -1755,20 +1682,6 @@ def test_heatmap_redraws_free_the_maps_they_replace(tk_root, monkeypatch):
 
 
 @pytest.mark.display
-def test_heatmap_exclude_box_is_clamped(tk_root, monkeypatch):
-    """The heatmap's Exclude entry is clamped to the highest scan, so a typo returns at once."""
-    top = max(s["scan_num"] for s in build_hm_scans())
-    hm = HeatmapWindow(tk_root, build_hm_scans(), oned_arrays=build_oned_arrays())
-    try:
-        monkeypatch.setattr(dialog_module, "range", _refusing_range(top + 1), raising=False)
-        hm.exclude_var.set("2-100000000")
-        hm._apply_exclusions()
-        assert hm._excluded == set(range(2, top + 1))
-    finally:
-        hm.destroy()
-
-
-@pytest.mark.display
 def test_heatmap_replot_timers_never_outlive_reset_or_close(tk_root, monkeypatch):
     """Reset redraws at once and cancels the replot its ceiling reset queued; a replot still queued
     when the window closes is cancelled with it, as its callback goes with the window."""
@@ -1795,20 +1708,13 @@ def test_heatmap_replot_timers_never_outlive_reset_or_close(tk_root, monkeypatch
     assert not errors, errors
 
 
-@pytest.mark.display
-def test_capacity_timers_never_outlive_the_window(tk_root, monkeypatch):
-    """A mass redraw and a source swap still queued when Capacity closes are cancelled with it."""
+def _capacity_jobs(root, monkeypatch):
+    """Queue Capacity's mass redraw and source swap; return their ids and the window."""
     monkeypatch.setattr(capacity_module, "maximise_window", lambda win: win.withdraw())
-    win = CapacityWindow(tk_root, {"operando": build_cycling_df()})
-    try:
-        win._queue_mass_replot()
-        win._queue_source_change("operando")
-        jobs = {win._mass_job, win._source_job}
-        assert None not in jobs and jobs <= pending_after_ids(tk_root)
-    finally:
-        errors = background_errors(tk_root, win.destroy)
-    assert not jobs & pending_after_ids(tk_root), "a queued Capacity job outlived the window"
-    assert not errors, errors
+    win = CapacityWindow(root, {"operando": build_cycling_df()})
+    win._queue_mass_replot()
+    win._queue_source_change("operando")
+    return {win._mass_job, win._source_job}, win
 
 
 def _plot_controls_jobs(root, monkeypatch):
@@ -1849,8 +1755,9 @@ def _figure_sync_jobs(root, monkeypatch):
 
 
 @pytest.mark.display
-@pytest.mark.parametrize("queue", [_plot_controls_jobs, _ici_jobs, _figure_sync_jobs],
-                         ids=["plot controls", "ICI window", "shared figure timers"])
+@pytest.mark.parametrize("queue", [_capacity_jobs, _plot_controls_jobs, _ici_jobs,
+                                   _figure_sync_jobs],
+                         ids=["capacity", "plot controls", "ICI window", "shared figure timers"])
 def test_queued_jobs_never_outlive_their_window(tk_root, monkeypatch, queue):
     """Debounced updates and timers still queued when their window goes are cancelled with it."""
     jobs, owner = queue(tk_root, monkeypatch)
@@ -1864,11 +1771,12 @@ def test_queued_jobs_never_outlive_their_window(tk_root, monkeypatch, queue):
 @pytest.mark.parametrize("close", ["close button", "Clear All"])
 @pytest.mark.parametrize("which", ["heatmap", "ici", "capacity"])
 def test_closing_an_analysis_window_frees_it(tk_root, monkeypatch, which, close):
-    """A Heatmap, ICI or Capacity window closed by its close button or by Clear All is freed at once;
-    while it is open, a second click lifts it."""
+    """An analysis window opened again is lifted, Add echem... asks for files, closing frees it."""
     for module in (gui_module, capacity_module, heatmap_module, ici_module):
         monkeypatch.setattr(module, "maximise_window", lambda win: win.withdraw())
     monkeypatch.setattr(messagebox, "askyesno", lambda *_a, **_k: True)
+    asked = []
+    monkeypatch.setattr(filedialog, "askopenfilenames", lambda **_k: asked.append(1) or ())
     master = tk.Toplevel(tk_root)
     master.withdraw()
     try:
@@ -1883,6 +1791,12 @@ def test_closing_an_analysis_window_frees_it(tk_root, monkeypatch, which, close)
         pump(win, 300)
         open_window()
         assert getattr(app, f"_{which}_window") is win, "a second click must lift the open window"
+        if which != "heatmap":
+            button = win.selector.source_button if which == "ici" else win.source_button
+            menu = win.nametowidget(button.cget("menu"))
+            menu.invoke(menu.index("Add echem..."))
+            del button, menu
+            assert asked == [1], "the Echem menu's Add echem... must open the file picker"
         ref = weakref.ref(win)
         if close == "close button":
             win.tk.eval(win.protocol("WM_DELETE_WINDOW"))

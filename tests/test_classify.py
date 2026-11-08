@@ -24,33 +24,16 @@ SYN_FILES = {
 }
 
 
-@pytest.fixture
-def syn_groups():
-    """Return SynchrotronFileGrouper output over the fixed synchrotron file mix."""
-    return core.SynchrotronFileGrouper().group_files(list(SYN_FILES))
-
-
-@pytest.mark.parametrize("scan_id, key, expected", [
-    pytest.param("123456", "nxs", "/data/sample_123456.nxs", id="anchored-nxs"),
-    pytest.param("123456", "hdf", "/data/sample_123456.hdf", id="anchored-hdf"),
-    pytest.param("777777", "nxs", "/data/other_777777.nxs", id="lone-nxs-own-group"),
+@pytest.mark.parametrize("files, xy", [
+    pytest.param(list(SYN_FILES), "/data/sample_123456_extra.xy", id="fixed-mix"),
+    pytest.param([f for f in SYN_FILES if f != "/data/sample_123456_extra.xy"],
+                 "/data/sample_123456_integration_00.xy", id="without-extra-xy"),
 ])
-def test_synchrotron_grouping(syn_groups, scan_id, key, expected):
-    """A .nxs anchors each group; same-ID files join; a lone .nxs still groups."""
-    assert syn_groups.get(scan_id, {}).get(key) == expected, str(syn_groups.get(scan_id))
-
-
-def test_synchrotron_orphan_hdf_stays_ungrouped(syn_groups):
-    """An .hdf with no matching .nxs anchor never forms a group."""
-    assert "999999" not in syn_groups, str(syn_groups)
-
-
-def test_synchrotron_integration_xy_joins_group():
-    """An _integration_ .xy maps back to its scan ID and joins the anchored group."""
-    files = [f for f in SYN_FILES if f != "/data/sample_123456_extra.xy"]
-    groups = core.SynchrotronFileGrouper().group_files(files)
-    assert groups["123456"].get("xy") == "/data/sample_123456_integration_00.xy", \
-        str(groups.get("123456"))
+def test_synchrotron_grouping(files, xy):
+    """A .nxs anchors a group (a lone one too), an orphan .hdf none; the last .xy grouped wins."""
+    assert core.SynchrotronFileGrouper().group_files(files) == {
+        "123456": {"nxs": "/data/sample_123456.nxs", "hdf": "/data/sample_123456.hdf", "xy": xy},
+        "777777": {"nxs": "/data/other_777777.nxs"}}
 
 
 @pytest.mark.parametrize("prefix", ["i11-1-", "cell_0.5C_"])
@@ -61,12 +44,6 @@ def test_synchrotron_dotted_names_keep_their_xy(prefix):
     groups = core.SynchrotronFileGrouper().group_files(files)
     assert groups == {"12345": {"nxs": files[0], "hdf": files[1], "xy": files[2]}}
     assert {core.SynchrotronFileGrouper.extract_scan_id(f) for f in files} == {"12345"}
-
-
-def test_synchrotron_trailing_id_xy_joins_group(syn_groups):
-    """A plain trailing-ID .xy also joins its group; the last file grouped wins the slot."""
-    assert syn_groups.get("123456", {}).get("xy") == "/data/sample_123456_extra.xy", \
-        str(syn_groups.get("123456"))
 
 
 # ============================================================================
@@ -94,13 +71,6 @@ def test_echem_logger_with_one_ctime_column_stays_echem(tmp_path):
     assert core.TXTClassifier().classify(str(path))[0] == "echem"
 
 
-def test_dat_classifier_oned(tmp_path):
-    """An XRD .dat header classifies as oned with its timestamp and exposure."""
-    path = tmp_path / "scan.dat"
-    _builders.write_xrd_dat(str(path), _builders.SCAN_TIMES[0])
-    assert core.DATClassifier().classify(str(path)) == ("oned", "2024-02-05 10:05:00", 120.0)
-
-
 @pytest.mark.parametrize("value, expected", [
     pytest.param("2023-12-07T10:11:25", "2023-12-07 10:11:25", id="iso-T"),
     pytest.param("2024-02-05 10:05:00", "2024-02-05 10:05:00", id="iso-space"),
@@ -108,10 +78,10 @@ def test_dat_classifier_oned(tmp_path):
     pytest.param("Mon Feb  5 10:05:00 2024", "2024-02-05 10:05:00", id="ctime"),
 ])
 def test_dat_date_value_is_read_whole(tmp_path, value, expected):
-    """The whole '# Date' value is read, slash dates day-first; ISO with 'T' is stored with a space."""
+    """A .dat is oned with its exposure; the whole '# Date' is read, slash dates day-first."""
     path = tmp_path / "scan.dat"
     _builders.write_xrd_dat(str(path), value)
-    assert core.DATClassifier().classify(str(path))[:2] == ("oned", expected)
+    assert core.DATClassifier().classify(str(path)) == ("oned", expected, 120.0)
 
 
 @pytest.mark.parametrize("value, expected", [
@@ -349,14 +319,6 @@ def test_neutron_file_grouping(tmp_path):
         assert groups["123456"][meas]["d"].endswith(f"123456-{meas}-d-0.dat")
 
 
-@pytest.mark.parametrize("filename", [
-    "123456-1-0.dat", "123456-1-d-0.dat", "123456-2-0.dat", "123456-2-d-0.dat",
-])
-def test_neutron_extract_scan_id(filename):
-    """Every bank filename variant yields the scan ID used for grouping."""
-    assert core.NeutronFileGrouper.extract_scan_id(filename) == "123456"
-
-
 def test_parse_mantid_header(tmp_path):
     """Instrument, X-axis unit and spectrum number harvest from a Mantid header."""
     path = tmp_path / "mantid.dat"
@@ -412,55 +374,41 @@ def test_mantid_split_banks_keep_their_own_slots(caplog):
         "98765-0.dat, 98765-10.dat, 98765-11.dat and 6 more"]
 
 
-def test_banks_6_to_9_are_skipped_and_named(caplog):
-    """Banks 6-9 are not loaded; one line names them instead of dropping them silently."""
-    files = [f"/x/{name}" for bank in range(1, 10)
-             for name in _builders.polaris_bank_names("153868", bank)]
+@pytest.mark.parametrize("banks, extra, line", [
+    pytest.param(range(1, 10), [], "8 .dat files were not recognised as neutron bank 1-5 files and "
+                 "were ignored: POL153868-b_6-TOF.dat, POL153868-b_6-d.dat, POL153868-b_7-TOF.dat "
+                 "and 5 more", id="banks-6-to-9"),
+    pytest.param((1, 2), ["/x/POL153868-b_13-d.dat"], "1 .dat file was not recognised as a neutron "
+                 "bank 1-5 file and was ignored: POL153868-b_13-d.dat", id="one-bank-13-file"),
+])
+def test_banks_6_to_9_are_skipped_and_named(caplog, banks, extra, line):
+    """Banks past 5 are not loaded nor fill bank 1; one line names them, in the singular for one."""
+    files = [f"/x/{name}" for bank in banks
+             for name in _builders.polaris_bank_names("153868", bank)] + extra
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         groups = core.NeutronFileGrouper().group_files(files)
-    assert sorted(groups["153868"]) == ["1", "2", "3", "4", "5"], groups
-    assert all(set(slot) == {"tof", "d"} for slot in groups["153868"].values()), groups
-    assert _bank_warnings(caplog) == [
-        "8 .dat files were not recognised as neutron bank 1-5 files and were ignored: "
-        "POL153868-b_6-TOF.dat, POL153868-b_6-d.dat, POL153868-b_7-TOF.dat and 5 more"]
+    expected = {}
+    for bank in (range(1, 6) if len(banks) > 5 else banks):
+        tof, d = _builders.polaris_bank_names("153868", bank)
+        expected[str(bank)] = {"tof": f"/x/{tof}", "d": f"/x/{d}"}
+    assert groups["153868"] == expected, groups
+    assert _bank_warnings(caplog) == [line]
 
 
-def test_one_unrecognised_bank_file_is_reported_in_the_singular(caplog):
-    """A lone bank 13 file leaves bank 1 alone and is reported as one file."""
-    files = [f"/x/{name}" for bank in (1, 2)
-             for name in _builders.polaris_bank_names("153868", bank)]
-    files.append("/x/POL153868-b_13-d.dat")
+@pytest.mark.parametrize("case", ["upper-case-extension", "cell_d-prefix", "all-upper-case"])
+def test_upper_case_dat_bank_files_group(caplog, case):
+    """Bank files in .DAT, all upper case or after 'cell_d_' keep TOF and d apart, unwarned."""
+    if case == "upper-case-extension":
+        pairs = {run: {b: [f"{folder}{n[:-4]}.DAT" for n in names(run, b)] for b in (1, 2)}
+                 for run, folder, names in (("153868", "/p/", _builders.polaris_bank_names),
+                                            ("59268", "/w/", _builders.wish_bank_names))}
+    elif case == "cell_d-prefix":
+        pairs = {"59268": {1: [f"/x/cell_d_{n}" for n in _builders.wish_bank_names("59268", 1)]}}
+    else:
+        pairs = {"59268": {1: [f"/x/{n.upper()}" for n in _builders.wish_bank_names("59268", 1)]}}
+    files = [path for banks in pairs.values() for pair in banks.values() for path in pair]
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         groups = core.NeutronFileGrouper().group_files(files)
-    assert groups["153868"]["1"]["d"] == "/x/POL153868-b_1-d.dat", groups
-    assert _bank_warnings(caplog) == [
-        "1 .dat file was not recognised as a neutron bank 1-5 file and was ignored: "
-        "POL153868-b_13-d.dat"]
-
-
-def test_upper_case_dat_bank_files_group(caplog):
-    """POLARIS and WISH bank files named .DAT group like .dat, with no warning."""
-    files = [f"/p/{name[:-4]}.DAT" for bank in (1, 2)
-             for name in _builders.polaris_bank_names("153868", bank)]
-    files += [f"/w/{name[:-4]}.DAT" for bank in (1, 2)
-              for name in _builders.wish_bank_names("59268", bank)]
-    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
-        groups = core.NeutronFileGrouper().group_files(files)
-    for run in ("153868", "59268"):
-        assert sorted(groups.get(run, {})) == ["1", "2"], groups
-        assert all(set(slot) == {"tof", "d"} for slot in groups[run].values()), groups
+    assert groups == {run: {str(b): {"tof": tof, "d": d} for b, (tof, d) in banks.items()}
+                      for run, banks in pairs.items()}, groups
     assert _bank_warnings(caplog) == []
-
-
-def test_d_in_a_cell_name_keeps_the_tof_file():
-    """A 'cell_d_' sample prefix does not turn the TOF file into a second d file."""
-    tof, d = _builders.wish_bank_names("59268", 1)
-    groups = core.NeutronFileGrouper().group_files([f"/x/cell_d_{tof}", f"/x/cell_d_{d}"])
-    assert groups["59268"]["1"] == {"tof": f"/x/cell_d_{tof}", "d": f"/x/cell_d_{d}"}, groups
-
-
-def test_upper_case_d_marker_reads_as_d():
-    """An all upper-case WISH pair (59268-1_10RAW-D-0.DAT) keeps its TOF and d files apart."""
-    tof, d = (name.upper() for name in _builders.wish_bank_names("59268", 1))
-    groups = core.NeutronFileGrouper().group_files([f"/x/{tof}", f"/x/{d}"])
-    assert groups.get("59268", {}).get("1") == {"tof": f"/x/{tof}", "d": f"/x/{d}"}, groups

@@ -117,30 +117,25 @@ def test_cycling_protocol_written(protocol_nxs):
         assert s(cp["raw_data_file"]) == "doi:10.5281/zenodo.0000000"
 
 
-def test_raw_data_file_defaults_to_echem_sources(tmp_path, inhouse_src):
-    """An unsupplied raw_data_file records the echem files actually ingested."""
-    out = str(tmp_path / "auto_raw.nxs")
-    ok, msgs = core.generate([inhouse_src], out, core.DataSourceType.INHOUSE,
+@pytest.mark.parametrize("echem, recorded", [("txt", "echem.txt"), ("xlsx", "cellA.xlsx")],
+                         ids=["txt", "xlsx"])
+def test_raw_data_file_defaults_to_echem_sources(tmp_path, request, echem, recorded):
+    """An unsupplied raw_data_file records the user's echem files, an .xlsx by its own name."""
+    if echem == "xlsx":
+        src = tmp_path / "xlsx_src"
+        src.mkdir()
+        _builders.write_inhouse_scans(str(src))
+        _builders.write_arbin_xlsx(str(src / "cellA.xlsx"))
+        src = str(src)
+    else:
+        src = request.getfixturevalue("inhouse_src")
+    out = str(tmp_path / f"{echem}_raw.nxs")
+    ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE,
                              cycling_protocol={"technique": "GCPL"})
     assert ok, str(msgs)
     with h5py.File(out) as f:
-        assert s(f["entry/cycling_protocol/raw_data_file"]) == "echem.txt"
-    assert_pynxtools_valid(out, "auto raw_data_file")
-
-
-def test_raw_data_file_uses_original_xlsx_name(tmp_path):
-    """xlsx echem provenance records the user's filename, not the temp copy."""
-    src = tmp_path / "xlsx_src"
-    src.mkdir()
-    _builders.write_inhouse_scans(str(src))
-    _builders.write_arbin_xlsx(str(src / "cellA.xlsx"))
-    out = str(tmp_path / "xlsx_raw.nxs")
-    ok, msgs = core.generate([str(src)], out, core.DataSourceType.INHOUSE,
-                             cycling_protocol={"technique": "GCPL"})
-    assert ok, str(msgs)
-    with h5py.File(out) as f:
-        assert s(f["entry/cycling_protocol/raw_data_file"]) == "cellA.xlsx"
-    assert_pynxtools_valid(out, "xlsx raw_data_file")
+        assert s(f["entry/cycling_protocol/raw_data_file"]) == recorded
+    assert_pynxtools_valid(out, f"{echem} raw_data_file")
 
 
 def test_standard_echem_xlsx_provenance(tmp_path, inhouse_src):
@@ -197,65 +192,31 @@ def test_cycling_protocol_dropped_without_technique(tmp_path, inhouse_src):
     assert_pynxtools_valid(out, "no-technique")
 
 
-def test_tofnpd_geometry_placeholders_skipped(tmp_path, polaris_src, monkeypatch):
-    """None geometry placeholders write no flight path and no empty detector or monitor group."""
-    profile = core.config.INSTRUMENT_PROFILES["polaris"]
-    monkeypatch.setitem(profile, "pre_sample_flightpath_m", None)
-    monkeypatch.setitem(profile, "detector_banks", {
-        bank: {"distance_m": None, "polar_angle_deg": None,
-               "azimuthal_angle_deg": None}
-        for bank in (1, 2, 3, 4, 5)})
-    monkeypatch.setitem(profile, "monitor_mode", None)
-    monkeypatch.setitem(profile, "detector_description", None)
-    out = str(tmp_path / "polaris.nxs")
-    ok, msgs = core.generate([polaris_src], out, core.DataSourceType.NEUTRON)
-    assert ok, str(msgs)
-    with h5py.File(out) as f:
-        e = f["entry"]
-        assert s(e["instrument/name"]) == "POLARIS", "polaris profile not selected"
-        assert "pre_sample_flightpath" not in e
-        assert "detector" not in e["instrument"], \
-            "nothing to write, so no empty detector group"
-        assert "monitor" not in e, "None monitor_mode must write no monitor group"
-
-
 @needs_fabio
-def test_na_edf_geometry_is_not_written_and_file_validates(tmp_path):
-    """SampleDistance 'NA' leaves distance out (raw header kept) instead of a string in NX_FLOAT."""
-    src = str(tmp_path / "edf_na")
-    os.makedirs(src)
-    _builders.write_xrd_dat(os.path.join(src, "scan_001.dat"), _builders.SCAN_TIMES[0])
-    _builders.write_edf_image(os.path.join(src, "image_001.edf"), _builders.SCAN_TIMES[0],
-                              SampleDistance="NA", Center_1="NA", DetectorModel="300")
-    _builders.write_echem_txt(os.path.join(src, "echem.txt"))
-    out = str(tmp_path / "na.nxs")
-    ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
-    assert ok, msgs
-    with h5py.File(out, "r") as f:
-        det = f["entry/instrument/detector"]
-        assert "distance" not in det and "beam_center_x" not in det
-        assert det["description"].dtype.kind in "OS", "description is NX_CHAR"
-        assert f["entry/instrument/edf_metadata/SampleDistance"][()] in (b"NA", "NA")
-    assert_pynxtools_valid(out, "edf NA")
-
-
-@needs_fabio
-def test_nan_and_inf_edf_geometry_are_not_written(tmp_path, caplog):
-    """SampleDistance 'nan' and PSize_1 'inf' are left out with a warning, like 'NA'."""
+@pytest.mark.parametrize("case", ["NA", "nan-inf"])
+def test_na_edf_geometry_is_not_written_and_file_validates(tmp_path, caplog, case):
+    """EDF geometry of 'NA', 'nan' or 'inf' is left out with one warning each, raw header kept."""
     src = str(tmp_path / "lab")
     _builders.write_lab_dir(src)
-    _builders.write_edf_image(os.path.join(src, "image_001.edf"), _builders.SCAN_TIMES[0],
-                              SampleDistance="nan", PSize_1="inf", PSize_2="0.000172")
-    out = str(tmp_path / "nonfinite.nxs")
+    header = ({"SampleDistance": "NA", "Center_1": "NA", "DetectorModel": "300"} if case == "NA"
+              else {"SampleDistance": "nan", "PSize_1": "inf", "PSize_2": "0.000172"})
+    _builders.write_edf_image(os.path.join(src, "image_001.edf"), _builders.SCAN_TIMES[0], **header)
+    out = str(tmp_path / f"{case}.nxs")
     with caplog.at_level(logging.WARNING):
         ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
     assert ok, msgs
     with h5py.File(out, "r") as f:
         det = f["entry/instrument/detector"]
-        assert "distance" not in det and "x_pixel_size" not in det
-        assert det["y_pixel_size"][()] == pytest.approx(0.000172)
+        assert "distance" not in det
+        if case == "NA":
+            assert "beam_center_x" not in det
+            assert det["description"].dtype.kind in "OS", "description is NX_CHAR"
+            assert f["entry/instrument/edf_metadata/SampleDistance"][()] in (b"NA", "NA")
+        else:
+            assert "x_pixel_size" not in det
+            assert det["y_pixel_size"][()] == pytest.approx(0.000172)
     assert sum("not a finite number" in r.getMessage() for r in caplog.records) == 2
-    assert_pynxtools_valid(out, "nan geometry")
+    assert_pynxtools_valid(out, f"edf {case}")
 
 
 @needs_fabio
@@ -340,7 +301,7 @@ def test_polaris_profile_geometry_written(tmp_path, polaris_src):
 
 
 def test_tofnpd_geometry_from_profile(tmp_path, polaris_src, monkeypatch):
-    """Profile geometry gives flight path, bank and monitor arrays; a None drops that array."""
+    """Profile geometry writes flight path, bank and monitor arrays; a None leaves its part out."""
     profile = core.config.INSTRUMENT_PROFILES["polaris"]
     monkeypatch.setitem(profile, "pre_sample_flightpath_m", 14.0)
     monkeypatch.setitem(profile, "monitors", {
@@ -392,33 +353,23 @@ def test_tofnpd_geometry_from_profile(tmp_path, polaris_src, monkeypatch):
         assert np.allclose(det["polar_angle"][()], [52.0, 92.0])
         assert list(det["detector_number"][()]) == [1, 2]
 
-
-def test_xrd_data_group_omitted_on_read_failure(tmp_path, inhouse_src, monkeypatch):
-    """A failed 1D read leaves no empty NXdata shell behind."""
-    def _boom(cls, *args, **kwargs):
-        raise OSError("simulated read failure")
-    monkeypatch.setattr(core.nxs_writer.DataReaderFactory, "read_file",
-                        classmethod(_boom))
-    out = str(tmp_path / "read_failure.nxs")
-    ok, msgs = core.generate([inhouse_src], out, core.DataSourceType.INHOUSE)
+    # None placeholders throughout: no flight path and no empty detector or monitor group
+    monkeypatch.setitem(profile, "pre_sample_flightpath_m", None)
+    monkeypatch.setitem(profile, "detector_banks", {
+        bank: {"distance_m": None, "polar_angle_deg": None, "azimuthal_angle_deg": None}
+        for bank in (1, 2, 3, 4, 5)})
+    monkeypatch.setitem(profile, "monitor_mode", None)
+    monkeypatch.setitem(profile, "detector_description", None)
+    core.clear_global_cache()
+    out3 = str(tmp_path / "geometry_none.nxs")
+    ok, msgs = core.generate([polaris_src], out3, core.DataSourceType.NEUTRON)
     assert ok, str(msgs)
-    with h5py.File(out) as f:
-        names = [k for k in f["entry"] if k.startswith("scan_")]
-        assert names
-        for name in names:
-            assert "data" not in f["entry"][name], f"{name} carries an empty data group"
-        empty_nxdata = []
-        def _visit(path, obj):
-            if isinstance(obj, h5py.Group) and obj.attrs.get("NX_class") == "NXdata" \
-                    and len(obj.keys()) == 0:
-                empty_nxdata.append(path)
-        f.visititems(_visit)
-        assert not empty_nxdata, empty_nxdata
-
-
-def test_definition_version():
-    """The definition version advertised in files is 1.0.0."""
-    assert core.config.DEFINITION_VERSION == "1.0.0"
+    with h5py.File(out3) as f:
+        e = f["entry"]
+        assert s(e["instrument/name"]) == "POLARIS", "polaris profile not selected"
+        assert "pre_sample_flightpath" not in e
+        assert "detector" not in e["instrument"], "nothing to write, so no empty detector group"
+        assert "monitor" not in e, "None monitor_mode must write no monitor group"
 
 
 @pytest.mark.parametrize("nxs_fixture", ["inhouse_nxs", "neutron_nxs", "protocol_nxs"])

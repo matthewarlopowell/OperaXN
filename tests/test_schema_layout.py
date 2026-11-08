@@ -12,7 +12,7 @@ from _helpers import s, wall, tz_aware, assert_pynxtools_valid, needs_fabio
 
 
 def test_monopd_root_and_entry(inhouse_nxs):
-    """@default chains to the echem plot, provenance sits on definition, start_time is tz-aware."""
+    """@default chains to echem, definition 1.0.0 holds provenance, start_time is tz-aware."""
     with h5py.File(inhouse_nxs) as f:
         assert f.attrs.get("default") == "entry"
         e = f["entry"]
@@ -20,7 +20,7 @@ def test_monopd_root_and_entry(inhouse_nxs):
         assert "generator" not in e.attrs and "data_source" not in e.attrs, \
             "v3 provenance attrs left on entry"
         assert s(e["definition"]) == "NXoperando_monopd"
-        assert e["definition"].attrs.get("version") == core.config.DEFINITION_VERSION
+        assert e["definition"].attrs.get("version") == core.config.DEFINITION_VERSION == "1.0.0"
         assert e["definition"].attrs.get("URL", "").endswith("NXoperando_monopd.nxdl.xml")
         assert "program_name" not in e, "duplicate of process/program"
         assert wall(e["start_time"]) == "2024-02-05T10:05:00"
@@ -277,7 +277,7 @@ def test_tofnpd_unreadable_bank_leaves_no_shell(tmp_path):
 
 @pytest.mark.parametrize("fixture", ["inhouse_nxs", "neutron_nxs"])
 def test_entry_window_spans_all_scans(request, fixture):
-    """The entry time window contains every acquisition it holds."""
+    """The entry window contains every acquisition it holds, each with its scan_timestamp."""
     with h5py.File(request.getfixturevalue(fixture)) as f:
         entry = f["entry"]
         e_start, e_end = wall(entry["start_time"]), wall(entry["end_time"])
@@ -285,21 +285,12 @@ def test_entry_window_spans_all_scans(request, fixture):
         assert scans, "no scan subentries"
         for name in scans:
             sub = entry[name]
+            assert "scan_timestamp" in sub["environment"], name
             assert wall(sub["environment/start_time"]) >= e_start, \
                 f"{name} starts before the entry window"
             if "end_time" in sub["environment"]:
                 assert wall(sub["environment/end_time"]) <= e_end, \
                     f"{name} ends after the entry window"
-
-
-@pytest.mark.parametrize("nxs_fixture", ["inhouse_nxs", "neutron_nxs"])
-def test_scan_timestamp_always_written(request, nxs_fixture):
-    """Every scan subentry carries environment/scan_timestamp."""
-    with h5py.File(request.getfixturevalue(nxs_fixture)) as f:
-        names = [k for k in f["entry"] if k.startswith("scan_")]
-        assert names
-        for name in names:
-            assert "scan_timestamp" in f["entry"][name]["environment"], name
 
 
 # ============================================================================
