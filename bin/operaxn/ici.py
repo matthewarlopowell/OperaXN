@@ -1206,8 +1206,9 @@ class ICIWindow(tk.Toplevel):
             ax.axvspan(t0, t1, alpha=0.25, color=HIGHLIGHT_COLOR, zorder=3)
             ax.axvline(t0, color=HIGHLIGHT_COLOR, lw=1.0, ls='--', zorder=4)
 
-        ax.legend(fontsize=7, loc='best',
-                  labelcolor=PLOT_TEXT, facecolor=PLOT_BG, edgecolor=PLOT_BORDER)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=7, loc='best',
+                      labelcolor=PLOT_TEXT, facecolor=PLOT_BG, edgecolor=PLOT_BORDER)
 
     def _plot_pulse_zoom(self, cycle: int, pulse_idx: int, phase: str) -> None:
         """Plot voltage and current over the selected pulse and its relaxation."""

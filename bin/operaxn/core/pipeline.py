@@ -397,6 +397,13 @@ def _tolerance_error(value: Any) -> Optional[str]:
     return None
 
 
+def _path_list(paths: Any) -> List[str]:
+    """Return paths as a list of str; one str or PathLike is a list of one."""
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    return [os.fspath(path) for path in paths]
+
+
 def _run_pipeline(processor: FileProcessor,
                   input_paths: List[str],
                   data_source: DataSourceType,
@@ -439,7 +446,7 @@ def _run_pipeline(processor: FileProcessor,
 
 
 def process_raw(input_paths: List[str],
-                data_source: DataSourceType = DataSourceType.INHOUSE,
+                data_source: DataSourceType = DataSourceType.INHOUSE, *,
                 progress_callback: ProgressCallback = None,
                 time_method: TimeMethod = TimeMethod.ABSOLUTE,
                 echem_time_tolerance: float = ECHEM_TIME_TOLERANCE,
@@ -447,8 +454,9 @@ def process_raw(input_paths: List[str],
                 ) -> Tuple[List[Scan], pd.DataFrame]:
     """Collect, classify and correlate raw data; timestamps stay absolute whatever `time_method`.
     ZIP-extracted files the scans point to are deleted on return; use `generate` for the data."""
+    data_source, time_method = DataSourceType(data_source), TimeMethod(time_method)
     with FileProcessor(data_source, cancel) as processor:
-        return _run_pipeline(processor, input_paths, data_source,
+        return _run_pipeline(processor, _path_list(input_paths), data_source,
                              progress_callback, time_method,
                              echem_time_tolerance)
 
@@ -596,7 +604,7 @@ def check_scans(scans: List[Scan], echem_df: pd.DataFrame) -> List[str]:
 
 def generate(input_paths: List[str],
              output_path: str,
-             data_source: DataSourceType = DataSourceType.INHOUSE,
+             data_source: DataSourceType = DataSourceType.INHOUSE, *,
              include_2d_images: bool = False,
              max_display_size: int = 0,
              standard_echem_files: Optional[List[str]] = None,
@@ -615,6 +623,12 @@ def generate(input_paths: List[str],
     error = _tolerance_error(echem_time_tolerance)
     if error:
         return False, [f"Error: {error}"]
+    try:
+        data_source, time_method = DataSourceType(data_source), TimeMethod(time_method)
+        input_paths, output_path = _path_list(input_paths), os.fspath(output_path)
+        standard_echem_files = _path_list(standard_echem_files or [])
+    except (ValueError, TypeError) as e:
+        return False, [f"Error: {e}"]
     try:
         # The FileProcessor context must span writing too: the writer reads
         # data from the scans' file paths, which for ZIP inputs live in the

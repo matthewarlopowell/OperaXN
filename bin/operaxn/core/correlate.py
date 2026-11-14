@@ -118,18 +118,21 @@ class EchemParser:
                     name=name)
                 if not columns:
                     return None
-                voltage_scale = self._voltage_unit_scale(lines[0], columns, name)
-                current_scale = self._current_unit_scale(lines[0], columns, name)
                 data_lines = lines[1:]
             else:
                 columns = {"time": 0, "voltage": 1, "current": 2}
-                voltage_scale = current_scale = 1.0
                 data_lines = lines
 
-            data = self._parse_data_lines(data_lines, columns, voltage_scale, current_scale,
-                                          name=name)
+            data = self._parse_data_lines(data_lines, columns, name=name)
 
             if data:
+                if has_header:  # unit lines only for a file with rows to read
+                    voltage_scale = self._voltage_unit_scale(lines[0], columns, name)
+                    current_scale = self._current_unit_scale(lines[0], columns, name)
+                    for row in data:
+                        row["echem_data"] *= voltage_scale
+                        if row["current"] is not None:
+                            row["current"] *= current_scale
                 return pd.DataFrame(data)
             # None: a warning already named the file
             if data is not None:
@@ -236,10 +239,11 @@ class EchemParser:
         used_indices = set(detected.values()) | matched_indices
         for col_name in columns:
             if col_name not in detected and columns[col_name] in used_indices:
-                logger.warning(
-                    f"{name}: default column '{col_name}' at index {columns[col_name]} "
-                    f"collides with a detected column; it is not read"
-                )
+                if col_name == "current":  # a lost time or voltage gets the skip line
+                    logger.warning(
+                        f"{name}: default column '{col_name}' at index {columns[col_name]} "
+                        f"collides with a detected column; it is not read"
+                    )
                 columns[col_name] = -1
 
         # A voltage or current taken by position must carry its unit (V or mV; a current unit
@@ -299,9 +303,9 @@ class EchemParser:
         return scale
 
     @staticmethod
-    def _parse_data_lines(lines: List[str], columns: Dict[str, int], voltage_scale: float,
-                          current_scale: float, name: str) -> Optional[List[Dict[str, Any]]]:
-        """Parse data lines into row dicts, skipping unparseable and placeholder rows.
+    def _parse_data_lines(lines: List[str], columns: Dict[str, int],
+                          name: str) -> Optional[List[Dict[str, Any]]]:
+        """Parse data lines into unscaled row dicts, skipping unparseable and placeholder rows.
         None when a warning named the file; dates are read day-first (UK convention, by design)."""
         # A disabled time/voltage column (-1) would silently index parts[-1]
         if columns["time"] < 0 or columns["voltage"] < 0:
@@ -360,7 +364,7 @@ class EchemParser:
                 timestamp = strip_utc_offset(timestamp)
 
                 try:
-                    voltage = float(parts[columns["voltage"]]) * voltage_scale
+                    voltage = float(parts[columns["voltage"]])
                 except ValueError:
                     # A blank cell holds no reading, so none is lost
                     unreadable += bool(parts[columns["voltage"]].strip())
@@ -369,7 +373,7 @@ class EchemParser:
                 current = None
                 if 0 <= columns["current"] < len(parts):
                     try:
-                        current = float(parts[columns["current"]]) * current_scale
+                        current = float(parts[columns["current"]])
                     except ValueError:
                         pass
 

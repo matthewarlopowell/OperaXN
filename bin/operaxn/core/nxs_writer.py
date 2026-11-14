@@ -371,7 +371,7 @@ def get_profile(data_source: DataSourceType,
 class NXSWriter:
     """Canonical schema-4.0 NeXus/HDF5 file writer."""
 
-    def __init__(self, data_source: DataSourceType = DataSourceType.INHOUSE,
+    def __init__(self, data_source: DataSourceType = DataSourceType.INHOUSE, *,
                  include_2d_images: bool = False,
                  max_display_size: int = 0,
                  time_method: TimeMethod = TimeMethod.ABSOLUTE,
@@ -702,6 +702,9 @@ class NXSWriter:
             logger.warning("cycling_protocol omitted: technique is required; "
                            f"discarded keys: {sorted(present)}")
             return
+        unknown = sorted(set(present) - {key for key, *_ in CYCLING_PROTOCOL_FIELDS})
+        if unknown:
+            logger.warning(f"cycling_protocol keys not recognised and not stored: {unknown}")
         if _is_blank(protocol.get('raw_data_file')):
             sources = _echem_source_names(echem_df)
             if sources:

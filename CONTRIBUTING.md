@@ -15,6 +15,9 @@ include:
   formats involved
 - the full traceback, or the terminal output from running `operaxn --debug`
 
+Setting `OPERAXN_DEBUG=1` logs at debug level, as `--debug` does, and also
+writes the log to `operaxn.log` in the working folder.
+
 If the problem is specific to a data file and you are able to share it (or a
 minimal excerpt), that makes reproduction much easier.
 
@@ -61,15 +64,10 @@ Notes:
   `OPERAXN_TEST_DATA=<folder>` to enable them (see
   [examples/README.md](examples/README.md) for the expected layout). They
   are skipped otherwise.
-- Set `OPERAXN_REQUIRE_VALIDATION=1` (as CI does) to make the NeXus
-  schema-validation tests fail, instead of skipping, when pynxtools
-  validation is unavailable.
-- Set `OPERAXN_DEBUG=1` to log at debug level, as `--debug` does, and also
-  write the log to `operaxn.log` in the working folder.
 
 The `[test]` extra includes FAIRmat's pynxtools, so the NeXus
 schema-validation tests run by default; they skip if it is missing or cannot
-run (they fail instead with `OPERAXN_REQUIRE_VALIDATION=1`).
+run (they fail instead with `OPERAXN_REQUIRE_VALIDATION=1`, which CI sets).
 Those tests copy the two NXDL files from `definitions/` into pynxtools'
 installed `contributed_definitions` directory, because the validator cannot
 resolve `NXoperando_monopd` / `NXoperando_tofnpd` otherwise. Run them in a virtual

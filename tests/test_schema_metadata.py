@@ -192,6 +192,19 @@ def test_cycling_protocol_dropped_without_technique(tmp_path, inhouse_src):
     assert_pynxtools_valid(out, "no-technique")
 
 
+def test_unknown_cycling_protocol_keys_are_named(tmp_path, inhouse_src, caplog):
+    """A protocol key the writer does not know is named in one warning; the rest is stored."""
+    out = str(tmp_path / "unknown_key.nxs")
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
+        ok, msgs = core.generate([inhouse_src], out, core.DataSourceType.INHOUSE,
+                                 cycling_protocol={"technique": "GCPL", "C_rate": "C/10"})
+    assert ok, str(msgs)
+    assert [r.getMessage() for r in caplog.records if "cycling_protocol" in r.getMessage()] == [
+        "cycling_protocol keys not recognised and not stored: ['C_rate']"]
+    with h5py.File(out) as f:
+        assert set(f["entry/cycling_protocol"]) == {"technique", "raw_data_file"}
+
+
 @needs_fabio
 @pytest.mark.parametrize("case", ["NA", "nan-inf"])
 def test_na_edf_geometry_is_not_written_and_file_validates(tmp_path, caplog, case):

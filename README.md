@@ -108,7 +108,7 @@ back. A `.zip` upload reads from its own extracted copy, and images embedded
 with "Include 2D images in the NeXus file" need no source file. 2D images
 stored by reference stay outside the `.nxs`: to share an experiment with its
 2D, tick "Include 2D images in the NeXus file", or send the image files with
-it (for a ZIP upload, the `<name>_images` folder written beside the export).
+it (for a `.zip` upload, the `<name>_images` folder written beside the export).
 
 No data to hand? [examples/](examples) generates a small synthetic operando
 dataset and an ICI cycling log, and walks through loading them.

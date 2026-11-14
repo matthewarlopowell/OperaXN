@@ -227,8 +227,7 @@ The entry `entry` in file `experiment.nxs` is valid according to the
 ```
 
 (`NXoperando_tofnpd` for neutron files. `validate_nexus experiment.nxs`
-does the same: the test suite uses it, and older pynxtools versions have
-only that form.)
+does the same; older pynxtools versions have only that form.)
 
 After editing either NXDL, the copies inside pynxtools' contributed
 definitions folder must be refreshed (repeat step 2) or validation silently

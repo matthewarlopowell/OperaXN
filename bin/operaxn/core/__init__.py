@@ -53,7 +53,12 @@ from .correlate import (
     format_relative_time,
     parse_relative_time,
 )
-from .nxs_writer import NXSWriter, get_profile, write_standard_echem_group
+from .nxs_writer import (
+    CYCLING_PROTOCOL_FIELDS,
+    NXSWriter,
+    get_profile,
+    write_standard_echem_group,
+)
 from .nxs_reader import is_canonical_nxs, load, read_correlation_method, read_data_source
 from .pipeline import (
     FileProcessor,
@@ -83,8 +88,8 @@ __all__ = [
     # Correlation
     'EchemParser', 'ScanProcessor', 'format_relative_time', 'parse_relative_time',
     # NeXus I/O
-    'NXSWriter', 'get_profile', 'write_standard_echem_group', 'is_canonical_nxs',
-    'load', 'read_correlation_method', 'read_data_source',
+    'CYCLING_PROTOCOL_FIELDS', 'NXSWriter', 'get_profile', 'write_standard_echem_group',
+    'is_canonical_nxs', 'load', 'read_correlation_method', 'read_data_source',
     # Pipeline
     'FileProcessor', 'cache_dir', 'check_scans', 'convert_tabular_to_txt',
     'default_cache_path', 'generate', 'process_raw',

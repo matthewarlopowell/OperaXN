@@ -987,14 +987,19 @@ def test_unit_lines_name_the_users_csv_not_its_converted_copy(tmp_path, caplog):
 @pytest.mark.parametrize("name,line", [
     ("gone.txt", "Standard electrochemistry file gone.txt not found; skipped"),
     ("notes.txt", "No electrochemistry data found in notes.txt; not stored"),
+    ("volts.txt", "No electrochemistry data found in volts.txt; not stored"),
+    ("sweep.txt", "Skipping sweep.txt: echem time/voltage column could not be resolved"),
     ("gone.csv", None), ("broken.xlsx", None),  # named by their conversion error
     ("empty_log.txt", "No electrochemistry data found in empty_log.txt; not stored"),
-], ids=["gone.txt", "notes.txt", "gone.csv", "broken.xlsx", "empty_log.txt"])
+], ids=["gone.txt", "notes.txt", "volts.txt", "sweep.txt", "gone.csv", "broken.xlsx",
+        "empty_log.txt"])
 def test_skipped_standard_echem_files_are_named(tmp_path, caplog, name, line):
     """A chosen echem file that cannot be used (missing, empty, unconverted) is named once."""
     src = str(tmp_path / "inhouse")
     _builders.write_inhouse_dir(src)
     (tmp_path / "notes.txt").write_text("Time\tVoltage\tCurrent\n")
+    (tmp_path / "volts.txt").write_text("Time\tVoltage(kV)\tCurrent(mA)\n")
+    (tmp_path / "sweep.txt").write_text("Voltage\tCurrent\tTemp\n3.7\t0.1\t25\n")
     (tmp_path / "broken.xlsx").write_bytes(b"not a workbook")
     standard = [str(tmp_path / name)]
     if name == "empty_log.txt":  # an operando file with no row
@@ -1005,8 +1010,7 @@ def test_skipped_standard_echem_files_are_named(tmp_path, caplog, name, line):
         ok, msgs = core.generate([src], str(tmp_path / "std.nxs"), core.DataSourceType.INHOUSE,
                                  standard_echem_files=standard)
     assert ok, msgs
-    # notes.txt's unitless 'Current' also gets its unit warning
-    assert len(named_records(caplog, name)) == (2 if name == "notes.txt" else 1), caplog.messages
+    assert len(named_records(caplog, name)) == 1, caplog.messages
     assert line is None or line in caplog.messages, caplog.messages  # the decided lines
 
 
@@ -1090,6 +1094,29 @@ def test_xlsx_conversion_leaves_no_temp_files(tmp_path):
 # ============================================================================
 # Input files
 # ============================================================================
+
+_LAB, _RELATIVE = core.DataSourceType.INHOUSE, core.TimeMethod.RELATIVE
+
+
+@pytest.mark.parametrize("paths, out, std, source, method", [
+    ("lab", "out.nxs", "std.txt", _LAB, _RELATIVE),
+    (["lab"], "out.nxs", ["std.txt"], "inhouse", "relative"),
+    (Path("lab"), Path("out.nxs"), [Path("std.txt")], _LAB, _RELATIVE),
+], ids=["lone-str", "enum-values", "pathlib"])
+def test_entry_points_take_a_lone_path_and_enum_values(tmp_path, monkeypatch, paths, out, std,
+                                                       source, method):
+    """A lone str or Path is read as a list of one, Path objects as str, enum values as enums."""
+    _builders.write_inhouse_dir(str(tmp_path / "lab"))
+    _builders.write_echem_txt(str(tmp_path / "std.txt"))
+    monkeypatch.chdir(tmp_path)  # "lab" has no separator: read per character it finds nothing
+    scans, _ = core.process_raw(paths, source, time_method=method)
+    assert scans[0].echem == 3.70, "scan 1 in relative mode (3.76 in absolute)"
+    ok, msgs = core.generate(paths, out, source, time_method=method, standard_echem_files=std)
+    assert ok, msgs
+    assert core.load(out).scans[0].echem == 3.70
+    with h5py.File(out) as f:
+        assert "file_001" in f["entry/standard_electrochemistry"]
+
 
 def test_text_file_that_is_neither_echem_nor_logbook_is_named(tmp_path, caplog):
     """A headerless temperature log is named once; no warning names the echem or the logbook."""
