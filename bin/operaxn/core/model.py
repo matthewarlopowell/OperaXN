@@ -6,6 +6,7 @@ results); `ScanData` carries the loaded data arrays. `source_nxs` on a Scan
 feeds the NeXus writer's global metadata.
 """
 
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -51,6 +52,21 @@ class TimeMethod(Enum):
     RELATIVE = "relative"
 
 
+class Cancelled(BaseException):
+    """Raised at the next file or scan once a run's cancel event is set. A BaseException, as
+    asyncio.CancelledError is, so the per-file `except Exception` handlers let it through."""
+
+
+def check_cancelled(cancel: Optional[threading.Event]) -> None:
+    """Raise Cancelled if cancel is set (None never is)."""
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+
+
+class InputError(ValueError):
+    """A selection the chosen data source cannot be read as; reported without a traceback."""
+
+
 @dataclass
 class FileRecord:
     """Single collected file with its classification and extracted metadata."""
@@ -60,7 +76,6 @@ class FileRecord:
     twod: Optional[str] = None
     echem: Optional[str] = None
     neutron_meta: Optional[str] = None
-    neutron_files: Optional[Dict[str, Dict[str, str]]] = None
     timestamp: Optional[str] = None
     exposure_time: Optional[float] = None
     source_nxs: Optional[str] = None
@@ -132,4 +147,3 @@ class ExperimentModel:
     standard_echem: List[Dict[str, Any]] = field(default_factory=list)
     global_metadata: Dict[str, Any] = field(default_factory=dict)
     data_source: Optional[str] = None
-    source_path: Optional[str] = None                # the .nxs this came from

@@ -2,7 +2,7 @@
 ICI (intermittent current interruption) analysis window and the analysis windows' shared helpers.
 
 Pulse detection and regression follow the pyICI conventions
-(https://github.com/joe-arroyo/pyICI): a pulse is an active period
+(https://github.com/Joe-Arroyo/pyICI): a pulse is an active period
 (current != 0) followed by a rest (current == 0) no longer than max_rest;
 for each pulse a linear fit of ΔV against √Δt over a configurable time
 window yields R = -intercept/I and k = -slope/I, with errors propagated
@@ -11,11 +11,13 @@ from the fit covariance. Ported from the OperaXN-ICI fork (Joe Arroyo).
 
 from __future__ import annotations
 
+import logging
 import os
 import tkinter as tk
+import traceback
 from tkinter import filedialog, messagebox
 from types import SimpleNamespace
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,12 +25,14 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 
-from .capacity import assign_cycles, compute_capacity
 from .config import (
-    CSV_ENCODING, FIGURE_DPI, OPERAXNTheme, SECONDS_PER_HOUR, TIME_HOURS_LABEL,
+    CSV_ENCODING, FIGURE_DPI, MASS_REPLOT_DELAY_MS, OPERAXNTheme, SECONDS_PER_HOUR,
+    TIME_HOURS_LABEL,
 )
 
-# Theme shorthands, also imported by heatmap.py
+logger = logging.getLogger(__name__)
+
+# Theme shorthands, also imported by capacity.py and heatmap.py
 _C = OPERAXNTheme.COLORS
 BG = _C['bg_primary']
 BG2 = _C['bg_secondary']
@@ -54,10 +58,56 @@ _FONT = OPERAXNTheme.FONTS['small']
 _FONT_BTN = OPERAXNTheme.FONTS['button']
 _PAD_S = OPERAXNTheme.PADDING['small']
 
+# ICI figure labels (units in square brackets, as in every figure; widget text keeps parentheses)
+_VOLTAGE_LABEL = 'Voltage [V]'
+_SQRT_DT_LABEL = '√Δt [s¹ᐟ²]'
+_DELTA_V_LABEL = 'ΔV [V]'
+_R_LABEL = 'R [Ω]'
+_K_LABEL = 'k [Ω·s⁻¹ᐟ²]'
+
+# Default regression window (start_s, length_s)
+_R1_DEFAULT = (0.5, 1.0)
+# A line through two points fits exactly (R² 1, zero error bars)
+_MIN_FIT_POINTS = 3
+
+# Columns of <stem>_ici_charge.csv and _discharge.csv, one row per fitted pulse
+ICI_CSV_COLUMNS = ('Cycle', 'Pulse', 'Voltage (V)', 'Capacity (mAh)', 'Specific Capacity (mAh/g)',
+                   'R (Ohm)', 'R Error (Ohm)', 'k (Ohm s^-1/2)', 'k Error (Ohm s^-1/2)', 'R2',
+                   'Window Start (s)', 'Window Length (s)')
+
 
 # ============================================================================
 # Window Helpers
 # ============================================================================
+
+def trace_write(owner: tk.Misc, var: tk.Variable, callback) -> None:
+    """Call callback on every write to var until owner is destroyed; a live trace keeps owner."""
+    name = var.trace_add('write', callback)
+
+    def _remove(event) -> None:
+        if event.widget is owner:
+            try:
+                var.trace_remove('write', name)
+            except tk.TclError:
+                pass
+
+    owner.bind('<Destroy>', _remove, add='+')
+
+
+def entered_mass_mg(var: tk.Variable) -> float:
+    """Return a mass entry's value in mg, 0.0 unless it is a finite positive number."""
+    try:
+        value = float(var.get())
+    except (ValueError, tk.TclError):
+        return 0.0
+    return value if np.isfinite(value) and value > 0 else 0.0
+
+
+def show_mass_in_use(var: tk.Variable) -> None:
+    """Put '0' (no mass) in a mass box whose text is not a finite positive number."""
+    if entered_mass_mg(var) == 0.0 and var.get() != '0':
+        var.set('0')
+
 
 def maximise_window(win: tk.Toplevel) -> None:
     """Maximise a toplevel, with fallbacks per window manager."""
@@ -76,7 +126,11 @@ def maximise_window(win: tk.Toplevel) -> None:
 # Data Helpers
 # ============================================================================
 
-def _detect_pulses(phase_df: pd.DataFrame, max_rest: float = 1800.0) -> list[dict]:
+# Default Max rest (s): a longer rest (after a CV step, between steps) ends no pulse
+DEFAULT_MAX_REST_S = 300.0
+
+
+def _detect_pulses(phase_df: pd.DataFrame, max_rest: float = DEFAULT_MAX_REST_S) -> List[dict]:
     """Detect pulses: an active run (current != 0) followed by a rest (current == 0).
     Valid only if 0 < rest duration <= max_rest (s), which excludes the CV step and
     inter-cycle rests."""
@@ -131,10 +185,11 @@ def _detect_pulses(phase_df: pd.DataFrame, max_rest: float = 1800.0) -> list[dic
 
 
 def _compute_fit(seg: pd.DataFrame, pulse: dict, r1_start: float, r1_length: float,
-                 cap_arr: np.ndarray | None = None) -> dict | None:
-    """Fit ΔV against √Δt over one pulse's rest window; None when it cannot be fitted.
-    The window is r1_start <= Δt < r1_start + r1_length (s). cap_arr is seg's cumulative
-    capacity (mAh, row-aligned); V0's capacity is taken by position, as voltage can repeat."""
+                 cap_arr: Optional[np.ndarray] = None) -> Optional[dict]:
+    """Fit ΔV against √Δt over one pulse's rest window; None below _MIN_FIT_POINTS points.
+    The window is r1_start <= Δt < r1_start + r1_length (s), each edge snapped to the nearest
+    rest sample. cap_arr is seg's cumulative capacity (mAh, row-aligned); V0's capacity is
+    taken by position, as voltage can repeat."""
     active = seg[pulse['pulse_mask']]
     rest = seg[pulse['relax_mask']]
     if active.empty or rest.empty:
@@ -153,12 +208,17 @@ def _compute_fit(seg: pd.DataFrame, pulse: dict, r1_start: float, r1_length: flo
     elapsed = rest['t_s'].values - rest['t_s'].values[0]
     sqrt_dt = np.sqrt(np.maximum(elapsed, 0.0))
 
-    win_mask = (elapsed >= r1_start) & (elapsed < r1_start + r1_length)
-    if win_mask.sum() < 2:
+    # Edges sit on samples for regular logging: snapped, timestamp noise cannot move one in or out
+    r1_end = r1_start + r1_length
+    midpoints = (elapsed[:-1] + elapsed[1:]) / 2
+    first, stop = np.searchsorted(midpoints, (r1_start, r1_end), side='right')
+    if r1_end > elapsed[-1]:
+        stop = len(elapsed)
+    if stop - first < _MIN_FIT_POINTS:
         return None
 
-    X = sqrt_dt[win_mask]
-    y = delta_V[win_mask]
+    X = sqrt_dt[first:stop]
+    y = delta_V[first:stop]
 
     X_mean, y_mean = np.mean(X), np.mean(y)
     dX = X - X_mean
@@ -174,7 +234,7 @@ def _compute_fit(seg: pd.DataFrame, pulse: dict, r1_start: float, r1_length: flo
     r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else np.nan
 
     n_pts = len(X)
-    s2 = ss_res / max(n_pts - 2, 1)
+    s2 = ss_res / (n_pts - 2)
     var_slope = s2 / denom
     var_intercept = s2 * (1.0 / n_pts + X_mean ** 2 / denom)
 
@@ -192,9 +252,11 @@ def _compute_fit(seg: pd.DataFrame, pulse: dict, r1_start: float, r1_length: flo
     )
 
 
-def _compute_all_pulses(seg: pd.DataFrame, pulses: list[dict], get_r1) -> list[dict]:
+def _compute_all_pulses(seg: pd.DataFrame, pulses: List[dict], get_r1) -> List[dict]:
     """Fit every pulse in seg; get_r1(1-based pulse_idx) -> (r1_start_s, r1_length_s)."""
-    cap_arr = compute_capacity(seg) if not seg.empty else np.array([])
+    # Imported here: capacity.py builds its window from this module's widgets
+    from .capacity import compute_capacity
+    cap_arr = compute_capacity(seg)
     results = []
     for i, p in enumerate(pulses):
         r1_start, r1_length = get_r1(i + 1)
@@ -316,8 +378,6 @@ def echem_source_button(master, var, values, command=None,
                         on_add=None) -> tk.Menubutton:
     """Build a compact themed menu button for choosing an echem dataset.
     Shared by the ICI and Capacity windows; button.set_values(names) refreshes the menu."""
-    values = list(values)
-
     def display_text(value) -> str:
         value = str(value)
         short = value if len(value) <= 16 else f'{value[:13]}...'
@@ -350,7 +410,7 @@ def echem_source_button(master, var, values, command=None,
 
     set_values(values)
     button.config(menu=source_menu)
-    var.trace_add('write', lambda *_: display_var.set(display_text(var.get())))
+    trace_write(button, var, lambda *_: display_var.set(display_text(var.get())))
     button.set_values = set_values
     return button
 
@@ -359,24 +419,33 @@ def echem_source_button(master, var, values, command=None,
 # Selector Strip (Cycle | Pulse | Phase | Scope)
 # ============================================================================
 
+def _int_value(var: tk.IntVar) -> Optional[int]:
+    """Return an IntVar's value, or None while its text is not a number (mid-edit)."""
+    try:
+        return var.get()
+    except (tk.TclError, OverflowError):
+        return None
+
+
 class _SelectorStrip(tk.Frame):
     """Navigation strip: echem source, cycle/pulse spinboxes, phase and R² scope toggles."""
 
     def __init__(self, master, on_change, source_names=None,
-                 on_source_change=None, on_add_source=None):
+                 on_source_change=None, on_add_source=None) -> None:
         super().__init__(master, bg=BG2)
         self._on_change = on_change
         self._source_names = list(source_names or [])
         self._on_source_change = on_source_change
         self._on_add_source = on_add_source
+        self._last_read = {'cycle': 1, 'pulse': 1}  # the last numbers the boxes held
         self._build()
 
-    def _build(self):
+    def _build(self) -> None:
         """Create the selector widgets."""
         row = tk.Frame(self, bg=BG2)
         row.pack(fill='x', padx=1, pady=4)
 
-        # Echem source (only when there is a choice to make)
+        # Echem source menu (when the window has sources)
         if self._source_names and self._on_source_change is not None:
             source_frame = tk.Frame(row, bg=BG2)
             source_frame.pack(side='left', padx=(1, 2))
@@ -397,12 +466,13 @@ class _SelectorStrip(tk.Frame):
         self.cycle_var = tk.IntVar(value=1)
         _Btn(cycle_frame, '◀', width=1, padx=2,
              command=self._prev_cycle).pack(side='left', padx=1)
-        self._cycle_spin = _spinbox(cycle_frame, self.cycle_var, from_=1, to=999, width=4,
-                                    command=self._on_change)
+        # No command=: the trace also fires on the arrows, so a click redraws once
+        self._cycle_spin = _spinbox(cycle_frame, self.cycle_var, from_=1, to=999, width=4)
         self._cycle_spin.pack(side='left', padx=2)
         _Btn(cycle_frame, '▶', width=1, padx=2,
              command=self._next_cycle).pack(side='left', padx=1)
-        self.cycle_var.trace_add('write', lambda *_: self._on_change())
+        trace_write(self, self.cycle_var, lambda *_: self._box_changed())
+        self._cycle_spin.bind('<FocusOut>', lambda *_: self._commit_box('cycle'), add='+')
 
         _separator(row, horizontal=False).pack(
             side='left', fill='y', padx=2, pady=3)
@@ -414,12 +484,12 @@ class _SelectorStrip(tk.Frame):
         self.pulse_var = tk.IntVar(value=1)
         _Btn(pulse_frame, '◀', width=1, padx=2,
              command=self._prev_pulse).pack(side='left', padx=1)
-        self._pulse_spin = _spinbox(pulse_frame, self.pulse_var, from_=1, to=999, width=4,
-                                    command=self._on_change)
+        self._pulse_spin = _spinbox(pulse_frame, self.pulse_var, from_=1, to=999, width=4)
         self._pulse_spin.pack(side='left', padx=2)
         _Btn(pulse_frame, '▶', width=1, padx=2,
              command=self._next_pulse).pack(side='left', padx=1)
-        self.pulse_var.trace_add('write', lambda *_: self._on_change())
+        trace_write(self, self.pulse_var, lambda *_: self._box_changed())
+        self._pulse_spin.bind('<FocusOut>', lambda *_: self._commit_box('pulse'), add='+')
 
         _separator(row, horizontal=False).pack(
             side='left', fill='y', padx=2, pady=3)
@@ -464,36 +534,56 @@ class _SelectorStrip(tk.Frame):
             font=_FONT,
         ).pack(side='left', padx=2)
 
-    def _prev_cycle(self):
+    def _box_changed(self) -> None:
+        """Remember the cycle and pulse the boxes hold as numbers, then refresh."""
+        for key, var in (('cycle', self.cycle_var), ('pulse', self.pulse_var)):
+            value = _int_value(var)
+            if value is not None:
+                self._last_read[key] = value
+        self._on_change()
+
+    def _commit_box(self, key: str) -> None:
+        """On focus-out: text back to the last number read, a cycle past its range to its end."""
+        var = self.cycle_var if key == 'cycle' else self.pulse_var
+        value = _int_value(var)
+        if value is None:
+            var.set(self._last_read[key])
+        elif key == 'cycle':
+            top = int(self._cycle_spin.cget('to'))
+            if not 1 <= value <= top:
+                var.set(min(max(value, 1), top))
+
+    def _prev_cycle(self) -> None:
         """Step to the previous cycle."""
-        value = self.cycle_var.get()
-        if value > 1:
+        value = _int_value(self.cycle_var)
+        if value is not None and value > 1:
             self.cycle_var.set(value - 1)
 
-    def _next_cycle(self):
+    def _next_cycle(self) -> None:
         """Step to the next cycle."""
-        value = self.cycle_var.get()
-        if value < int(self._cycle_spin.cget('to')):
+        value = _int_value(self.cycle_var)
+        if value is not None and value < int(self._cycle_spin.cget('to')):
             self.cycle_var.set(value + 1)
 
-    def _prev_pulse(self):
+    def _prev_pulse(self) -> None:
         """Step to the previous pulse."""
-        value = self.pulse_var.get()
-        if value > 1:
+        value = _int_value(self.pulse_var)
+        if value is not None and value > 1:
             self.pulse_var.set(value - 1)
 
-    def _next_pulse(self):
+    def _next_pulse(self) -> None:
         """Step to the next pulse."""
-        value = self.pulse_var.get()
-        if value < int(self._pulse_spin.cget('to')):
+        value = _int_value(self.pulse_var)
+        if value is not None and value < int(self._pulse_spin.cget('to')):
             self.pulse_var.set(value + 1)
 
     def set_pulse_range(self, max_pulse: int) -> None:
         """Bound the pulse spinbox to the pulses in the current selection."""
         clamped = max(1, max_pulse)
         self._pulse_spin.config(to=clamped)
-        if self.pulse_var.get() > clamped:
-            self.pulse_var.set(clamped)
+        value = _int_value(self.pulse_var)
+        if value is not None and not 1 <= value <= clamped:
+            self.pulse_var.set(min(max(value, 1), clamped))
 
     def set_cycle_range(self, max_cycle: int) -> None:
         """Bound the cycle spinbox to the loaded data's cycles and reset it to cycle 1."""
@@ -503,19 +593,20 @@ class _SelectorStrip(tk.Frame):
     def set_sources(self, source_names) -> None:
         """Refresh the echem menu after files are appended to the session."""
         self._source_names = list(source_names)
-        if hasattr(self, 'source_button'):
-            self.source_button.set_values(self._source_names)
+        if not hasattr(self, 'source_button'):
+            return  # built without sources: there is no menu to refresh
+        self.source_button.set_values(self._source_names)
         if self._source_names and self.source_var.get() not in self._source_names:
             self.source_var.set(self._source_names[0])
 
-    def _set_phase(self, phase):
+    def _set_phase(self, phase: str) -> None:
         """Switch the phase toggle and refresh."""
         self.phase_var.set(phase)
         self._btn_chg.set_selected(phase == 'charge')
         self._btn_dis.set_selected(phase == 'discharge')
         self._on_change()
 
-    def _set_scope(self, scope):
+    def _set_scope(self, scope: str) -> None:
         """Switch the R² scope toggle and refresh."""
         self.scope_var.set(scope)
         for value, btn in self._scope_btns.items():
@@ -531,47 +622,69 @@ class _RegressionBar(tk.Frame):
     """Bottom bar: regression window, pulse-detection max rest and CSV export.
     Edits apply live, the window to the selected pulse; Apply All sets it on every pulse."""
 
-    def __init__(self, master, on_change, on_apply_all, on_export):
+    def __init__(self, master, on_change, on_apply_all, on_export, on_max_rest_change,
+                 on_focus_out) -> None:
         super().__init__(master, bg=BG2)
         self._on_change = on_change
         self._on_apply_all = on_apply_all
         self._on_export = on_export
+        self._on_max_rest_change = on_max_rest_change
+        self._on_focus_out = on_focus_out
+        self._showing = False
         self._build()
 
-    def _build(self):
+    def set_window(self, start: float, length: float) -> None:
+        """Show a regression window without reporting it as an edit."""
+        self._showing = True
+        try:
+            self.start_var.set(start)
+            self.length_var.set(length)
+        finally:
+            self._showing = False
+
+    def _window_edited(self) -> None:
+        """Report a Start or Length edit made by the user."""
+        if not self._showing:
+            self._on_change()
+
+    def _build(self) -> None:
         """Create the regression bar widgets."""
         row = tk.Frame(self, bg=BG2)
         row.pack(fill='x', padx=2, pady=4)
 
         _label(row, 'Regression:').pack(side='left', padx=(2, _PAD_S))
         _label(row, 'Start (s):', dim=True).pack(side='left')
-        self.start_var = tk.DoubleVar(value=0.5)
-        _spinbox(row, self.start_var, from_=0.0, to=9999.0,
-                 increment=0.1, format='%.2f', width=5).pack(
-            side='left', padx=(2, _PAD_S))
+        self.start_var = tk.DoubleVar(value=_R1_DEFAULT[0])
+        start_spin = _spinbox(row, self.start_var, from_=0.0, to=9999.0,
+                              increment=0.1, format='%.2f', width=5)
+        start_spin.pack(side='left', padx=(2, _PAD_S))
         _label(row, 'Length (s):', dim=True).pack(side='left')
-        self.length_var = tk.DoubleVar(value=1.0)
-        _spinbox(row, self.length_var, from_=0.1, to=9999.0,
-                 increment=0.1, format='%.2f', width=5).pack(
-            side='left', padx=(2, _PAD_S))
+        self.length_var = tk.DoubleVar(value=_R1_DEFAULT[1])
+        length_spin = _spinbox(row, self.length_var, from_=0.1, to=9999.0,
+                               increment=0.1, format='%.2f', width=5)
+        length_spin.pack(side='left', padx=(2, _PAD_S))
 
         _label(row, 'Max rest (s):', dim=True).pack(side='left')
-        self.max_rest_var = tk.DoubleVar(value=300.0)
-        _spinbox(row, self.max_rest_var, from_=1.0, to=99999.0,
-                 increment=10.0, format='%.0f', width=6).pack(
-            side='left', padx=(2, _PAD_S))
+        self.max_rest_var = tk.DoubleVar(value=DEFAULT_MAX_REST_S)
+        max_rest_spin = _spinbox(row, self.max_rest_var, from_=1.0, to=99999.0,
+                                 increment=10.0, format='%.0f', width=6)
+        max_rest_spin.pack(side='left', padx=(2, _PAD_S))
 
-        # Any edit (arrows or typing) applies live to the selected pulse
-        for var in (self.start_var, self.length_var, self.max_rest_var):
-            var.trace_add('write', lambda *_: self._on_change())
+        # Arrows or typing apply live: Start/Length to the selected pulse, Max rest everywhere
+        for var in (self.start_var, self.length_var):
+            trace_write(self, var, lambda *_: self._window_edited())
+        trace_write(self, self.max_rest_var, lambda *_: self._on_max_rest_change())
+        # Leaving a box that holds unusable text shows what is in use
+        for spin in (start_spin, length_spin):
+            spin.bind('<FocusOut>', lambda *_: self._on_focus_out('window'), add='+')
+        max_rest_spin.bind('<FocusOut>', lambda *_: self._on_focus_out('max_rest'), add='+')
 
         _Btn(row, 'Apply All', style='primary',
              command=self._on_apply_all).pack(side='left', padx=2)
 
         _separator(row, horizontal=False).pack(
             side='left', fill='y', padx=_PAD_S, pady=3)
-        _Btn(row, 'Export CSV', style='secondary',
-             command=self._on_export).pack(side='left', padx=2)
+        _Btn(row, 'Export CSV', command=self._on_export).pack(side='left', padx=2)
 
 
 # ============================================================================
@@ -581,25 +694,27 @@ class _RegressionBar(tk.Frame):
 class _RKAxisBar(tk.Frame):
     """Header strip above the R/k panel: sample mass and x-axis selection."""
 
-    def __init__(self, master, on_change):
+    def __init__(self, master, on_change, on_mass_change) -> None:
         super().__init__(master, bg=BG2)
         self._on_change = on_change
+        self._on_mass_change = on_mass_change
         self._build()
 
-    def _build(self):
+    def _build(self) -> None:
         """Create the mass entry and x-axis toggle buttons."""
         row = tk.Frame(self, bg=BG2)
         row.pack(fill='x', padx=2, pady=4)
 
+        # Wired like Capacity's mass box: edits queue one redraw, Return redraws now
         _label(row, 'Mass (mg):').pack(side='left', padx=(2, 0))
         self.mass_var = tk.StringVar(value='0')
         mass_entry = _spinbox(row, self.mass_var, from_=0.0, to=99999.0,
                               increment=0.1, format='%.2f', width=7,
-                              command=self._on_change)
+                              command=self._on_mass_change)
         mass_entry.pack(side='left', padx=(2, _PAD_S))
-        mass_entry.bind('<Return>', lambda *_: self._on_change())
-        mass_entry.bind('<FocusOut>', lambda *_: self._on_change())
-        self.mass_var.trace_add('write', lambda *_: self._on_change())
+        mass_entry.bind('<Return>', lambda *_: self._commit_mass(self._on_change))
+        mass_entry.bind('<FocusOut>', lambda *_: self._commit_mass(self._on_mass_change))
+        trace_write(self, self.mass_var, lambda *_: self._on_mass_change())
 
         _separator(row, horizontal=False).pack(
             side='left', fill='y', padx=_PAD_S, pady=3)
@@ -615,7 +730,12 @@ class _RKAxisBar(tk.Frame):
             btn.pack(side='left', padx=2)
             self._btns[value] = btn
 
-    def _set_xaxis(self, value):
+    def _commit_mass(self, redraw) -> None:
+        """Show the mass in use in the box ('0' when its text is no mass), then redraw."""
+        show_mass_in_use(self.mass_var)
+        redraw()
+
+    def _set_xaxis(self, value: str) -> None:
         """Switch the R/k x-axis toggle and refresh."""
         self.xaxis_var.set(value)
         for val, btn in self._btns.items():
@@ -672,14 +792,11 @@ def embed_figure(fig, parent) -> FigureCanvasTkAgg:
     # Every resize on a scaled display can re-run matplotlib's device-pixel-
     # ratio race (see sync_figure_to_widget), not just the opening layout
     # the windows' startup watchdogs cover. Reconcile after each resize
-    # settles; the sync is a no-op when figure and widget already agree.
+    # settles, forced: the sizes can agree while the photo buffer is stale.
     def _sync_after_resize(_event=None):
         job = getattr(canvas, '_operaxn_sync_job', None)
         if job is not None:
-            try:
-                parent.after_cancel(job)
-            except tk.TclError:
-                pass
+            parent.after_cancel(job)
 
         def run():
             canvas._operaxn_sync_job = None
@@ -687,7 +804,14 @@ def embed_figure(fig, parent) -> FigureCanvasTkAgg:
 
         canvas._operaxn_sync_job = parent.after(180, run)
 
+    # A sync still pending when the frame goes would fire into its deleted callback
+    def _cancel_sync(event):
+        job = getattr(canvas, '_operaxn_sync_job', None)
+        if event.widget is parent and job is not None:
+            parent.after_cancel(job)
+
     parent.bind('<Configure>', _sync_after_resize, add='+')
+    parent.bind('<Destroy>', _cancel_sync, add='+')
     return canvas
 
 
@@ -706,7 +830,7 @@ def sync_figure_to_widget(canvas: FigureCanvasTkAgg, force: bool = False) -> Non
     height = parent.winfo_height()
     if toolbar is not None:
         height -= toolbar.winfo_height()
-    # the canvas widget (no border of its own) sits inside the frame's 2px
+    # The canvas widget (no border of its own) sits inside the frame's 2px
     # highlight on each side: its actual size is parent - 4 in each dimension
     width = max(1, width - 4)
     height = max(1, height - 4)
@@ -725,18 +849,22 @@ def watch_figure_sync(win, canvases):
     """Re-fit each canvas to its widget 150 ms after opening, then every 200 ms, 12 times in all.
     Layout and the DPI adjustment settle in no fixed order, so a one-shot timer can miss."""
     attempts = 0
+    job = None
 
     def watchdog():
-        nonlocal attempts
-        if not win.winfo_exists():
-            return
+        nonlocal attempts, job
         for canvas in canvases:
             sync_figure_to_widget(canvas)
         attempts += 1
-        if attempts < 12:
-            win.after(200, watchdog)
+        job = win.after(200, watchdog) if attempts < 12 else None
 
-    win.after(150, watchdog)
+    # Closing the window cancels the next run, which would fire into its deleted callback
+    def cancel(event):
+        if event.widget is win and job is not None:
+            win.after_cancel(job)
+
+    job = win.after(150, watchdog)
+    win.bind('<Destroy>', cancel, add='+')
 
 
 # ============================================================================
@@ -744,43 +872,43 @@ def watch_figure_sync(win, canvases):
 # ============================================================================
 
 class ICIWindow(tk.Toplevel):
-    """ICI analysis window; opens maximised.
-    Takes one echem_df, or echem_sources {name: df} to choose between datasets."""
+    """ICI analysis window over echem_sources {name: df}; opens maximised.
+    CSVs are <export_stem>_ici_charge.csv and <export_stem>_ici_discharge.csv."""
 
-    def __init__(self, parent: tk.Widget,
-                 echem_df: Optional[pd.DataFrame] = None,
-                 echem_sources: Optional[dict] = None,
-                 on_add_source=None) -> None:
+    def __init__(self, parent: tk.Widget, echem_sources: Dict[str, pd.DataFrame],
+                 on_add_source=None, export_stem: str = 'experiment') -> None:
         super().__init__(parent)
         self.title('OperaXN: ICI Analysis')
         self.configure(bg=BG)
         self.minsize(1000, 600)
         maximise_window(self)
 
-        if echem_sources:
-            self._sources = dict(echem_sources)
-        elif echem_df is not None and not echem_df.empty:
-            self._sources = {'Operando echem': echem_df}
-        else:
-            self._sources = {}
-
+        self._sources = dict(echem_sources)
+        self._source_name = next(iter(self._sources), None)
         self._df: Optional[pd.DataFrame] = None
         self._pulses: dict = {}
         self._ici_cache: dict = {}
         self._ax_pulse_twin = None
         self._updating = False
+        self._focus_job = None
         self._source_change_job = None
         self._reg_change_job = None
-        self._last_max_rest = 300.0
+        self._pending_edit = None
+        self._max_rest_job = None
+        self._mass_job = None
+        self._last_max_rest = DEFAULT_MAX_REST_S
         self._on_add_source = on_add_source
+        self._export_stem = export_stem
+        self.bind('<Destroy>', self._cancel_pending, add='+')
 
         # Regression-window overrides, resolved pulse > phase > defaults.
         # Bar edits write the pulse level; Apply All writes the phase level.
-        self._r1_pulse_overrides: dict = {}   # (cycle, phase, pulse_idx) -> (start_s, length_s)
+        # Pulses are keyed by start time: a Max rest edit that renumbers them keeps their windows
+        self._r1_pulse_overrides: dict = {}   # (cycle, phase, start t_s) -> (start_s, length_s)
         self._r1_phase_overrides: dict = {}   # phase                     -> (start_s, length_s)
 
         self._build_ui()
-        self.after_idle(self._focus_primary_panel)
+        self._focus_job = self.after_idle(self._focus_primary_panel)
 
         if self._sources:
             self._load(next(iter(self._sources.values())))
@@ -791,13 +919,15 @@ class ICIWindow(tk.Toplevel):
     # Layout
     # ------------------------------------------------------------------
 
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         """Build the window layout: figures, selector strip, regression bar."""
         # Regression bar, packed from the bottom first
         _separator(self).pack(fill='x', side='bottom')
-        self.reg_bar = _RegressionBar(self, on_change=self._on_regression_change,
+        self.reg_bar = _RegressionBar(self, on_change=self._queue_regression_change,
                                       on_apply_all=self._on_apply_all,
-                                      on_export=self._export_csv)
+                                      on_export=self._export_csv,
+                                      on_max_rest_change=self._queue_max_rest_change,
+                                      on_focus_out=self._show_bar_in_use)
         self.reg_bar.pack(fill='x', side='bottom')
 
         # Content area: left 2/3 | right 1/3. The right panel's width is
@@ -821,7 +951,8 @@ class ICIWindow(tk.Toplevel):
                               highlightbackground=BORDER,
                               highlightthickness=1)
         rk_wrapper.pack(fill='x', padx=_PAD_S, pady=(_PAD_S, 0))
-        self.rk_axis_bar = _RKAxisBar(rk_wrapper, on_change=self._on_rk_axis_changed)
+        self.rk_axis_bar = _RKAxisBar(rk_wrapper, on_change=self._on_rk_axis_change,
+                                      on_mass_change=self._queue_mass_replot)
         self.rk_axis_bar.pack(fill='x')
 
         # Left panel: top figure / selector strip / bottom figure
@@ -849,7 +980,7 @@ class ICIWindow(tk.Toplevel):
         self.selector = _SelectorStrip(strip_wrapper,
                                        on_change=self._on_selection_change,
                                        source_names=list(self._sources),
-                                       on_source_change=self._on_source_change,
+                                       on_source_change=self._queue_source_change,
                                        on_add_source=self._on_add_source)
         self.selector.pack(fill='x')
 
@@ -868,6 +999,8 @@ class ICIWindow(tk.Toplevel):
         self._fig_right = Figure(figsize=(5.0, 10), facecolor=PLOT_BG, dpi=FIGURE_DPI)
         self._build_right_axes()
         self._canvas_right = embed_figure(self._fig_right, right_frame)
+        self._canvas_right.mpl_connect('resize_event', self._fit_right_margins)
+        self._fit_right_margins()
 
         # A third of the screen, or enough for the R/k axis controls
         # (idle tasks first so the axis bar's requested width is computed)
@@ -877,11 +1010,18 @@ class ICIWindow(tk.Toplevel):
 
     def _focus_primary_panel(self) -> None:
         """Focus the overview/pulse panel as the starting plot region."""
-        frame = getattr(self, '_primary_canvas_frame', None)
-        if frame is not None and frame.winfo_exists():
-            frame.focus_set()
+        self._focus_job = None
+        self._primary_canvas_frame.focus_set()
 
-    def _build_top_axes(self):
+    def _cancel_pending(self, event) -> None:
+        """Cancel ICI's queued jobs on close, as their callbacks go with the window."""
+        if event.widget is self:
+            for job in (self._focus_job, self._source_change_job, self._reg_change_job,
+                        self._max_rest_job, self._mass_job):
+                if job is not None:
+                    self.after_cancel(job)
+
+    def _build_top_axes(self) -> None:
         """Create the overview and pulse-zoom axes."""
         gs = GridSpec(1, 2, figure=self._fig_top,
                       wspace=0.35,
@@ -889,10 +1029,10 @@ class ICIWindow(tk.Toplevel):
                       top=0.88, bottom=0.18)
         self.ax_overview = self._fig_top.add_subplot(gs[0, 0])
         self.ax_pulse = self._fig_top.add_subplot(gs[0, 1])
-        _style_ax(self.ax_overview, TIME_HOURS_LABEL, 'Voltage (V)', 'Overview')
-        _style_ax(self.ax_pulse, TIME_HOURS_LABEL, 'Voltage (V)', 'Pulse zoom')
+        _style_ax(self.ax_overview, TIME_HOURS_LABEL, _VOLTAGE_LABEL, 'Overview')
+        _style_ax(self.ax_pulse, TIME_HOURS_LABEL, _VOLTAGE_LABEL, 'Pulse zoom')
 
-    def _build_bot_axes(self):
+    def _build_bot_axes(self) -> None:
         """Create the ICI-fit and R² axes."""
         gs = GridSpec(1, 2, figure=self._fig_bot,
                       wspace=0.35,
@@ -900,34 +1040,69 @@ class ICIWindow(tk.Toplevel):
                       top=0.80, bottom=0.18)
         self.ax_dv = self._fig_bot.add_subplot(gs[0, 0])
         self.ax_r2 = self._fig_bot.add_subplot(gs[0, 1])
-        _style_ax(self.ax_dv, '√Δt (s¹ᐟ²)', 'ΔV (V)', 'ICI fit')
-        _style_ax(self.ax_r2, 'Pulse #', 'R²', 'R² vs Pulse')
+        _style_ax(self.ax_dv, _SQRT_DT_LABEL, _DELTA_V_LABEL, 'ICI fit')
+        _style_ax(self.ax_r2, 'Pulse number', 'R²', 'R² vs pulse')
         _stub(self.ax_dv)
         _stub(self.ax_r2)
 
-    def _build_right_axes(self):
+    def _build_right_axes(self) -> None:
         """Create the four stacked R/k axes."""
-        gs = GridSpec(4, 1, figure=self._fig_right,
-                      hspace=0.40,
-                      left=0.14, right=0.97,
-                      top=0.95, bottom=0.04)
+        gs = GridSpec(4, 1, figure=self._fig_right)
         self.ax_r_chg = self._fig_right.add_subplot(gs[0])
         self.ax_r_dis = self._fig_right.add_subplot(gs[1])
         self.ax_k_chg = self._fig_right.add_subplot(gs[2])
         self.ax_k_dis = self._fig_right.add_subplot(gs[3])
-        _style_ax(self.ax_r_chg, '', 'R (Ω)', 'R – Charge')
-        _style_ax(self.ax_r_dis, '', 'R (Ω)', 'R – Discharge')
-        _style_ax(self.ax_k_chg, '', 'k', 'k – Charge')
-        _style_ax(self.ax_k_dis, 'V (V)', 'k', 'k – Discharge')
-        for ax in (self.ax_r_chg, self.ax_r_dis, self.ax_k_chg, self.ax_k_dis):
+        self._style_right_axes(self._XAXIS_LABELS['voltage'])
+        for ax, _, _ in self._rk_panels():
             _stub(ax, 'No data')
+
+    def _rk_panels(self) -> Tuple[tuple, ...]:
+        """Return the four R/k panels as (axes, y label, title), top to bottom."""
+        return (
+            (self.ax_r_chg, _R_LABEL, 'R  |  Charge'),
+            (self.ax_r_dis, _R_LABEL, 'R  |  Discharge'),
+            (self.ax_k_chg, _K_LABEL, 'k  |  Charge'),
+            (self.ax_k_dis, _K_LABEL, 'k  |  Discharge'),
+        )
+
+    def _style_right_axes(self, xlabel: str) -> None:
+        """Clear and label the four R/k panels; only the lowest carries the x label."""
+        panels = self._rk_panels()
+        for index, (ax, ylabel, title) in enumerate(panels):
+            ax.cla()
+            _style_ax(ax, xlabel if index == len(panels) - 1 else '', ylabel, title)
+
+    def _fit_right_margins(self, _event=None) -> None:
+        """Space the R/k plots with even white bands around the room their labels take."""
+        fig = self._fig_right
+        width, height = max(fig.bbox.width, 1.0), max(fig.bbox.height, 1.0)
+        band = 0.028 * height  # the left figures' white band at the maximised size
+        renderer = fig.canvas.get_renderer()
+        axes = fig.axes
+        boxes = [ax.get_window_extent(renderer) for ax in axes]
+        xaxes = [ax.xaxis.get_tightbbox(renderer) for ax in axes]
+        below = [box.y0 - xaxis.y0 for box, xaxis in zip(boxes, xaxes)]
+        above = [ax.title.get_window_extent(renderer).y1 - box.y1 for ax, box in zip(axes, boxes)]
+        right = max(0.0, *(xaxis.x1 - box.x1 for box, xaxis in zip(boxes, xaxes)))
+        top = 1 - (band + above[0]) / height
+        bottom = (band + below[-1]) / height
+        gap = band + max(b + a for b, a in zip(below, above[1:]))
+        # hspace is in mean axes heights: n - 1 gaps among n rows
+        n = len(axes)
+        fig.subplots_adjust(top=top, bottom=bottom,
+                            hspace=n * gap / max((top - bottom) * height - (n - 1) * gap, 1.0))
+        # Tick labels follow the new plot heights, so measure the y labels' room afterwards
+        left = max(ax.get_window_extent(renderer).x0 - ax.yaxis.get_tightbbox(renderer).x0
+                   for ax in axes)
+        fig.subplots_adjust(left=(band + left) / width, right=1 - (band + right) / width)
 
     # ------------------------------------------------------------------
     # Data Loading
     # ------------------------------------------------------------------
 
-    def _load(self, echem_df: pd.DataFrame):
+    def _load(self, echem_df: pd.DataFrame) -> None:
         """Load echem data, reset caches, and redraw everything."""
+        from .capacity import assign_cycles  # see _compute_all_pulses
         self._updating = True
         try:
             self._df = assign_cycles(echem_df)
@@ -940,9 +1115,10 @@ class ICIWindow(tk.Toplevel):
                 self.selector.cycle_var.get(), self.selector.phase_var.get())))
         finally:
             self._updating = False
+        self._sync_regression_bar()
         self._update_live_plots()
 
-    def _on_source_change(self, name):
+    def _queue_source_change(self, name: str) -> None:
         """Queue a source switch after the dropdown has closed."""
         if name not in self._sources:
             return
@@ -950,23 +1126,25 @@ class ICIWindow(tk.Toplevel):
             self.after_cancel(self._source_change_job)
         self._source_change_job = self.after_idle(self._apply_source_change, name)
 
-    def _apply_source_change(self, name):
+    def _apply_source_change(self, name: str) -> None:
         """Switch datasets once Tk is idle, avoiding menu callback re-entry."""
         self._source_change_job = None
         df = self._sources.get(name)
-        if df is None:
+        if df is None or name == self._source_name:
             return
         self.configure(cursor='watch')
         self.update_idletasks()
         try:
             # Overrides are indexed by pulse/cycle of the previous dataset.
+            self._drop_pending_regression_edit()
             self._r1_pulse_overrides.clear()
             self._r1_phase_overrides.clear()
+            self._source_name = name
             self._load(df)
         finally:
             self.configure(cursor='')
 
-    def refresh_sources(self, sources) -> None:
+    def refresh_sources(self, sources: Dict[str, pd.DataFrame]) -> None:
         """Expose newly appended echem files without rebuilding the window."""
         self._sources = dict(sources)
         self.selector.set_sources(self._sources)
@@ -978,8 +1156,8 @@ class ICIWindow(tk.Toplevel):
         cycles = self._df[self._df['cycle'] > 0]['cycle']
         return int(cycles.max()) if not cycles.empty else 0
 
-    def _get_pulses(self, cycle: int, phase: str) -> list[dict]:
-        """Return the detected pulses for (cycle, phase), cached until a bar edit or reload."""
+    def _get_pulses(self, cycle: int, phase: str) -> List[dict]:
+        """Return the detected pulses for (cycle, phase), cached until a Max rest edit or reload."""
         key = (cycle, phase)
         if key not in self._pulses:
             if self._df is None:
@@ -997,14 +1175,11 @@ class ICIWindow(tk.Toplevel):
     # Plots: Overview and Pulse Zoom
     # ------------------------------------------------------------------
 
-    def _plot_overview(self, cycle, pulse_idx, phase):
+    def _plot_overview(self, cycle: int, pulse_idx: int, phase: str) -> None:
         """Plot voltage against time for the selected cycle, highlighting the pulse."""
         ax = self.ax_overview
         ax.cla()
-        _style_ax(ax, TIME_HOURS_LABEL, 'Voltage (V)', 'Overview')
-        if self._df is None:
-            _stub(ax, 'No data loaded')
-            return
+        _style_ax(ax, TIME_HOURS_LABEL, _VOLTAGE_LABEL, 'Overview')
 
         df = self._df
         t_h = df['t_s'].values / SECONDS_PER_HOUR
@@ -1030,10 +1205,11 @@ class ICIWindow(tk.Toplevel):
             ax.axvspan(t0, t1, alpha=0.25, color=HIGHLIGHT_COLOR, zorder=3)
             ax.axvline(t0, color=HIGHLIGHT_COLOR, lw=1.0, ls='--', zorder=4)
 
-        ax.legend(fontsize=7, loc='best',
-                  labelcolor=PLOT_TEXT, facecolor=PLOT_BG, edgecolor=PLOT_BORDER)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=7, loc='best',
+                      labelcolor=PLOT_TEXT, facecolor=PLOT_BG, edgecolor=PLOT_BORDER)
 
-    def _plot_pulse_zoom(self, cycle, pulse_idx, phase):
+    def _plot_pulse_zoom(self, cycle: int, pulse_idx: int, phase: str) -> None:
         """Plot voltage and current over the selected pulse and its relaxation."""
         if self._ax_pulse_twin is not None:
             self._fig_top.delaxes(self._ax_pulse_twin)
@@ -1041,11 +1217,7 @@ class ICIWindow(tk.Toplevel):
 
         ax = self.ax_pulse
         ax.cla()
-        _style_ax(ax, TIME_HOURS_LABEL, 'Voltage (V)', 'Pulse zoom')
-
-        if self._df is None:
-            _stub(ax, 'No data loaded')
-            return
+        _style_ax(ax, TIME_HOURS_LABEL, _VOLTAGE_LABEL, 'Pulse zoom')
 
         pulses = self._get_pulses(cycle, phase)
         if not pulses:
@@ -1087,7 +1259,7 @@ class ICIWindow(tk.Toplevel):
         ax2 = self._ax_pulse_twin
         ax2.plot(t_h, current, color=CURRENT_COLOR, lw=1.2, ls='--',
                  label='Current', alpha=0.8, zorder=2)
-        ax2.set_ylabel('Current (mA)', color=PLOT_DIM, fontsize=9)
+        ax2.set_ylabel('Current [mA]', color=PLOT_DIM, fontsize=9)
         ax2.tick_params(colors=PLOT_DIM, labelsize=8)
         for spine in ax2.spines.values():
             spine.set_color(PLOT_BORDER)
@@ -1115,16 +1287,22 @@ class ICIWindow(tk.Toplevel):
     # ICI Analysis
     # ------------------------------------------------------------------
 
-    def _get_r1(self, cycle: int = None, phase: str = None, pulse_idx: int = None):
+    def _get_r1(self, cycle: int, phase: str, pulse_idx: int) -> Tuple[float, float]:
         """Return a pulse's regression window (start_s, length_s).
-        Resolves the pulse override, then the phase override, then the default (0.5, 1.0)."""
-        if cycle is not None and phase is not None and pulse_idx is not None:
-            override = self._r1_pulse_overrides.get((cycle, phase, pulse_idx))
-            if override is not None:
-                return override
-        return self._r1_phase_overrides.get(phase, (0.5, 1.0))
+        Resolves the pulse override, then the phase override, then _R1_DEFAULT."""
+        override = self._r1_pulse_overrides.get(self._pulse_key(cycle, phase, pulse_idx))
+        if override is not None:
+            return override
+        return self._r1_phase_overrides.get(phase, _R1_DEFAULT)
 
-    def _compute_ici(self, cycle: int, phase: str) -> list[dict]:
+    def _pulse_key(self, cycle: int, phase: str, pulse_idx: int) -> Optional[tuple]:
+        """Return pulse_idx's override key (cycle, phase, start t_s), or None if there is none."""
+        pulses = self._get_pulses(cycle, phase)
+        if not 1 <= pulse_idx <= len(pulses):
+            return None
+        return (cycle, phase, pulses[pulse_idx - 1]['pulse_start_t'])
+
+    def _compute_ici(self, cycle: int, phase: str) -> List[dict]:
         """Return the fit results for (cycle, phase), cached until a bar edit or reload."""
         key = (cycle, phase)
         if key not in self._ici_cache:
@@ -1136,24 +1314,25 @@ class ICIWindow(tk.Toplevel):
                 self._ici_cache[key] = _compute_all_pulses(
                     self._df[mask], pulses,
                     lambda idx: self._get_r1(cycle, phase, idx))
+            logger.debug('ICI cycle %d %s: %d of %d pulses fitted (max rest %g s)', cycle, phase,
+                         len(self._ici_cache[key]), len(pulses), self._last_max_rest)
         return self._ici_cache[key]
 
     # ------------------------------------------------------------------
     # Plots: ICI Fit and R²
     # ------------------------------------------------------------------
 
-    def _plot_ici_fit(self, cycle: int, pulse_idx: int, phase: str):
+    def _plot_ici_fit(self, cycle: int, pulse_idx: int, phase: str) -> None:
         """Plot ΔV against square-root elapsed time with its regression."""
         ax = self.ax_dv
         ax.cla()
-        _style_ax(ax, '√Δt (√s)', 'ΔV (V)', 'ICI fit')
+        _style_ax(ax, _SQRT_DT_LABEL, _DELTA_V_LABEL, 'ICI fit')
 
         results = self._compute_ici(cycle, phase)
         fit = next((r for r in results if r['pulse_idx'] == pulse_idx), None)
 
         if fit is None:
-            _stub(ax, 'Too few rest points in the regression window\n'
-                      '(increase Length and press Apply)')
+            _stub(ax, 'Too few rest points in the regression window\n(increase Length)')
             return
 
         colour = CHARGE_COLOR if phase == 'charge' else DISCHARGE_COLOR
@@ -1161,26 +1340,22 @@ class ICIWindow(tk.Toplevel):
                    color=colour, s=12, alpha=0.7, zorder=3, label='ΔV')
 
         ax.plot(fit['X_fit'], fit['y_fit'],
-                color=CHARGE_COLOR, lw=2, zorder=4,
-                label=f'fit  R²={fit["r2"]:.3f}')
+                color=PLOT_TEXT, lw=2, zorder=4,
+                label=f'Fit  R²={fit["r2"]:.3f}')
 
         ax.legend(fontsize=7, loc='best',
                   labelcolor=PLOT_TEXT, facecolor=PLOT_BG, edgecolor=PLOT_BORDER)
 
         ax.set_title(
-            f'ICI fit  |  C{cycle}  {phase[:3]}  |  Pulse {pulse_idx}  '
+            f'Cycle {cycle}  |  {phase.capitalize()}  |  Pulse {pulse_idx}  '
             f'|  R={fit["R"]:.4f} Ω  k={fit["k"]:.4f} Ω·s⁻¹ᐟ²',
             color=PLOT_TEXT, fontsize=9, pad=4)
 
-    def _plot_r2_panel(self, cycle: int, pulse_idx: int, phase: str, scope: str):
+    def _plot_r2_panel(self, cycle: int, pulse_idx: int, phase: str, scope: str) -> None:
         """Plot R² of every fit in the selected scope, starring the current pulse."""
         ax = self.ax_r2
         ax.cla()
-        _style_ax(ax, 'Pulse #', 'R²', 'R² vs Pulse')
-
-        if self._df is None:
-            _stub(ax, 'No data')
-            return
+        _style_ax(ax, 'Pulse number', 'R²', 'R² vs pulse')
 
         datasets = []
         if scope == 'phase':
@@ -1188,12 +1363,14 @@ class ICIWindow(tk.Toplevel):
             datasets.append((self._compute_ici(cycle, phase), phase.capitalize(), colour, 0.85))
         elif scope == 'cycle':
             datasets.append((self._compute_ici(cycle, 'charge'), 'Charge', CHARGE_COLOR, 0.85))
-            datasets.append((self._compute_ici(cycle, 'discharge'), 'Discharge', DISCHARGE_COLOR, 0.85))
+            datasets.append((self._compute_ici(cycle, 'discharge'), 'Discharge',
+                             DISCHARGE_COLOR, 0.85))
         else:
             for c in range(1, self._max_cycle() + 1):
-                alpha = 1.0 if c == cycle else 0.35   # same shading rule as the R/k panels
+                alpha = 1.0 if c == cycle else 0.35   # the other cycles are dimmed
                 for ph, colour in (('charge', CHARGE_COLOR), ('discharge', DISCHARGE_COLOR)):
-                    datasets.append((self._compute_ici(c, ph), f'C{c} {ph[:3]}', colour, alpha))
+                    datasets.append((self._compute_ici(c, ph), f'{ph.capitalize()} C{c}',
+                                     colour, alpha))
 
         for results, label, colour, alpha in datasets:
             if not results:
@@ -1219,43 +1396,27 @@ class ICIWindow(tk.Toplevel):
     # ------------------------------------------------------------------
 
     _XAXIS_LABELS = {
-        'voltage': 'V (V)',
-        'capacity': 'Capacity (mAh)',
-        'specific_capacity': 'Specific Capacity (mAh/g)',
+        'voltage': _VOLTAGE_LABEL,
+        'capacity': 'Capacity [mAh]',
+        'specific_capacity': 'Specific capacity [mAh/g]',
     }
 
     def _get_mass_mg(self) -> float:
-        """Return the sample mass (mg) from the R/k axis bar, 0.0 when unset or invalid."""
-        try:
-            return float(self.rk_axis_bar.mass_var.get())
-        except (ValueError, tk.TclError):
-            return 0.0
+        """Return the R/k axis bar's sample mass (mg), 0.0 unless a finite positive number."""
+        return entered_mass_mg(self.rk_axis_bar.mass_var)
 
-    def _update_right_plots(self, cycle: int, phase: str, scope: str):
+    def _update_right_plots(self, cycle: int, scope: str) -> None:
         """Redraw the four stacked R/k panels for the selected scope."""
+        from .capacity import specific_capacity  # see _compute_all_pulses
         xaxis = self.rk_axis_bar.xaxis_var.get()
         mass_mg = self._get_mass_mg()
-        xlabel = self._XAXIS_LABELS[xaxis]
-
-        panels = (
-            (self.ax_r_chg, 'R (Ω)', 'R – Charge'),
-            (self.ax_r_dis, 'R (Ω)', 'R – Discharge'),
-            (self.ax_k_chg, 'k (Ω·s⁻¹ᐟ²)', 'k – Charge'),
-            (self.ax_k_dis, 'k (Ω·s⁻¹ᐟ²)', 'k – Discharge'),
-        )
-        for index, (ax, ylabel, title) in enumerate(panels):
-            ax.cla()
-            _style_ax(ax, xlabel if index == len(panels) - 1 else '', ylabel, title)
-
-        if self._df is None:
-            for ax, _, _ in panels:
-                _stub(ax)
-            self._canvas_right.draw_idle()
-            return
+        self._style_right_axes(self._XAXIS_LABELS[xaxis])
+        panels = self._rk_panels()
 
         if xaxis == 'specific_capacity' and mass_mg <= 0:
             for ax, _, _ in panels:
                 _stub(ax, 'Enter mass (mg) > 0')
+            self._fit_right_margins()
             self._canvas_right.draw_idle()
             return
 
@@ -1277,7 +1438,7 @@ class ICIWindow(tk.Toplevel):
                 elif xaxis == 'capacity':
                     xs = np.array([r['capacity'] for r in results])
                 else:
-                    xs = np.array([r['capacity'] for r in results]) / (mass_mg / 1000.0)
+                    xs = specific_capacity([r['capacity'] for r in results], mass_mg)
                 R_values = np.array([r['R'] for r in results])
                 k_values = np.array([r['k'] for r in results])
                 R_errors = np.array([r['R_err'] for r in results])
@@ -1302,76 +1463,103 @@ class ICIWindow(tk.Toplevel):
             else:
                 _stub(ax, 'No data')
 
+        self._fit_right_margins()
         self._canvas_right.draw_idle()
 
     # ------------------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------------------
 
-    def _on_selection_change(self):
+    def _on_selection_change(self) -> None:
         """Handle cycle/pulse/phase/scope changes from the selector strip."""
-        if getattr(self, '_updating', False):
+        if self._updating or _int_value(self.selector.cycle_var) is None:
             return
+        self._store_pending_edit()
         self._updating = True
         try:
             cycle = self.selector.cycle_var.get()
             phase = self.selector.phase_var.get()
             pulses = self._get_pulses(cycle, phase)
             self.selector.set_pulse_range(len(pulses))
+            self._sync_regression_bar()
             self._update_live_plots()
         finally:
             self._updating = False
 
-    def _export_csv(self):
-        """Write ici_charge.csv and ici_discharge.csv covering every cycle."""
-        if self._df is None:
-            return
-        directory = filedialog.askdirectory(title='Select export folder', parent=self)
-        if not directory:
-            return
+    def _sync_regression_bar(self) -> None:
+        """Show the selected pulse's regression window in the bar."""
+        cycle, pulse = _int_value(self.selector.cycle_var), _int_value(self.selector.pulse_var)
+        if cycle is not None and pulse is not None:
+            self.reg_bar.set_window(*self._get_r1(cycle, self.selector.phase_var.get(), pulse))
 
+    def _export_csv(self) -> None:
+        """Write <stem>_ici_charge.csv and <stem>_ici_discharge.csv covering every cycle."""
+        try:
+            self._store_pending_edit()
+            tables = self._export_tables()
+            if not any(len(table) for table in tables.values()):
+                messagebox.showwarning('No data', 'No fitted pulses to export', parent=self)
+                return
+            directory = filedialog.askdirectory(parent=self, title='Export ICI CSV')
+            if not directory:
+                return
+            paths = {phase: os.path.join(directory, f'{self._export_stem}_ici_{phase}.csv')
+                     for phase in tables}
+            existing = [os.path.basename(path) for path in paths.values() if os.path.exists(path)]
+            if existing and not messagebox.askyesno(
+                    'Confirm', f'Replace {" and ".join(existing)}?', parent=self):
+                return
+            # A file Excel holds open fails here, before either file is replaced
+            for path in paths.values():
+                if os.path.exists(path):
+                    open(path, 'ab').close()
+            for phase, table in tables.items():
+                table.to_csv(paths[phase], index=False, encoding=CSV_ENCODING)
+        except Exception as exc:
+            logger.debug('ICI export error: %s', traceback.format_exc())
+            messagebox.showerror('Export failed', f'ICI results could not be exported: {exc}',
+                                 parent=self)
+            return
+        messagebox.showinfo('Export complete',
+                            'ICI results exported to:\n' + '\n'.join(paths.values()), parent=self)
+
+    def _export_tables(self) -> Dict[str, pd.DataFrame]:
+        """Return the charge and discharge fit tables over every cycle (empty without data)."""
+        from .capacity import specific_capacity  # see _compute_all_pulses
         max_cycle = self._max_cycle()
         mass_mg = self._get_mass_mg()
-        columns = ['cycle', 'voltage (V)', 'capacity (mAh)', 'specific_capacity (mAh/g)',
-                   'R (Ohm)', 'R_error (Ohm)',
-                   'k (Ohm.s^-1/2)', 'k_error (Ohm.s^-1/2)', 'R2']
-
+        tables = {}
         for phase in ('charge', 'discharge'):
-            rows = []
-            for cycle in range(1, max_cycle + 1):
-                for r in self._compute_ici(cycle, phase):
-                    rows.append({
-                        'cycle': cycle,
-                        'voltage (V)': r['V0'],
-                        'capacity (mAh)': r['capacity'],
-                        'specific_capacity (mAh/g)': (r['capacity'] / (mass_mg / 1000.0)
-                                                      if mass_mg > 0 else np.nan),
-                        'R (Ohm)': r['R'],
-                        'R_error (Ohm)': r['R_err'],
-                        'k (Ohm.s^-1/2)': r['k'],
-                        'k_error (Ohm.s^-1/2)': r['k_err'],
-                        'R2': r['r2'],
-                    })
-            out = pd.DataFrame(rows, columns=columns)
-            out.to_csv(os.path.join(directory, f'ici_{phase}.csv'), index=False,
-                       encoding=CSV_ENCODING)
+            # A pulse whose fit failed has no row, so its number is missing from Pulse
+            rows = [(cycle, r['pulse_idx'], r['V0'], r['capacity'],
+                     float(specific_capacity(r['capacity'], mass_mg)),
+                     r['R'], r['R_err'], r['k'], r['k_err'], r['r2'],
+                     *self._get_r1(cycle, phase, r['pulse_idx']))
+                    for cycle in range(1, max_cycle + 1)
+                    for r in self._compute_ici(cycle, phase)]
+            tables[phase] = pd.DataFrame(rows, columns=ICI_CSV_COLUMNS)
+        return tables
 
-        messagebox.showinfo(
-            'Export complete',
-            f'Saved ici_charge.csv and ici_discharge.csv to:\n{directory}',
-            parent=self
-        )
-
-    def _on_rk_axis_changed(self, *_):
+    def _on_rk_axis_change(self) -> None:
         """Redraw the right panel when the mass or x-axis selection changes."""
-        if self._df is None:
+        self._cancel_mass_replot()  # this redraw already reads the current mass
+        cycle = _int_value(self.selector.cycle_var)
+        if self._df is None or cycle is None:
             return
-        cycle = self.selector.cycle_var.get()
-        phase = self.selector.phase_var.get()
-        scope = self.selector.scope_var.get()
-        self._update_right_plots(cycle, phase, scope)
+        self._update_right_plots(cycle, self.selector.scope_var.get())
 
-    def _reg_values(self):
+    def _queue_mass_replot(self) -> None:
+        """Redraw the R/k panel shortly after the last mass edit, so typing stays responsive."""
+        self._cancel_mass_replot()
+        self._mass_job = self.after(MASS_REPLOT_DELAY_MS, self._on_rk_axis_change)
+
+    def _cancel_mass_replot(self) -> None:
+        """Drop a queued mass redraw."""
+        if self._mass_job is not None:
+            self.after_cancel(self._mass_job)
+            self._mass_job = None
+
+    def _reg_values(self) -> Optional[Tuple[float, float]]:
         """Return the bar's (start_s, length_s), or None while an edit is invalid."""
         try:
             return (float(self.reg_bar.start_var.get()),
@@ -1379,57 +1567,103 @@ class ICIWindow(tk.Toplevel):
         except (ValueError, tk.TclError):
             return None
 
-    def _on_regression_change(self, *_):
-        """Debounce bar edits; each settles onto the selected pulse."""
-        if self._reg_change_job is not None:
-            self.after_cancel(self._reg_change_job)
-        self._reg_change_job = self.after(250, self._apply_regression_change)
-
-    def _apply_regression_change(self):
-        """Apply the bar's window to the selected pulse, re-detect pulses and refit."""
-        self._reg_change_job = None
-        if self._df is None:
-            return
-        value = self._reg_values()
-        if value is None:
+    def _show_bar_in_use(self, box: str) -> None:
+        """On focus-out, unusable text gives way to what is in use: the selected pulse's window, or
+        the Max rest last read."""
+        if box == 'window':
+            if self._reg_values() is None:
+                self._sync_regression_bar()
             return
         try:
-            cycle = self.selector.cycle_var.get()
-            phase = self.selector.phase_var.get()
-            pulse = self.selector.pulse_var.get()
-        except tk.TclError:
+            float(self.reg_bar.max_rest_var.get())
+        except (ValueError, tk.TclError):
+            self.reg_bar.max_rest_var.set(self._last_max_rest)
+
+    def _queue_regression_change(self) -> None:
+        """Debounce Start/Length edits; each settles onto the pulse selected when it was made."""
+        self._drop_pending_regression_edit()
+        value = self._reg_values()
+        cycle, pulse = _int_value(self.selector.cycle_var), _int_value(self.selector.pulse_var)
+        if value is None or cycle is None or pulse is None:
             return
-        self._r1_pulse_overrides[(cycle, phase, pulse)] = value
-        self._pulses.clear()
+        phase = self.selector.phase_var.get()
+        key = self._pulse_key(cycle, phase, pulse)
+        # Only a changed window is written: an edit back to the one in use sets nothing
+        if key is not None and value != self._get_r1(cycle, phase, pulse):
+            self._pending_edit = (key, value)
+            self._reg_change_job = self.after(250, self._apply_regression_change, key, value)
+
+    def _store_pending_edit(self) -> None:
+        """Store a Start/Length edit still settling on its pulse now; its job still redraws."""
+        if self._reg_change_job is not None:
+            key, value = self._pending_edit
+            self._r1_pulse_overrides[key] = value
+            self._ici_cache.clear()
+
+    def _drop_pending_regression_edit(self) -> None:
+        """Cancel a pending Start/Length edit that a newer change supersedes."""
+        if self._reg_change_job is not None:
+            self.after_cancel(self._reg_change_job)
+            self._reg_change_job = None
+
+    def _apply_regression_change(self, key: tuple, value: Tuple[float, float]) -> None:
+        """Store an edited window as its pulse's override and refit."""
+        self._reg_change_job = None
+        self._r1_pulse_overrides[key] = value
         self._ici_cache.clear()
         self._update_live_plots()
 
-    def _on_apply_all(self):
+    def _queue_max_rest_change(self) -> None:
+        """Debounce Max rest edits; each re-detects the pulses."""
+        if self._max_rest_job is not None:
+            self.after_cancel(self._max_rest_job)
+        self._max_rest_job = self.after(250, self._apply_max_rest_change)
+
+    def _apply_max_rest_change(self) -> None:
+        """Re-detect pulses at the new Max rest; selection and windows stay on their pulses."""
+        self._max_rest_job = None
+        cycle, pulse = _int_value(self.selector.cycle_var), _int_value(self.selector.pulse_var)
+        phase = self.selector.phase_var.get()
+        selected = None if cycle is None or pulse is None else self._pulse_key(cycle, phase, pulse)
+        self._pulses.clear()
+        self._ici_cache.clear()
+        if selected is not None:
+            starts = [p['pulse_start_t'] for p in self._get_pulses(cycle, phase)]
+            if selected[2] in starts:
+                self._updating = True
+                try:
+                    self.selector.pulse_var.set(starts.index(selected[2]) + 1)
+                finally:
+                    self._updating = False
+        # Re-bounds the pulse spinbox, shows the selected pulse's window and redraws
+        self._on_selection_change()
+
+    def _on_apply_all(self) -> None:
         """Apply the bar's window to every pulse, cycle and phase."""
         if self._df is None:
             return
         value = self._reg_values()
         if value is None:
             return
+        self._drop_pending_regression_edit()
         self._r1_pulse_overrides.clear()
         self._r1_phase_overrides['charge'] = value
         self._r1_phase_overrides['discharge'] = value
-        self._pulses.clear()
         self._ici_cache.clear()
         self._update_live_plots()
 
-    def _update_live_plots(self):
+    def _update_live_plots(self) -> None:
         """Redraw all panels for the current selection."""
-        if self._df is None:
+        cycle = _int_value(self.selector.cycle_var)
+        pulse = _int_value(self.selector.pulse_var)
+        if self._df is None or cycle is None or pulse is None:
             return
-        cycle = self.selector.cycle_var.get()
-        pulse = self.selector.pulse_var.get()
         phase = self.selector.phase_var.get()
         scope = self.selector.scope_var.get()
         self._plot_overview(cycle, pulse, phase)
         self._plot_pulse_zoom(cycle, pulse, phase)
-        self._fig_top.canvas.draw_idle()
+        self._canvas_top.draw_idle()
         self._plot_ici_fit(cycle, pulse, phase)
         self._plot_r2_panel(cycle, pulse, phase, scope)
         self._canvas_bot.draw_idle()
-        self._update_right_plots(cycle, phase, scope)
+        self._update_right_plots(cycle, scope)

@@ -1,5 +1,5 @@
 """
-OperaXN entry point: CLI parsing, logging, dependency checks, splash screen and window lifecycle.
+OperaXN entry point: CLI parsing, logging, splash screen and window lifecycle.
 """
 
 import argparse
@@ -10,22 +10,20 @@ import subprocess
 import sys
 import time
 import tkinter as tk
-from pathlib import Path
 from tkinter import messagebox
-from typing import List, Optional, Tuple, Callable
+from typing import Callable, List, Optional, Tuple
 
 from .config import (
-    DEBUG_MODE,
+    APP_COPYRIGHT,
     APP_NAME,
     APP_VERSION as __version__,
-    APP_COPYRIGHT,
-    OPERAXNTheme,
-    LOG_FORMAT,
+    DEBUG_MODE,
     LOG_FILE,
-    log_config_summary
+    LOG_FORMAT,
+    OPERAXNTheme,
+    log_config_summary,
 )
-from .gui import OPERAXN
-from core import format_profile_block, profile_from_mantid_nexus
+from .core import format_profile_block, profile_from_mantid_nexus
 
 # ============================================================================
 # Constants
@@ -35,20 +33,6 @@ SPLASH_DURATION_MS = 2500
 SPLASH_WIDTH = 500
 SPLASH_HEIGHT = 350
 SPLASH_LOGO_CENTER_Y = 76
-
-REQUIRED_DEPENDENCIES = {
-    'numpy': 'NumPy',
-    'pandas': 'Pandas',
-    'matplotlib': 'Matplotlib',
-    'h5py': 'H5py'
-}
-
-OPTIONAL_DEPENDENCIES = {
-    'fabio': 'Fabio (for EDF file support)',
-    'imageio': 'ImageIO (for GIF creation)',
-    'psutil': 'PSutil (for performance monitoring)',
-    'openpyxl': 'OpenPyXL (for Excel export)'
-}
 
 
 # ============================================================================
@@ -66,7 +50,7 @@ def setup_logging(debug: bool = False) -> logging.Logger:
         force=True
     )
 
-    if LOG_FILE and (debug or DEBUG_MODE):
+    if LOG_FILE:
         file_handler = logging.FileHandler(LOG_FILE, mode='w')
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
@@ -74,41 +58,17 @@ def setup_logging(debug: bool = False) -> logging.Logger:
 
     # Application loggers follow the chosen level
     logging.getLogger("operaxn").setLevel(level)
-    logging.getLogger("operaxn.input").setLevel(level)
-    logging.getLogger("operaxn.output").setLevel(level)
-    logging.getLogger("operaxn.gui").setLevel(level)
 
     # Keep third-party debug output quiet
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
-    logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
-    logging.getLogger("matplotlib.ticker").setLevel(logging.WARNING)
     logging.getLogger("PIL").setLevel(logging.WARNING)
+    logging.getLogger("fabio").setLevel(logging.WARNING)
 
     logger = logging.getLogger(__name__)
     logger.debug("Logging configured - Debug mode ENABLED")
     if level == logging.DEBUG:
         log_config_summary()
     return logger
-
-
-def check_dependencies() -> Tuple[List[str], List[str]]:
-    """Return (missing_required, missing_optional) dependency names."""
-    missing_required = []
-    missing_optional = []
-
-    for module, name in REQUIRED_DEPENDENCIES.items():
-        try:
-            __import__(module)
-        except ImportError:
-            missing_required.append(name)
-
-    for module, name in OPTIONAL_DEPENDENCIES.items():
-        try:
-            __import__(module)
-        except ImportError:
-            missing_optional.append(name)
-
-    return missing_required, missing_optional
 
 
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
@@ -125,7 +85,8 @@ class WindowManager:
     """Shared window positioning and configuration utilities."""
 
     @staticmethod
-    def center_window(window: tk.Misc, width: Optional[int] = None, height: Optional[int] = None) -> None:
+    def center_window(window: tk.Misc, width: Optional[int] = None,
+                      height: Optional[int] = None) -> None:
         """Centre a window on the screen, also setting its size when width is given."""
         window.update_idletasks()
 
@@ -176,8 +137,11 @@ class EnhancedSplashScreen(WindowManager):
         self.splash = None
         self.canvas = None
         self.animation_items = []
-        self.animation_running = False
+        # Pending after() id per animation step, cancelled by close()
+        self._jobs = {}
         self.progress_var = tk.DoubleVar(value=0)
+        # Highest progress announced so far: the bar eases up to it and never moves back
+        self.progress_target = 0.0
 
         # Canvas item ids plus the progress-bar geometry
         self.ui_elements = {}
@@ -266,7 +230,7 @@ class EnhancedSplashScreen(WindowManager):
             if tag == 'inner_hex':
                 self.animation_items.append(('rotate', hex_id, 0))
 
-        # Center dot
+        # Centre dot
         self.canvas.create_oval(
             center_x - 5, center_y - 5,
             center_x + 5, center_y + 5,
@@ -282,7 +246,7 @@ class EnhancedSplashScreen(WindowManager):
         subtitle_font = (OPERAXNTheme._SANS, 11)
         version_font = (OPERAXNTheme._SANS, 9)
 
-        # Split title for coloring
+        # Split title for colouring
         opera_text = "OPERA"
         xn_text = "XN"
 
@@ -453,8 +417,6 @@ class EnhancedSplashScreen(WindowManager):
 
     def _start_animations(self) -> None:
         """Schedule all splash animation callbacks."""
-        self.animation_running = True
-
         animations = [
             (30, self._animate_progress),
             (500, self._animate_loading_dots),
@@ -465,19 +427,20 @@ class EnhancedSplashScreen(WindowManager):
         for delay, callback in animations:
             self._schedule_animation(delay, callback)
 
-    def _schedule_animation(self, delay: int, callback: Callable) -> None:
-        """Queue a callback on the splash window if still alive."""
-        if self.animation_running and self.splash and self.splash.winfo_exists():
-            self.splash.after(delay, callback)
+    def _schedule_animation(self, delay: int, callback: Callable,
+                            key: Optional[str] = None) -> None:
+        """Queue a callback on the splash window, replacing that step's pending run."""
+        key = key or callback.__name__
+        if key in self._jobs:
+            self.splash.after_cancel(self._jobs[key])
+        self._jobs[key] = self.splash.after(delay, callback)
 
     def _animate_progress(self) -> None:
-        """Advance the progress bar fill by one step."""
-        if not self.animation_running or not self.splash.winfo_exists():
-            return
-
+        """Advance the progress bar fill one step towards the announced progress."""
         current = self.progress_var.get()
-        if current < 100:
-            current = min(current + 3, 100)  # the drawn fill must not pass the track
+        if current < self.progress_target:
+            # Ease towards the announced progress, never past it or the track end
+            current = min(current + 3, self.progress_target, 100)
             self.progress_var.set(current)
 
             # Update bar
@@ -504,9 +467,6 @@ class EnhancedSplashScreen(WindowManager):
 
     def _animate_loading_dots(self) -> None:
         """Cycle the loading-dot indicator text."""
-        if not self.animation_running or not self.splash.winfo_exists():
-            return
-
         current = self.canvas.itemcget(self.ui_elements['loading_dots'], 'text')
         new_text = "" if len(current) >= 3 else current + "•"
         self.canvas.itemconfig(self.ui_elements['loading_dots'], text=new_text)
@@ -515,27 +475,20 @@ class EnhancedSplashScreen(WindowManager):
 
     def _animate_rings(self) -> None:
         """Flash the diffraction rings, hiding each after a staggered delay."""
-        if not self.animation_running or not self.splash.winfo_exists():
-            return
-
         for item_type, item_id, index in self.animation_items:
             if item_type == 'ring':
                 state = self.canvas.itemcget(item_id, 'state')
                 if state == 'hidden':
                     self.canvas.itemconfig(item_id, state='normal')
-                    self.splash.after(
+                    self._schedule_animation(
                         100 * index,
-                        lambda id=item_id: self.canvas.itemconfig(id, state='hidden')
-                        if self.splash.winfo_exists() else None
-                    )
+                        lambda id=item_id: self.canvas.itemconfig(id, state='hidden'),
+                        key=f'ring{index}')
 
         self._schedule_animation(2000, self._animate_rings)
 
     def _animate_rotation(self) -> None:
         """Rotate the inner hexagon by one angular step."""
-        if not self.animation_running or not self.splash.winfo_exists():
-            return
-
         center_x = self.width // 2
         center_y = SPLASH_LOGO_CENTER_Y
 
@@ -557,16 +510,23 @@ class EnhancedSplashScreen(WindowManager):
         self._schedule_animation(50, self._animate_rotation)
 
     def update_status(self, message: str, progress: Optional[float] = None) -> None:
-        """Set the status label text and optionally the progress value."""
+        """Set the status label text and optionally raise the progress target (never lowered)."""
         if self.splash and self.splash.winfo_exists():
             self.canvas.itemconfig(self.ui_elements['status_label'], text=message)
             if progress is not None:
-                self.progress_var.set(progress)
+                self.progress_target = max(self.progress_target, min(progress, 100))
 
     def close(self) -> None:
-        """Fade out and destroy the splash window."""
-        self.animation_running = False
+        """Finish the progress fill, then fade out and destroy the splash window."""
         if self.splash and self.splash.winfo_exists():
+            # A slow GUI build can leave the bar short of its last announced value
+            while self.progress_var.get() < self.progress_target:
+                self._animate_progress()
+        if self.splash and self.splash.winfo_exists():
+            # Pending steps would fire into the destroyed window's deleted callbacks
+            for job in self._jobs.values():
+                self.splash.after_cancel(job)
+            self._jobs.clear()
             # Fade out effect
             try:
                 for i in range(20, 0, -1):
@@ -587,12 +547,12 @@ class ApplicationManager:
     """Controller for startup, the splash screen and the main-window lifecycle."""
 
     def __init__(self, args: argparse.Namespace) -> None:
-        self.args = args
         self.logger = setup_logging(args.debug)
         self.root = None
-        self.app = None
         self.splash_manager = None
-        self.initialization_complete = False
+        self._window_class = None  # OPERAXN, imported by run()
+        self.initialisation_complete = False
+        self.initialisation_failed = False
 
     def run(self) -> int:
         """Launch the GUI event loop; return 0 on success, 1 on error."""
@@ -600,6 +560,9 @@ class ApplicationManager:
             if not self._validate_environment():
                 return 1
 
+            # Imported here, before the splash: --version and --profile load no operaxn.gui
+            from .gui import OPERAXN
+            self._window_class = OPERAXN
             self._initialise_ui()
 
             # Build the GUI shortly before the splash closes
@@ -609,6 +572,8 @@ class ApplicationManager:
             self.logger.info("Starting main event loop")
             self.root.mainloop()
 
+            if self.initialisation_failed:
+                return 1
             self.logger.info("Application closed normally")
             return 0
 
@@ -618,29 +583,14 @@ class ApplicationManager:
             return 1
 
     def _validate_environment(self) -> bool:
-        """Check dependencies and the macOS Tk version; return False when the app cannot start."""
-        missing_required, missing_optional = check_dependencies()
-
-        if missing_required:
-            self._show_error(
-                "Missing required dependencies:\n\n" +
-                "\n".join(f"• {dep}" for dep in missing_required) +
-                "\n\nPlease install using:\npip install -r requirements.txt"
-                "\n(from the OperaXN repository root)"
-            )
-            return False
-
-        if missing_optional and (self.args.debug or DEBUG_MODE):
-            self.logger.warning("Optional dependencies not installed: %s",
-                                ", ".join(missing_optional))
-
+        """Check the macOS Tk version; return False when the app cannot start."""
         if sys.platform == 'darwin' and tk.TkVersion < 8.6:
             self._show_error(
                 f"Tcl/Tk {tk.TkVersion} detected.\n\n"
                 "OperaXN requires Tcl/Tk 8.6 or newer on macOS. "
                 "The system Python does not include a compatible version.\n\n"
                 "Fix: install Python from https://www.python.org, "
-                "create a virtual environment with it, and reinstall OperaXN."
+                "create a virtual environment with it, and reinstall OperaXN"
             )
             return False
 
@@ -649,11 +599,10 @@ class ApplicationManager:
     def _initialise_ui(self) -> None:
         """Create the root Tk window and show the splash screen."""
         self.root = tk.Tk()
-        self.root.withdraw()  # Hidden until the splash closes
+        self.root.withdraw()  # Hidden while the splash shows
 
         self.root.title(f"{APP_NAME} v{__version__}")
 
-        self._set_window_icon()
         self._show_splash()
 
     def _show_splash(self) -> None:
@@ -662,11 +611,10 @@ class ApplicationManager:
         self.splash_manager.show()
 
         updates = [
-            (100, "Checking dependencies...", 15),
+            (100, "Starting OperaXN...", 15),
             (700, "Initialising GUI components...", 50),
             (1000, "Loading visualisation engine...", 70),
             (1300, "Preparing workspace...", 85),
-            (1600, "Ready to launch!", 100)
         ]
 
         for delay, message, progress in updates:
@@ -675,7 +623,7 @@ class ApplicationManager:
 
     def _initialise_application(self) -> None:
         """Create the OPERAXN main window unless already created."""
-        if self.initialization_complete:
+        if self.initialisation_complete or self.initialisation_failed:
             return
 
         self.logger.info("Initialising %s v%s", APP_NAME, __version__)
@@ -684,18 +632,27 @@ class ApplicationManager:
             self.splash_manager.update_status("Creating application interface...", 95)
 
         try:
-            self.app = OPERAXN(master=self.root)
-            self.initialization_complete = True
+            # Tk keeps the main frame alive as a child of root
+            self._window_class(master=self.root)
+            self.initialisation_complete = True
             self.logger.info("Application initialised successfully")
+            if self.splash_manager:
+                self.splash_manager.update_status("Ready to launch!", 100)
         except Exception as e:
+            # One error box, then end the main loop: the splash is topmost and has no close button
             self.logger.exception("Failed to initialise application")
+            self.initialisation_failed = True
+            if self.splash_manager:
+                self.splash_manager.close()
             self._show_error(f"Failed to initialise:\n\n{e}")
-            raise
+            self.root.destroy()
 
     def _show_main_window(self) -> None:
         """Close the splash and reveal the main application window."""
-        if not self.initialization_complete:
+        if not self.initialisation_complete:
             self._initialise_application()
+        if not self.initialisation_complete:
+            return
 
         if self.splash_manager:
             self.splash_manager.close()
@@ -720,23 +677,13 @@ class ApplicationManager:
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
 
-    def _set_window_icon(self) -> None:
-        """Load and apply the window icon if the asset exists."""
-        try:
-            icon_path = Path(__file__).parent / 'assets' / 'icon.png'
-            if icon_path.exists():
-                photo = tk.PhotoImage(file=str(icon_path))
-                self.root.iconphoto(True, photo)
-        except (tk.TclError, FileNotFoundError, OSError):
-            pass  # Icon optional
-
     def _show_error(self, message: str) -> None:
         """Display a fatal-error messagebox, falling back to stderr."""
         try:
             if not self.root:
                 self.root = tk.Tk()
                 self.root.withdraw()
-            messagebox.showerror("Fatal Error", message)
+            messagebox.showerror("Fatal error", message)
         except Exception:
             print(f"FATAL ERROR: {message}", file=sys.stderr)
 
@@ -744,43 +691,6 @@ class ApplicationManager:
 # ============================================================================
 # Information Display Functions
 # ============================================================================
-
-def display_dependency_check() -> int:
-    """Print dependency status to stdout; return 1 if required deps are missing."""
-    # The status glyphs below are not encodable in the Windows ANSI
-    # codepage, so a redirected or piped stdout would raise
-    # UnicodeEncodeError before any status could be reported.
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
-
-    missing_required, missing_optional = check_dependencies()
-
-    print("\n" + "=" * 60)
-    print(f"{APP_NAME} Dependency Check")
-    print("=" * 60 + "\n")
-
-    if missing_required:
-        print("❌ Missing required dependencies:")
-        for dep in missing_required:
-            print(f"   - {dep}")
-        print("\nPlease install using:")
-        print("   pip install -r requirements.txt")
-        print("   (from the OperaXN repository root)")
-        return 1
-    print("✓ All required dependencies installed")
-
-    if missing_optional:
-        print("\n⚠ Optional dependencies not installed:")
-        for dep in missing_optional:
-            print(f"   - {dep}")
-    else:
-        print("✓ All optional dependencies installed")
-
-    print("\n" + "=" * 60)
-    return 0
-
 
 def print_instrument_profile(path: str) -> int:
     """Print the INSTRUMENT_PROFILES block from a Mantid-processed .nxs; return 1 if unreadable."""
@@ -799,15 +709,14 @@ def print_instrument_profile(path: str) -> int:
 def create_parser() -> argparse.ArgumentParser:
     """Build and return the CLI argument parser."""
     parser = argparse.ArgumentParser(
+        prog='operaxn',
         description=f'{APP_NAME} - OPERAndo X-ray and Neutron data visualisation tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s                           # Launch GUI
   %(prog)s --debug                   # Launch with debug logging
-  %(prog)s --check-deps              # Check dependencies and exit
-  %(prog)s --profile RUN.nxs         # Print an instrument-profile block and exit
-        """
+  %(prog)s --profile RUN.nxs         # Print an instrument-profile block and exit"""
     )
 
     parser.add_argument(
@@ -820,12 +729,6 @@ Examples:
         '--debug', '-d',
         action='store_true',
         help='Enable debug mode with verbose logging'
-    )
-
-    parser.add_argument(
-        '--check-deps',
-        action='store_true',
-        help='Check dependencies and exit'
     )
 
     parser.add_argument(
@@ -850,8 +753,6 @@ def main(args: Optional[List[str]] = None) -> int:
     # Handle info commands
     if parsed_args.profile:
         return print_instrument_profile(parsed_args.profile)
-    if parsed_args.check_deps:
-        return display_dependency_check()
 
     app_manager = ApplicationManager(parsed_args)
     return app_manager.run()

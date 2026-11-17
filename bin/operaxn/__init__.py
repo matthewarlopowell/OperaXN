@@ -1,145 +1,95 @@
 """
 OperaXN: operando diffraction visualisation with NeXus-canonical storage.
 
-The GUI (this package) is a thin layer over the shared `core` pipeline:
+The GUI (this package) is a thin layer over the shared `operaxn.core` pipeline:
 every raw-data upload is generated into a canonical .nxs file and the
 interface works entirely from that file; opening a .nxs directly skips
-generation. See the `core` package for the pipeline itself.
+generation. See `operaxn.core` for the pipeline itself.
+
+The names below import their module on first use, so `import operaxn.core`
+loads no Tk or matplotlib.
 """
 
-from .config import APP_VERSION, APP_AUTHOR, SUPPORT_EMAIL
+import importlib
+from typing import Any, List
 
-__version__ = APP_VERSION
-__author__ = APP_AUTHOR
-__email__ = SUPPORT_EMAIL
 __license__ = "MIT"
 
-from .config import (  # noqa: F401  (package API re-exports)
-    DataSourceType,
-    DEFAULT_TWOD_YMIN_PERCENT,
-    DEFAULT_TWOD_YMAX_PERCENT,
-    DEFAULT_TWOD_XMIN_PERCENT,
-    DEFAULT_TWOD_XMAX_PERCENT,
-    CACHE_ENABLED,
-    PARALLEL_PROCESSING,
-    MAX_CACHE_SIZE_MB,
-    EXPORT_DPI,
-    FIGURE_DPI,
-    OPERAXNTheme,
-    DEBUG_MODE,
-    APP_NAME,
-    APP_COPYRIGHT,
-    DOCUMENTATION_URL
-)
-
-from .gui import OPERAXN, UIState, VisualiserConfig
-
-from .capacity import (
-    assign_cycles,
-    compute_capacity,
-    plot_capacity_vs_voltage,
-    plot_time_vs_voltage
-)
-
-from .heatmap import HeatmapWindow
-from .ici import ICIWindow
-
-from .input import (
-    process_paths,
-    make_oned_arrays,
-    make_twod_arrays,
-    make_echem_arrays,
-    get_correlated_data,
-    add_standard_echem_files,
-    FileType,
-    DataType,
-    TimeMethod
-)
-
-from .output import (
-    plot_oned_data,
-    plot_twod_data,
-    plot_echem_data,
-    plot_neutron_data,
-    create_figure_layout,
-    export_single_scan,
-    clear_plot_cache,
-    clear_plot_axes,
-    get_scan_time_positions,
-    PlotConfig
-)
-
-from .dialog import (
-    UploadOptionsDialog,
-    PlotSettingsDialog,
-    ExportOptionsDialog,
-    GIFSettingsDialog,
-    ProgressDialog
-)
-
-__all__ = [
+# Public name -> the submodule it comes from
+_EXPORTS = {
     # Main application
-    'OPERAXN',
+    'OPERAXN': 'gui',
 
     # Configuration classes
-    'VisualiserConfig',
-    'PlotConfig',
-    'OPERAXNTheme',
+    'VisualiserConfig': 'gui',
+    'PlotConfig': 'output',
+    'OPERAXNTheme': 'config',
 
     # Data processing
-    'process_paths',
-    'make_oned_arrays',
-    'make_twod_arrays',
-    'make_echem_arrays',
-    'get_correlated_data',
-    'add_standard_echem_files',
-    'get_scan_time_positions',
+    'process_paths': 'input',
+    'make_oned_arrays': 'input',
+    'make_twod_arrays': 'input',
+    'make_echem_arrays': 'input',
+    'make_neutron_arrays': 'input',
+    'get_correlated_data': 'input',
+    'add_standard_echem_files': 'input',
+    'get_scan_time_positions': 'output',
 
     # Plotting
-    'plot_oned_data',
-    'plot_twod_data',
-    'plot_echem_data',
-    'plot_neutron_data',
-    'create_figure_layout',
-    'export_single_scan',
-    'clear_plot_cache',
-    'clear_plot_axes',
+    'plot_oned_data': 'output',
+    'plot_twod_data': 'output',
+    'plot_echem_data': 'output',
+    'plot_neutron_data': 'output',
+    'create_figure_layout': 'output',
+    'export_single_scan': 'output',
+    'clear_plot_cache': 'output',
+    'clear_plot_axes': 'output',
 
     # Analysis
-    'assign_cycles',
-    'compute_capacity',
-    'plot_capacity_vs_voltage',
-    'plot_time_vs_voltage',
-    'ICIWindow',
-    'HeatmapWindow',
+    'assign_cycles': 'capacity',
+    'compute_capacity': 'capacity',
+    'plot_capacity_vs_voltage': 'capacity',
+    'plot_time_vs_voltage': 'capacity',
+    'CapacityWindow': 'capacity',
+    'ICIWindow': 'ici',
+    'HeatmapWindow': 'heatmap',
 
     # Dialogs
-    'UploadOptionsDialog',
-    'PlotSettingsDialog',
-    'ExportOptionsDialog',
-    'GIFSettingsDialog',
-    'ProgressDialog',
+    'UploadOptionsDialog': 'dialog',
+    'PlotSettingsDialog': 'dialog',
+    'ExportOptionsDialog': 'dialog',
+    'GIFSettingsDialog': 'dialog',
 
     # Enums
-    'DataSourceType',
-    'UIState',
-    'FileType',
-    'DataType',
-    'TimeMethod',
+    'DataSourceType': 'core',
+    'UIState': 'gui',
+    'TimeMethod': 'core',
+}
 
-    # Version info
-    '__version__',
-    '__author__',
-    '__email__',
-    '__license__',
+# Version info -> its name in operaxn.config
+_VERSION_INFO = {
+    '__version__': 'APP_VERSION',
+    '__author__': 'APP_AUTHOR',
+    '__email__': 'SUPPORT_EMAIL',
+}
 
-    # Application info
-    'APP_NAME',
-    'APP_COPYRIGHT',
-    'DEBUG_MODE',
+__all__ = ['core', *_EXPORTS, *_VERSION_INFO, '__license__']
 
-    # Performance settings
-    'CACHE_ENABLED',
-    'PARALLEL_PROCESSING',
-    'MAX_CACHE_SIZE_MB',
-]
+
+def __getattr__(name: str) -> Any:
+    """Import a public name's module on first access and keep the value."""
+    if name == 'core':
+        return importlib.import_module(".core", __name__)
+    if name in _EXPORTS:
+        value = getattr(importlib.import_module(f".{_EXPORTS[name]}", __name__), name)
+    elif name in _VERSION_INFO:
+        value = getattr(importlib.import_module(".config", __name__), _VERSION_INFO[name])
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> List[str]:
+    """List the module's own names with the public ones not loaded yet."""
+    return sorted(set(globals()) | set(__all__))

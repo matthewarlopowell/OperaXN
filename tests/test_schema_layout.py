@@ -5,14 +5,14 @@ import h5py
 import numpy as np
 import pytest
 
-import core
+from operaxn import core
 
 import _builders
-from _helpers import s, wall, tz_aware, assert_pynxtools_valid, needs_fabio
+from _helpers import assert_pynxtools_valid, needs_fabio, s, tz_aware, wall
 
 
 def test_monopd_root_and_entry(inhouse_nxs):
-    """@default chains to the echem plot, provenance sits on definition, start_time is tz-aware."""
+    """@default chains to echem, definition 1.0.0 holds provenance, start_time is tz-aware."""
     with h5py.File(inhouse_nxs) as f:
         assert f.attrs.get("default") == "entry"
         e = f["entry"]
@@ -20,7 +20,7 @@ def test_monopd_root_and_entry(inhouse_nxs):
         assert "generator" not in e.attrs and "data_source" not in e.attrs, \
             "v3 provenance attrs left on entry"
         assert s(e["definition"]) == "NXoperando_monopd"
-        assert e["definition"].attrs.get("version") == core.config.DEFINITION_VERSION
+        assert e["definition"].attrs.get("version") == core.config.DEFINITION_VERSION == "1.0.0"
         assert e["definition"].attrs.get("URL", "").endswith("NXoperando_monopd.nxdl.xml")
         assert "program_name" not in e, "duplicate of process/program"
         assert wall(e["start_time"]) == "2024-02-05T10:05:00"
@@ -71,8 +71,8 @@ def test_monopd_environment(inhouse_nxs):
         assert abs(env["voltage_max"][()] - 3.77) < 1e-9
         assert abs(env["current_min"][()] - 0.105) < 1e-9
         assert abs(env["current_max"][()] - 0.107) < 1e-9
-        for name in ("echem_index_first", "echem_index_last", "capacity",
-                     "voltage_log", "current_log"):
+        for name in ("echem_index_start", "echem_index_end", "echem_index_first",
+                     "echem_index_last", "capacity", "voltage_log", "current_log"):
             assert name not in env, f"{name} is derivable and must not be stored"
         assert wall(env["scan_timestamp"]) == "2024-02-05T10:05:00"
         assert wall(env["midpoint_adjusted_timestamp"]) == "2024-02-05T10:06:00"
@@ -85,7 +85,7 @@ def test_monopd_data(inhouse_nxs):
     with h5py.File(inhouse_nxs) as f:
         d = f["entry/scan_000001/data"]
         assert d["polar_angle"].attrs.get("units") == "degrees"
-        assert "polar_angle_indices" not in d.attrs, "redundant for a 1-D axis"
+        assert "polar_angle_indices" not in d.attrs, "redundant for a 1D axis"
         assert d.attrs.get("signal") == "data"
         assert "data_errors" in d, "1D uncertainties dropped"
         assert "errors" not in d, "deprecated NXdata errors name written"
@@ -179,6 +179,20 @@ def test_monopd_image_only_scans(tmp_path):
     assert_pynxtools_valid(out, "image-only")
 
 
+@needs_fabio
+def test_image_source_path_normalised(tmp_path):
+    """A forward-slash source folder (the Windows file dialog's form) records a normalised path."""
+    src = str(tmp_path / "twod_slash")
+    _builders.write_twod_dir(src)
+    nxs = str(tmp_path / "twod_slash.nxs")
+    ok, msgs = core.generate([src.replace(os.sep, "/")], nxs,
+                             core.DataSourceType.INHOUSE)
+    assert ok, msgs
+    with h5py.File(nxs) as f:
+        name = s(f["entry/scan_000001/image_source/file_name"])
+        assert name == os.path.normpath(name), name
+
+
 def test_tofnpd_entry_and_scan(neutron_nxs):
     """The entry declares NXoperando_tofnpd, scan windows come from the logbook, nothing repeats."""
     with h5py.File(neutron_nxs) as f:
@@ -244,9 +258,26 @@ def test_tofnpd_banks_without_mantid_header(tmp_path):
     assert_pynxtools_valid(out, "neutron without Mantid header")
 
 
+def test_tofnpd_unreadable_bank_leaves_no_shell(tmp_path):
+    """An unreadable bank file leaves no data-less NXdata shell, and the other banks are intact."""
+    src = str(tmp_path / "neutron_bad_bank")
+    _builders.write_neutron_dir(src)
+    with open(os.path.join(src, "123456-2-0.dat"), "w") as f:
+        f.write("# Time-of-flight Y E\nnot numbers at all\n")
+    nxs = str(tmp_path / "bad_bank.nxs")
+    ok, msgs = core.generate([src], nxs, core.DataSourceType.NEUTRON)
+    assert ok, msgs
+    with h5py.File(nxs) as f:
+        s1 = f["entry/scan_000001"]
+        assert "bank_2" not in s1, "empty NXdata shell left for an unreadable bank"
+        assert "bank_2_d" in s1 and "bank_1" in s1 and "bank_1_d" in s1
+        assert s1["bank_2_d"].attrs.get("signal") == "data"
+    assert_pynxtools_valid(nxs, "unreadable bank")
+
+
 @pytest.mark.parametrize("fixture", ["inhouse_nxs", "neutron_nxs"])
 def test_entry_window_spans_all_scans(request, fixture):
-    """The entry time window contains every acquisition it holds."""
+    """The entry window contains every acquisition it holds, each with its scan_timestamp."""
     with h5py.File(request.getfixturevalue(fixture)) as f:
         entry = f["entry"]
         e_start, e_end = wall(entry["start_time"]), wall(entry["end_time"])
@@ -254,21 +285,12 @@ def test_entry_window_spans_all_scans(request, fixture):
         assert scans, "no scan subentries"
         for name in scans:
             sub = entry[name]
+            assert "scan_timestamp" in sub["environment"], name
             assert wall(sub["environment/start_time"]) >= e_start, \
                 f"{name} starts before the entry window"
             if "end_time" in sub["environment"]:
                 assert wall(sub["environment/end_time"]) <= e_end, \
                     f"{name} ends after the entry window"
-
-
-@pytest.mark.parametrize("nxs_fixture", ["inhouse_nxs", "neutron_nxs"])
-def test_scan_timestamp_always_written(request, nxs_fixture):
-    """Every scan subentry carries environment/scan_timestamp."""
-    with h5py.File(request.getfixturevalue(nxs_fixture)) as f:
-        names = [k for k in f["entry"] if k.startswith("scan_")]
-        assert names
-        for name in names:
-            assert "scan_timestamp" in f["entry"][name]["environment"], name
 
 
 # ============================================================================
@@ -416,40 +438,9 @@ def test_monopd_image_member_order(tmp_path):
             assert _members(sub["image_source"]) == expected
 
 
-def test_tofnpd_unreadable_bank_leaves_no_shell(tmp_path):
-    """An unreadable bank file leaves no data-less NXdata shell, and the other banks are intact."""
-    src = str(tmp_path / "neutron_bad_bank")
-    _builders.write_neutron_dir(src)
-    with open(os.path.join(src, "123456-2-0.dat"), "w") as f:
-        f.write("# Time-of-flight Y E\nnot numbers at all\n")
-    nxs = str(tmp_path / "bad_bank.nxs")
-    ok, msgs = core.generate([src], nxs, core.DataSourceType.NEUTRON)
-    assert ok, msgs
-    with h5py.File(nxs) as f:
-        s1 = f["entry/scan_000001"]
-        assert "bank_2" not in s1, "empty NXdata shell left for an unreadable bank"
-        assert "bank_2_d" in s1 and "bank_1" in s1 and "bank_1_d" in s1
-        assert s1["bank_2_d"].attrs.get("signal") == "data"
-    assert_pynxtools_valid(nxs, "unreadable bank")
-
-
-@needs_fabio
-def test_image_source_path_normalised(tmp_path):
-    """A forward-slash source folder (the Windows file dialog's form) records a normalised path."""
-    src = str(tmp_path / "twod_slash")
-    _builders.write_twod_dir(src)
-    nxs = str(tmp_path / "twod_slash.nxs")
-    ok, msgs = core.generate([src.replace(os.sep, "/")], nxs,
-                             core.DataSourceType.INHOUSE)
-    assert ok, msgs
-    with h5py.File(nxs) as f:
-        name = s(f["entry/scan_000001/image_source/file_name"])
-        assert name == os.path.normpath(name), name
-
-
 @needs_fabio
 def test_monopd_monitor_integral_from_positive_counter(tmp_path):
-    """Positive EDF Monitor counts write scan monitor/integral; mode and preset sit once at entry."""
+    """Positive EDF Monitor counts give scan monitor/integral; mode and preset sit once at entry."""
     src = str(tmp_path / "monitored")
     os.makedirs(src)
     _builders.write_edf_image(os.path.join(src, "image_001.edf"),

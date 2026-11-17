@@ -13,6 +13,7 @@ dist/
 
 # IDE
 .idea/
+.vscode/
 
 # Testing / cache
 .pytest_cache/
@@ -21,6 +22,9 @@ dist/
 
 .coverage
 htmlcov/
+
+# Debug log (OPERAXN_DEBUG=1 writes operaxn.log)
+*.log
 
 # OS files
 .DS_Store
@@ -37,6 +41,7 @@ Thumbs.db
 *.nxs
 *.hdf
 *.edf
+*.part
 
 # Generated example data
 /examples/example_data/

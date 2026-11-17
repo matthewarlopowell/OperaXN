@@ -1,8 +1,8 @@
 """
 Operando heatmap window: stacked 1D patterns as an intensity map.
 
-2θ (X-ray) or time of flight / d-spacing (neutron, one map per detector
-bank) on x, scan number or elapsed time on y, with the correlated voltage
+2θ or d-spacing (X-ray) or time of flight / d-spacing (neutron, one map per
+detector bank) on x, scan number or elapsed time on y, with the correlated voltage
 track on a shared y axis so peak shifts line up with the electrochemistry.
 Patterns are interpolated onto the first usable scan's x grid when grids differ;
 the window also exports a publication figure (PNG, PDF or SVG).
@@ -10,29 +10,36 @@ the window also exports a publication figure (PNG, PDF or SVG).
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import tkinter as tk
+import traceback
 from tkinter import filedialog, messagebox
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from matplotlib import cbook
 from matplotlib.colors import LogNorm, Normalize
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
+from matplotlib.mathtext import MathTextParser
 
 from .config import (
     COLORMAP, DSPACING_LABEL, EXPORT_DPI, FIGURE_DPI, SECONDS_PER_HOUR,
-    TIME_HOURS_LABEL, TOF_LABEL, TWOTHETA_LABEL, VMIN_FLOOR,
+    TIME_HOURS_LABEL, TOF_LABEL, TWOTHETA_LABEL, VMIN_FLOOR, XRAY_WAVELENGTH,
 )
-from .dialog import parse_scan_range
+from .dialog import SCAN_RANGE_HINT, parse_scan_range
 from .ici import (
     BG, BG2, BORDER, INPUT, TEXT, _FONT,
     _PAD_S, CHARGE_COLOR,
     PLOT_BG, PLOT_BORDER, PLOT_DIM, PLOT_GRID,
     _Btn, _canvas_frame, _label, _separator, _spinbox, _style_ax, _stub,
-    _themed_menubutton, embed_figure, maximise_window, watch_figure_sync,
+    _themed_menubutton, embed_figure, maximise_window, trace_write, watch_figure_sync,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # Colour maps offered in the window; the application default comes first
@@ -41,15 +48,16 @@ COLORMAPS = (COLORMAP, 'viridis', 'inferno', 'magma', 'plasma', 'cividis',
 
 # Neutron x axes in the order they are offered, with their plot labels
 NEUTRON_AXES = {'tof': TOF_LABEL, 'd': DSPACING_LABEL}
-XRD_XLABEL = TWOTHETA_LABEL
-INTENSITY_LABEL = 'Intensity (arb. units)'
-VOLTAGE_LABEL = 'Voltage (V)'
+# X-ray x axes; d-spacing is converted from 2θ and drawn decreasing, in 2θ's order,
+# like the main window's d-spacing view
+XRD_AXES = {'twotheta': TWOTHETA_LABEL, 'd': DSPACING_LABEL}
+INTENSITY_LABEL = 'Intensity [arb. units]'
+VOLTAGE_LABEL = 'Voltage [V]'
 
-EXPORT_FILETYPES = (('PNG image', '*.png'), ('PDF document', '*.pdf'),
-                    ('SVG image', '*.svg'))
+EXPORT_FILETYPES = (('PNG files', '*.png'), ('PDF files', '*.pdf'),
+                    ('SVG files', '*.svg'))
 PUBLICATION_SIZE = (7.2, 5.0)  # inches; a two-column journal figure
 LOG_FLOOR_PERCENTILE = 1.0  # of the positive values, the auto log-scale floor
-SCAN_LIST_HINT = 'e.g. 1-5, 103'  # the GIF dialog's scan-range grammar
 
 
 # ============================================================================
@@ -58,7 +66,7 @@ SCAN_LIST_HINT = 'e.g. 1-5, 103'  # the GIF dialog's scan-range grammar
 
 def build_xrd_matrix(oned_arrays: Dict[int, Dict[str, Any]]):
     """Stack 1D patterns as (x_grid, matrix, scan_nums) on the first usable scan's grid.
-    Other grids are interpolated; entries without 1-D x and y are skipped;
+    Other grids are interpolated; entries without 1D x and y are skipped;
     (None, None, []) when nothing is usable."""
     scan_nums = sorted(oned_arrays)
     rows = []
@@ -83,6 +91,18 @@ def build_xrd_matrix(oned_arrays: Dict[int, Dict[str, Any]]):
     if not rows:
         return None, None, []
     return x_grid, np.vstack(rows), used
+
+
+def dspacing_columns(x, matrix, wavelength: float):
+    """Re-express a 2θ map's columns as ascending d-spacing (Bragg's law) for wavelength (Å).
+    Columns outside 0 < 2θ < 180° have no d and are dropped."""
+    if matrix is None:
+        return x, matrix
+    two_theta = np.asarray(x, dtype=float)
+    keep = (two_theta > 0) & (two_theta < 180)
+    d = wavelength / (2 * np.sin(np.deg2rad(two_theta[keep] / 2)))
+    order = np.argsort(d)
+    return d[order], np.asarray(matrix)[:, keep][:, order]
 
 
 def neutron_banks(neutron_arrays: Dict[int, Dict[str, Any]]) -> List[str]:
@@ -218,8 +238,13 @@ def intensity_limits(matrix: np.ndarray, ceiling: float = 100.0,
     data = data[np.isfinite(data)]
     if log:
         data = data[data > 0]
+        # An uncommitted bound <= 0 cannot be used either: it returns to automatic
+        vmin = None if vmin is not None and vmin <= 0 else vmin
+        vmax = None if vmax is not None and vmax <= 0 else vmax
     if data.size == 0:
         data = np.array([VMIN_FLOOR])
+    if vmin is not None and vmax is not None and vmax <= vmin:
+        vmax = None  # an uncommitted crossed pair: Max returns to automatic
     if vmin is not None:
         lo = float(vmin)
     elif log:
@@ -257,11 +282,12 @@ def row_edges(y_vals: np.ndarray) -> Tuple[float, float]:
 def publication_figure(x, y_vals, matrix, *, x_label: str, y_label: str,
                        cmap: str, vmin: float, vmax: float, log: bool = False,
                        x_range: Tuple[Optional[float], Optional[float]] = (None, None),
+                       invert_x: bool = False,
                        voltage=None, title: str = '',
                        dpi: int = EXPORT_DPI) -> Figure:
     """Build the publication figure: voltage track (left, shared y), map, colour bar.
-    voltage is (volts, y) on the row axis or None for no track; the mesh is
-    rasterised so PDF and SVG exports keep vector axes and text."""
+    voltage is (volts, y) on the row axis or None for no track; invert_x draws x decreasing;
+    the mesh is rasterised so PDF and SVG exports keep vector axes and text."""
     fig = Figure(figsize=PUBLICATION_SIZE, dpi=dpi, facecolor='white')
     has_voltage = voltage is not None and len(voltage[0]) > 1
     widths = (1.0, 3.4, 0.1) if has_voltage else (3.4, 0.1)
@@ -279,6 +305,8 @@ def publication_figure(x, y_vals, matrix, *, x_label: str, y_label: str,
     if x_range[0] is not None or x_range[1] is not None:
         ax.set_xlim(x_range[0] if x_range[0] is not None else ax.get_xlim()[0],
                     x_range[1] if x_range[1] is not None else ax.get_xlim()[1])
+    if invert_x:
+        ax.invert_xaxis()
     if title:
         ax.set_title(title, fontsize=10, color='black')
 
@@ -327,7 +355,7 @@ def _menu_button(master, var, values, prefix, command=None) -> tk.Menubutton:
             label=str(value), value=value, variable=var,
             command=(lambda selected=value: command(selected)) if command else None)
     button.config(menu=menu)
-    var.trace_add('write', lambda *_: display.set(f'{prefix}{var.get()}  ▾'))
+    trace_write(button, var, lambda *_: display.set(f'{prefix}{var.get()}  ▾'))
     return button
 
 
@@ -335,9 +363,27 @@ def _parse_float(text: str) -> Optional[float]:
     """Parse an entry's text as a float; None when blank or not a finite number."""
     try:
         value = float(str(text).strip())
-    except (TypeError, ValueError):
+    except (ValueError, TypeError):
         return None
     return value if np.isfinite(value) else None
+
+
+def _log_bound(text: str) -> str:
+    """Return a typed intensity bound for log mode: blank (automatic) when not above 0."""
+    value = _parse_float(text)
+    return '' if value is not None and value <= 0 else text
+
+
+def title_text(text: str) -> str:
+    """Return a typed figure title, stripped; $...$ that is not valid mathtext is shown as typed."""
+    text = str(text).strip()
+    for line in text.split('\n'):  # matplotlib parses each line on its own
+        if cbook.is_math_text(line):
+            try:
+                MathTextParser('path').parse(line)
+            except ValueError:
+                return re.sub(r'(?<!\\)\$', r'\\$', text)
+    return text
 
 
 # ============================================================================
@@ -346,8 +392,8 @@ def _parse_float(text: str) -> Optional[float]:
 
 class HeatmapWindow(tk.Toplevel):
     """Operando heatmap window; opens maximised.
-    Takes oned_arrays (X-ray) or neutron_arrays (bank selector, TOF / d toggle); neutron_dspacing
-    picks the starting axis and x_range seeds the x-range entries."""
+    Takes oned_arrays (X-ray, 2θ / d at wavelength Å) or neutron_arrays (per bank, TOF / d);
+    dspacing picks the start axis, x_range seeds the range, exports are <export_stem>_heatmap*."""
 
     def __init__(self, parent: tk.Widget,
                  scans: List[Dict[str, Any]],
@@ -355,8 +401,10 @@ class HeatmapWindow(tk.Toplevel):
                  echem_arrays: Optional[Dict[str, Any]] = None,
                  time_method: str = "absolute",
                  neutron_arrays: Optional[Dict[int, Dict[str, Any]]] = None,
-                 neutron_dspacing: bool = False,
-                 x_range: Optional[Tuple[Optional[float], Optional[float]]] = None) -> None:
+                 dspacing: bool = False,
+                 x_range: Optional[Tuple[Optional[float], Optional[float]]] = None,
+                 wavelength: float = XRAY_WAVELENGTH,
+                 export_stem: str = 'experiment') -> None:
         super().__init__(parent)
         self.title('OperaXN: Operando Heatmap')
         self.configure(bg=BG)
@@ -368,6 +416,7 @@ class HeatmapWindow(tk.Toplevel):
                          for num, banks in (neutron_arrays or {}).items()}
         self._banks = neutron_banks(self._neutron)
         self._echem_arrays = echem_arrays or {}
+        self._max_scan = max((scan["scan_num"] for scan in scans), default=0)
         self._scan_echem = {scan["scan_num"]: scan.get("echem") for scan in scans
                             if scan.get("echem") is not None}
         # Scans with a correlated echem value (the Correlated filter keeps these)
@@ -377,22 +426,34 @@ class HeatmapWindow(tk.Toplevel):
         self._positions = scan_positions_seconds(
             scans, time_method, reference=self._echem_reference(time_method))
         self._replot_job = None
+        self.bind('<Destroy>', self._cancel_replot, add='+')
         self._matrices: Dict[Tuple[str, str], tuple] = {}
         self._excluded: set = set()
+        self._exclude_text = ''  # the Exclude entry's last accepted text
+        # Typed (min, max) intensity text of the banks not shown (the entries hold the shown one)
+        self._bank_limits: Dict[str, Tuple[str, str]] = {}
+        # Typed titles of the banks not shown (the Title entry holds the shown one)
+        self._bank_titles: Dict[str, str] = {}
+        # Typed titles already warned about as invalid mathtext: one warning per text
+        self._warned_titles: set = set()
         self._x = self._matrix = None
         self._scan_nums: List[int] = []
+        self._wavelength = wavelength
+        self._file_stem = export_stem
 
         self.bank_var = tk.StringVar(value=self._banks[0] if self._banks else '')
-        first_axes = neutron_axes(self._neutron, self.bank_var.get())
-        self.xaxis_var = tk.StringVar(
-            value='d' if neutron_dspacing and 'd' in first_axes
-            else (first_axes[0] if first_axes else ''))
+        if self.is_neutron:
+            first_axes = neutron_axes(self._neutron, self.bank_var.get())
+            axis = ('d' if dspacing and 'd' in first_axes
+                    else (first_axes[0] if first_axes else ''))
+        else:
+            axis = 'd' if dspacing else 'twotheta'
+        self.xaxis_var = tk.StringVar(value=axis)
 
         self._build_ui()
         self._refresh_axis_buttons()
-        # The main window's x range is in its own neutron units; seed it only on that axis
-        if x_range is not None and (not self.is_neutron
-                                    or (self.xaxis_var.get() == 'd') == neutron_dspacing):
+        # The main window's x range is in its own axis units; seed it only on that axis
+        if x_range is not None and (self.xaxis_var.get() == 'd') == dspacing:
             self._set_entries(self.xmin_var, self.xmax_var, *x_range)
         self._load_matrix()
         self._replot()
@@ -436,15 +497,15 @@ class HeatmapWindow(tk.Toplevel):
         strip.pack(fill='x', padx=2, pady=4)
 
         self._bank_btns = {}
-        self._x_btns = {}
         if self.is_neutron:
             self._bank_btns = self._toggle_group(
                 self._group(strip), 'Bank:', [(b, b) for b in self._banks], self.bank_var)
             self._sep(strip)
-            self._x_btns = self._toggle_group(
-                self._group(strip), 'X axis:', [('tof', 'TOF'), ('d', 'd-spacing')],
-                self.xaxis_var)
-            self._sep(strip)
+        x_options = ([('tof', 'TOF'), ('d', 'd-spacing')] if self.is_neutron
+                     else [('twotheta', '2θ'), ('d', 'd-spacing')])
+        self._x_btns = self._toggle_group(self._group(strip), 'X axis:', x_options,
+                                          self.xaxis_var)
+        self._sep(strip)
 
         # Time is the default row axis whenever the scans carry positions; the buttons
         # keep one order (Time first) so they never swap places between datasets
@@ -473,7 +534,21 @@ class HeatmapWindow(tk.Toplevel):
         entry.pack(side='left', padx=2)
         entry.bind('<Return>', lambda _e: self._apply_exclusions())
         entry.bind('<FocusOut>', lambda _e: self._apply_exclusions())
-        _label(exclude, SCAN_LIST_HINT, dim=True).pack(side='left')
+        _label(exclude, SCAN_RANGE_HINT, dim=True).pack(side='left')
+        self._sep(strip)
+
+        # The map's title on screen and in every export; each neutron bank keeps its own
+        # (in this strip, as the display bar has no room left for neutron maps)
+        title = self._group(strip)
+        _label(title, 'Title:').pack(side='left', padx=(0, 2))
+        self.title_var = tk.StringVar(value=self._default_title())
+        entry = _entry(title, self.title_var, width=18)
+        entry.pack(side='left', padx=2)
+        entry.bind('<Return>', lambda _e: self._apply_title())
+        entry.bind('<FocusOut>', lambda _e: self._apply_title())
+        if self.is_neutron:
+            _Btn(title, 'Apply All', padx=6,
+                 command=self._apply_title_to_all_banks).pack(side='left', padx=2)
 
         # Display bar: scale, colour map, ranges, export
         self.scale_var = tk.StringVar(value='linear')
@@ -499,12 +574,18 @@ class HeatmapWindow(tk.Toplevel):
         intensity = self._group(bar)
         self.zmin_var, self.zmax_var = tk.StringVar(), tk.StringVar()
         self._range_pair(intensity, 'Intensity:', self.zmin_var, self.zmax_var)
+        if self.is_neutron:
+            _Btn(intensity, 'Apply All', padx=6,
+                 command=self._apply_to_all_banks).pack(side='left', padx=2)
         # Ceiling percentile clips hot pixels so weak peaks show
-        _label(intensity, 'ceiling (%):', dim=True).pack(side='left', padx=(_PAD_S, 0))
+        _label(intensity, 'Ceiling (%):', dim=True).pack(side='left', padx=(_PAD_S, 0))
         self.ceiling_var = tk.DoubleVar(value=100.0)
-        _spinbox(intensity, self.ceiling_var, from_=50.0, to=100.0,
-                 increment=0.5, format='%.1f', width=6).pack(side='left', padx=2)
-        self.ceiling_var.trace_add('write', lambda *_: self._queue_replot())
+        spin = _spinbox(intensity, self.ceiling_var, from_=50.0, to=100.0,
+                        increment=0.5, format='%.1f', width=6)
+        spin.pack(side='left', padx=2)
+        spin.bind('<Return>', self._commit_ceiling)
+        spin.bind('<FocusOut>', self._commit_ceiling)
+        trace_write(self, self.ceiling_var, lambda *_: self._queue_replot())
         _Btn(intensity, 'Reset', padx=6,
              command=self._reset_ranges).pack(side='left', padx=2)
         self._sep(bar)
@@ -521,7 +602,7 @@ class HeatmapWindow(tk.Toplevel):
         plot_frame.pack(fill='both', expand=True, padx=_PAD_S, pady=2)
 
         self._fig = Figure(facecolor=PLOT_BG, dpi=FIGURE_DPI)
-        # Keep a dedicated gutter after the colourbar so its tick labels and
+        # Keep a dedicated gutter after the colour bar so its tick labels and
         # scientific-notation offset cannot collide with the voltage panel.
         gs = GridSpec(1, 4, figure=self._fig,
                       width_ratios=(4, 0.12, 0.22, 1.1),
@@ -564,21 +645,60 @@ class HeatmapWindow(tk.Toplevel):
         return buttons
 
     def _range_pair(self, master, label, min_var, max_var) -> None:
-        """Build labelled min-to-max entries that replot on Return or focus loss."""
+        """Build labelled min-to-max entries that commit and replot on Return or focus loss."""
         _label(master, label).pack(side='left', padx=(0, 2))
         for i, var in enumerate((min_var, max_var)):
             if i:
                 _label(master, 'to', dim=True).pack(side='left', padx=2)
             entry = _entry(master, var)
             entry.pack(side='left')
-            entry.bind('<Return>', lambda _e: self._replot())
-            entry.bind('<FocusOut>', lambda _e: self._replot())
+            entry.bind('<Return>', lambda _e, v=var: self._commit_range(v))
+            entry.bind('<FocusOut>', lambda _e, v=var: self._commit_range(v))
+
+    def _commit_range(self, var: tk.StringVar) -> None:
+        """Clear unusable text, a Log bound <= 0, or the other intensity bound when Min >= Max."""
+        if var.get().strip() and _parse_float(var.get()) is None:
+            var.set('')
+        elif var is self.zmin_var or var is self.zmax_var:
+            if self.scale_var.get() == 'log':
+                var.set(_log_bound(var.get()))  # as switching to Log does
+            lo, hi = _parse_float(self.zmin_var.get()), _parse_float(self.zmax_var.get())
+            if lo is not None and hi is not None and lo >= hi:
+                (self.zmax_var if var is self.zmin_var else self.zmin_var).set('')
+        self._replot()
+
+    def _commit_ceiling(self, _event=None) -> None:
+        """Show the ceiling in use: a number clamped to 50-100, anything else 100."""
+        try:
+            typed = float(self.ceiling_var.get())
+        except (ValueError, tk.TclError):
+            typed = None
+        value = (min(max(typed, 50.0), 100.0)
+                 if typed is not None and np.isfinite(typed) else 100.0)
+        if value != typed:
+            self.ceiling_var.set(value)
 
     def _set_toggle(self, var: tk.StringVar, buttons: dict, value: str) -> None:
         """Switch a toggle group and replot; bank, x axis and scan filter reload the rows."""
+        if var is self.bank_var:
+            # Typed intensities belong to their bank (scales differ several-fold): keep the
+            # old bank's, show the new bank's own (blank = auto)
+            self._bank_limits[var.get()] = (self.zmin_var.get(), self.zmax_var.get())
+            lo, hi = self._bank_limits.get(value, ('', ''))
+            self.zmin_var.set(lo)
+            self.zmax_var.set(hi)
+            # So does a typed title; a bank not yet titled shows its default
+            self._bank_titles[var.get()] = self.title_var.get()
+            self.title_var.set(self._bank_titles.get(value, self._default_title(value)))
         var.set(value)
         for val, btn in buttons.items():
             btn.set_selected(val == value)
+        if var is self.scale_var and value == 'log':
+            # Log cannot use a typed bound <= 0, in any bank: it returns to the automatic floor
+            self.zmin_var.set(_log_bound(self.zmin_var.get()))
+            self.zmax_var.set(_log_bound(self.zmax_var.get()))
+            self._bank_limits = {bank: (_log_bound(lo), _log_bound(hi))
+                                 for bank, (lo, hi) in self._bank_limits.items()}
         if var is self.xaxis_var:
             self._set_entries(self.xmin_var, self.xmax_var)
         if var is self.bank_var or var is self.xaxis_var:
@@ -615,10 +735,24 @@ class HeatmapWindow(tk.Toplevel):
         max_var.set('' if hi is None else f'{hi:g}')
 
     def _reset_ranges(self) -> None:
-        """Clear the x and intensity ranges and reset the ceiling."""
+        """Clear the x and every bank's intensity ranges and reset the ceiling."""
         self._set_entries(self.xmin_var, self.xmax_var)
         self._set_entries(self.zmin_var, self.zmax_var)
+        self._bank_limits.clear()
         self.ceiling_var.set(100.0)
+        self._replot()
+
+    def _apply_to_all_banks(self) -> None:
+        """Confirm, then give every bank the shown map's intensity range."""
+        if self._matrix is None:
+            return
+        _matrix, vmin, vmax, _log = self._colour_scale(self._x, self._matrix)
+        if not messagebox.askyesno(
+                'Confirm', f'Apply intensity range {vmin:g} - {vmax:g} to all banks?',
+                parent=self):
+            return
+        self._set_entries(self.zmin_var, self.zmax_var, vmin, vmax)
+        self._bank_limits = dict.fromkeys(self._banks, (self.zmin_var.get(), self.zmax_var.get()))
         self._replot()
 
     # ------------------------------------------------------------------
@@ -634,9 +768,12 @@ class HeatmapWindow(tk.Toplevel):
                 self._matrices[key] = build_xrd_matrix(
                     neutron_bank_arrays(self._neutron, *key))
         else:
-            key = ('xrd', '')
+            key = ('xrd', self.xaxis_var.get())
             if key not in self._matrices:
-                self._matrices[key] = build_xrd_matrix(self._oned_arrays)
+                x, matrix, scan_nums = build_xrd_matrix(self._oned_arrays)
+                if key[1] == 'd':
+                    x, matrix = dspacing_columns(x, matrix, self._wavelength)
+                self._matrices[key] = (x, matrix, scan_nums)
         return self._matrices[key]
 
     def _rows_for(self, bank: Optional[str] = None) -> tuple:
@@ -649,8 +786,16 @@ class HeatmapWindow(tk.Toplevel):
         return x, matrix, scan_nums
 
     def _apply_exclusions(self) -> None:
-        """Re-read the Exclude entry and reload the rows when it changed."""
-        excluded = set(parse_scan_range(self.exclude_var.get()))
+        """Re-read the Exclude entry and reload the rows when it changed.
+        Text naming no scan keeps the previous exclusions and their text; blank clears them."""
+        text = self.exclude_var.get()
+        excluded = set(parse_scan_range(text, self._max_scan))
+        if text.strip() and not excluded:
+            logger.warning(f"Exclude '{text}' names no scan from 1 to {self._max_scan} "
+                           f"({SCAN_RANGE_HINT}); the previous exclusions are kept")
+            self.exclude_var.set(self._exclude_text)
+            return
+        self._exclude_text = text
         if excluded != self._excluded:
             self._excluded = excluded
             self._load_matrix()
@@ -663,13 +808,44 @@ class HeatmapWindow(tk.Toplevel):
 
     def _x_label(self) -> str:
         """Return the axis label for the selected x quantity."""
-        if self.is_neutron:
-            return NEUTRON_AXES.get(self.xaxis_var.get(), XRD_XLABEL)
-        return XRD_XLABEL
+        axes = NEUTRON_AXES if self.is_neutron else XRD_AXES
+        return axes.get(self.xaxis_var.get(), TWOTHETA_LABEL)
+
+    def _x_inverted(self) -> bool:
+        """True when x is drawn decreasing: X-ray d-spacing, kept in 2θ's order."""
+        return not self.is_neutron and self.xaxis_var.get() == 'd'
+
+    def _default_title(self, bank: Optional[str] = None) -> str:
+        """Return the default map title: 'Bank N' for neutron maps, empty for X-ray."""
+        return f'Bank {bank or self.bank_var.get()}' if self.is_neutron else ''
 
     def _map_title(self, bank: Optional[str] = None) -> str:
-        """Return 'Bank N' for neutron maps, empty for X-ray."""
-        return f'Bank {bank or self.bank_var.get()}' if self.is_neutron else ''
+        """Return a bank's title as drawn: the shown bank's from the entry, else the kept one."""
+        if bank is None or bank == self.bank_var.get():
+            text = self.title_var.get()
+        else:
+            text = self._bank_titles.get(bank, self._default_title(bank))
+        title = title_text(text)
+        # Every draw and export comes here, so the screen, a bank switch and exports all warn
+        if title != text.strip() and text.strip() not in self._warned_titles:
+            self._warned_titles.add(text.strip())
+            logger.warning(f"Title '{text}' is not valid mathtext; it is shown as typed")
+        return title
+
+    def _apply_title(self) -> None:
+        """Redraw on a changed title."""
+        if self._map_title() != self.ax_map.get_title():
+            self._replot()
+
+    def _apply_title_to_all_banks(self) -> None:
+        """Confirm, then give every bank the shown map's title."""
+        text = self.title_var.get()
+        prompt = (f"Apply title '{text.strip()}' to all banks?" if text.strip()
+                  else 'Clear the title of all banks?')
+        if not messagebox.askyesno('Confirm', prompt, parent=self):
+            return
+        self._bank_titles = dict.fromkeys(self._banks, text)
+        self._apply_title()
 
     def _y_values(self, scan_nums: Optional[List[int]] = None):
         """Return (row values, label) for the map's rows.
@@ -690,8 +866,15 @@ class HeatmapWindow(tk.Toplevel):
             lo, hi = hi, lo
         return lo, hi
 
-    def _colour_scale(self, x, matrix) -> Tuple[np.ndarray, float, float, bool]:
-        """Return (matrix, vmin, vmax, log) for the current controls.
+    def _typed_limits(self, bank: Optional[str] = None) -> Tuple[str, str]:
+        """Return a bank's typed (min, max) intensity text; the entries for the shown bank."""
+        if bank is None or bank == self.bank_var.get():
+            return self.zmin_var.get(), self.zmax_var.get()
+        return self._bank_limits.get(bank, ('', ''))
+
+    def _colour_scale(self, x, matrix,
+                      bank: Optional[str] = None) -> Tuple[np.ndarray, float, float, bool]:
+        """Return (matrix, vmin, vmax, log) for the current controls and a bank (None = shown).
         Limits come from the columns inside the x range; log mode clips at VMIN_FLOOR."""
         log = self.scale_var.get() == 'log'
         matrix = np.asarray(matrix, dtype=float)
@@ -706,9 +889,9 @@ class HeatmapWindow(tk.Toplevel):
             ceiling = float(self.ceiling_var.get())
         except (ValueError, tk.TclError):
             ceiling = 100.0
+        zmin, zmax = self._typed_limits(bank)
         vmin, vmax = intensity_limits(
-            sample, ceiling, _parse_float(self.zmin_var.get()),
-            _parse_float(self.zmax_var.get()), log)
+            sample, ceiling, _parse_float(zmin), _parse_float(zmax), log)
         if log:
             matrix = np.clip(matrix, VMIN_FLOOR, None)
         return matrix, vmin, vmax, log
@@ -752,21 +935,29 @@ class HeatmapWindow(tk.Toplevel):
     # Plotting
     # ------------------------------------------------------------------
 
-    def _queue_replot(self, *_):
+    def _queue_replot(self):
         """Debounce ceiling-spinbox edits into one replot."""
         if self._replot_job is not None:
             self.after_cancel(self._replot_job)
         self._replot_job = self.after(250, self._replot)
 
+    def _cancel_replot(self, event) -> None:
+        """Cancel a queued replot when the window closes, as its callback goes with the window."""
+        if event.widget is self and self._replot_job is not None:
+            self.after_cancel(self._replot_job)
+
     def _replot(self):
         """Redraw the heatmap and voltage track for the current controls."""
-        self._replot_job = None
-        if not self.winfo_exists():
-            return
+        if self._replot_job is not None:  # a direct redraw replaces a queued one
+            self.after_cancel(self._replot_job)
+            self._replot_job = None
 
         ax = self.ax_map
         ax.cla()
-        self.cax.cla()
+        # A colour bar keeps every earlier one on its axes alive, with its map, so each
+        # map gets a fresh colour-bar axes in the same grid slot
+        self._fig.delaxes(self.cax)
+        self.cax = self._fig.add_subplot(self.cax.get_subplotspec())
 
         y_vals, y_label = self._y_values()
         _style_ax(ax, self._x_label(), y_label, self._map_title())
@@ -791,6 +982,8 @@ class HeatmapWindow(tk.Toplevel):
             xlim = ax.get_xlim()
             ax.set_xlim(lo if lo is not None else xlim[0],
                         hi if hi is not None else xlim[1])
+        if self._x_inverted():
+            ax.invert_xaxis()
 
         colorbar = self._fig.colorbar(mesh, cax=self.cax)
         colorbar.ax.set_facecolor(PLOT_BG)
@@ -820,7 +1013,7 @@ class HeatmapWindow(tk.Toplevel):
             return
         curve = self._voltage_curve(self._scan_nums, y_vals, time_axis)
         if curve is None:
-            _stub(ax, 'No echem')
+            _stub(ax, 'No echem data available')
             return
         ax.plot(curve[0], curve[1], color=CHARGE_COLOR, lw=1.2)
 
@@ -830,7 +1023,8 @@ class HeatmapWindow(tk.Toplevel):
 
     def _export_stem(self, bank: Optional[str] = None) -> str:
         """Return the default file stem for an export."""
-        return f'heatmap_bank{bank or self.bank_var.get()}' if self.is_neutron else 'heatmap'
+        name = f'{self._file_stem}_heatmap'
+        return f'{name}_bank{bank or self.bank_var.get()}' if self.is_neutron else name
 
     def render_figure(self, bank: Optional[str] = None,
                       dpi: int = EXPORT_DPI) -> Optional[Figure]:
@@ -840,11 +1034,12 @@ class HeatmapWindow(tk.Toplevel):
         if matrix is None:
             return None
         y_vals, y_label = self._y_values(scan_nums)
-        matrix, vmin, vmax, log = self._colour_scale(x, matrix)
+        # Each bank uses its own typed intensities, else its own auto range
+        matrix, vmin, vmax, log = self._colour_scale(x, matrix, bank)
         return publication_figure(
             x, y_vals, matrix, x_label=self._x_label(), y_label=y_label,
             cmap=self._cmap(), vmin=vmin, vmax=vmax, log=log,
-            x_range=self._x_range(),
+            x_range=self._x_range(), invert_x=self._x_inverted(),
             voltage=self._voltage_curve(scan_nums, y_vals, y_label == TIME_HOURS_LABEL),
             title=self._map_title(bank), dpi=dpi)
 
@@ -862,10 +1057,10 @@ class HeatmapWindow(tk.Toplevel):
     def _export_figure(self) -> None:
         """Save the displayed map as a publication figure."""
         if self._matrix is None:
-            messagebox.showwarning('No data', 'Nothing to export.', parent=self)
+            messagebox.showwarning('No data', 'Nothing to export', parent=self)
             return
         path = filedialog.asksaveasfilename(
-            parent=self, title='Export heatmap figure',
+            parent=self, title='Export Heatmap Figure',
             defaultextension='.png', filetypes=EXPORT_FILETYPES,
             initialfile=self._export_stem() + '.png')
         if not path:
@@ -873,16 +1068,21 @@ class HeatmapWindow(tk.Toplevel):
         try:
             self.save_figure(path)
         except Exception as exc:
-            messagebox.showerror('Export failed', str(exc), parent=self)
+            logger.debug('Heatmap export error: %s', traceback.format_exc())
+            messagebox.showerror('Export failed', f'Heatmap could not be exported: {exc}',
+                                 parent=self)
             return
-        messagebox.showinfo('Export complete', f'Saved {path}', parent=self)
+        messagebox.showinfo('Export complete', f'Heatmap exported to:\n{path}', parent=self)
 
     def _export_all_banks(self) -> None:
         """Save one publication figure per bank, bank number appended."""
+        if not any(self._rows_for(bank)[1] is not None for bank in self._banks):
+            messagebox.showwarning('No data', 'No bank has patterns on this axis', parent=self)
+            return
         path = filedialog.asksaveasfilename(
-            parent=self, title='Export all banks (the bank number is appended)',
+            parent=self, title='Export All Banks (the bank number is appended)',
             defaultextension='.png', filetypes=EXPORT_FILETYPES,
-            initialfile='heatmap.png')
+            initialfile=f'{self._file_stem}_heatmap.png')
         if not path:
             return
         stem, ext = os.path.splitext(path)
@@ -893,11 +1093,10 @@ class HeatmapWindow(tk.Toplevel):
                 if self.save_figure(out, bank):
                     written.append(out)
         except Exception as exc:
-            messagebox.showerror('Export failed', str(exc), parent=self)
+            logger.debug('Heatmap export error: %s', traceback.format_exc())
+            messagebox.showerror('Export failed', f'Heatmaps could not be exported: {exc}',
+                                 parent=self)
             return
-        if not written:
-            messagebox.showwarning('No data', 'No bank has patterns on this axis.',
-                                   parent=self)
-            return
-        messagebox.showinfo('Export complete',
-                            'Saved:\n' + '\n'.join(written), parent=self)
+        noun = 'Heatmap' if len(written) == 1 else 'Heatmaps'
+        messagebox.showinfo('Export complete', f'{noun} exported to:\n' + '\n'.join(written),
+                            parent=self)

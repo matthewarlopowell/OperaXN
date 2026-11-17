@@ -10,10 +10,13 @@ Open an issue on the
 include:
 
 - your operating system and Python version
-- the OperaXN version (`pip show operaxn`)
+- the OperaXN version (`operaxn --version`)
 - the data source (laboratory XRD, synchrotron XRD or neutron) and file
   formats involved
-- the full traceback, or the log output from running with `operaxn --debug`
+- the full traceback, or the terminal output from running `operaxn --debug`
+
+Setting `OPERAXN_DEBUG=1` logs at debug level, as `--debug` does, and also
+writes the log to `operaxn.log` in the working folder.
 
 If the problem is specific to a data file and you are able to share it (or a
 minimal excerpt), that makes reproduction much easier.
@@ -29,9 +32,9 @@ output) can also be raised on the issue tracker.
 2. Install in development mode:
 
    ```bash
-   python3 -m venv .venv
+   python3 -m venv .venv       # Windows: py -m venv .venv
    source .venv/bin/activate   # Windows: .venv\Scripts\activate
-   pip install -e '.[test]'
+   pip install -e ".[test]"
    ```
 
 3. Make your changes, keeping each pull request focused on a single fix or
@@ -45,7 +48,7 @@ output) can also be raised on the issue tracker.
 Install the test dependencies and run pytest from the repository root:
 
 ```bash
-pip install -e '.[test]'
+pip install -e ".[test]"
 pytest
 ```
 
@@ -63,9 +66,10 @@ Notes:
   are skipped otherwise.
 
 The `[test]` extra includes FAIRmat's pynxtools, so the NeXus
-schema-validation tests run by default; they skip only if it is missing.
+schema-validation tests run by default; they skip if it is missing or cannot
+run (they fail instead with `OPERAXN_REQUIRE_VALIDATION=1`, which CI sets).
 Those tests copy the two NXDL files from `definitions/` into pynxtools'
-installed `contributed_definitions` directory, because the validator cannot
+installed `contributed_definitions` folder, because the validator cannot
 resolve `NXoperando_monopd` / `NXoperando_tofnpd` otherwise. Run them in a virtual
 environment rather than against a system Python install.
 

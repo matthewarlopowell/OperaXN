@@ -32,7 +32,7 @@ def _display_ts(value: Any) -> Any:
     if _RELATIVE_TS_RE.fullmatch(value):
         return value
     try:
-        return pd.to_datetime(value).strftime('%Y-%m-%d %H:%M:%S')
+        return pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
     except (ValueError, TypeError):
         return value
 
@@ -75,9 +75,44 @@ def is_canonical_nxs(path: str) -> bool:
         return False
 
 
+def read_data_source(path: str) -> Optional[str]:
+    """Return the data source ('inhouse', 'synchrotron', 'neutron') a canonical .nxs records.
+    None if unrecorded or unreadable; reads only load()'s fields, in its precedence, no scans."""
+    return _read_process_field(path, 'data_source')
+
+
+def read_correlation_method(path: str) -> Optional[str]:
+    """Return the correlation method ('absolute', 'relative') a canonical .nxs records, or None."""
+    return _read_process_field(path, 'correlation_method')
+
+
+def _read_process_field(path: str, field: str) -> Optional[str]:
+    """Return a recorded process text field (v4 process, else entry or global_metadata attrs)."""
+    try:
+        with h5py.File(path, 'r') as f:
+            entry = f.get('entry')
+            if _entry_is_canonical(entry):
+                process = entry.get('process')
+                value = (_dataset_scalar(process, field)
+                         if isinstance(process, h5py.Group) else None)
+                if value is None:
+                    value = entry.attrs.get(field)
+            else:
+                gm = f.get('global_metadata')
+                if not isinstance(gm, h5py.Group):
+                    return None
+                value = _dataset_scalar(gm, field)
+                if value is None:
+                    value = gm.attrs.get(field)
+            value = _decode(value)
+            return value if isinstance(value, str) and value else None
+    except Exception:
+        return None
+
+
 def load(path: str) -> ExperimentModel:
     """Load a canonical .nxs file into an ExperimentModel."""
-    model = ExperimentModel(source_path=os.path.abspath(path))
+    model = ExperimentModel()
 
     with h5py.File(path, 'r') as f:
         entry = f.get('entry')
@@ -86,7 +121,8 @@ def load(path: str) -> ExperimentModel:
         else:
             _load_legacy(f, model)
 
-    logger.info(f"Loaded {len(model.scans)} scans from {os.path.basename(path)}")
+    logger.info(f"Loaded {len(model.scans)} scan{'s' if len(model.scans) != 1 else ''} "
+                f"from {os.path.basename(path)}")
     return model
 
 
@@ -236,7 +272,7 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
         scan.neutron_start = start
         scan.neutron_end = end
 
-    # Monitor record (in-house EDF counters), when present
+    # Monitor record (laboratory EDF counters), when present
     mon = sub.get('monitor')
     if isinstance(mon, h5py.Group):
         monitor: Dict[str, Any] = {}
@@ -257,7 +293,7 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
     if isinstance(note, h5py.Group):
         scan.twod_source = _decode(_dataset_scalar(note, 'file_name'))
         embedded = _dataset_scalar(note, 'embedded')
-        scan.twod_embedded = bool(embedded) if embedded is not None else False
+        scan.twod_embedded = bool(embedded)
         image = sub.get('image_data')
         if (scan.twod_embedded and isinstance(image, h5py.Group)
                 and 'data' in image):
@@ -303,10 +339,10 @@ def _read_xrd_v3(grp: h5py.Group, scan: ScanData) -> None:
 
 def _read_twod_attrs(grp: h5py.Group, scan: ScanData) -> None:
     """Set the 2D source, embed flag and embedded image from twod_* attrs (v3 and legacy)."""
-    scan.twod_source = _decode(grp.attrs.get('twod_source_path')) or \
-        _decode(grp.attrs.get('twod_source'))
+    scan.twod_source = (_decode(grp.attrs.get('twod_source_path'))
+                        or _decode(grp.attrs.get('twod_source')))
     embedded = grp.attrs.get('twod_embedded')
-    scan.twod_embedded = bool(embedded) if embedded is not None else False
+    scan.twod_embedded = bool(embedded)
 
     if scan.twod_embedded and 'twod_image' in grp:
         scan.twod = np.asarray(grp['twod_image'][()], dtype=float)
@@ -452,9 +488,9 @@ def _read_echem_series(grp: h5py.Group) -> Optional[pd.DataFrame]:
         if start is not None and len(seconds) == len(v):
             start_ts = pd.to_datetime(start)
             if start_ts.tzinfo is not None:
-                # in-memory model uses naive local wall time throughout
+                # The in-memory model uses naive local wall time throughout
                 start_ts = start_ts.tz_localize(None)
-            # float-seconds storage can be ~1 ns off; source data (and the
+            # Float-seconds storage can be ~1 ns off; source data (and the
             # v3 string format) never exceeds microsecond resolution
             timestamps = (start_ts + pd.to_timedelta(seconds, unit='s')).round('us')
             df = pd.DataFrame({"timestamp": timestamps,
@@ -560,8 +596,6 @@ def _decode(value: Any) -> Optional[Any]:
         return None
     if isinstance(value, bytes):
         return value.decode('utf-8', errors='ignore')
-    if isinstance(value, np.bytes_):
-        return bytes(value).decode('utf-8', errors='ignore')
     if isinstance(value, (np.integer, np.floating, np.bool_)):
         return value.item()
     if isinstance(value, np.ndarray):

@@ -11,36 +11,27 @@ files are never re-read per scan. Relative time is a display-only view; the
 import logging
 import os
 import shutil
+import threading
+from collections.abc import Mapping
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import h5py
 import numpy as np
 import pandas as pd
 
-from core import ECHEM_TIME_TOLERANCE, SYNCHROTRON_MAX_DISPLAY_SIZE
-from core import (  # noqa: F401  (GUI scan labels)
+from .core import (  # noqa: F401  (GUI scan labels)
     NeutronFileGrouper,
     SynchrotronFileGrouper,
 )
-from core import EchemParser, format_relative_time, parse_relative_time
-from core import (
-    cache_dir, convert_tabular_to_txt, default_cache_path, generate,
+from .core import (
+    CYCLING_PROTOCOL_FIELDS, ECHEM_TIME_TOLERANCE, SYNCHROTRON_MAX_DISPLAY_SIZE,
+    DataReaderFactory, DataSourceType, EchemParser, HDFReader, ScanData, TimeMethod,
+    cache_dir, clear_global_cache, convert_tabular_to_txt, default_cache_path,
+    format_relative_time, generate, is_canonical_nxs, load, parse_relative_time,
+    write_standard_echem_group,
 )
-from core import (  # noqa: F401  (re-exported for package API)
-    DataSourceType,
-    DataType,
-    FileType,
-    ScanData,
-    TimeMethod,
-)
-from core import is_canonical_nxs, load
-from core import write_standard_echem_group
-from core.nxs_writer import CYCLING_PROTOCOL_FIELDS
-from core import (  # noqa: F401  (clear_global_cache used by gui.py)
-    DataReaderFactory,
-    HDFReader,
-    clear_global_cache,
-)
+# gui.py imports replace_when_done from here
+from .core.nxs_writer import replace_when_done
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +42,9 @@ _session: Dict[str, Any] = {
     "input_paths": None,  # None = opened a .nxs directly (user's own file)
     "exported": False,
     "standard_echem": [],
+    "stem": None,  # export-name stem; kept when a working copy replaces nxs_path
+    "data_source": None,  # DataSourceType the loaded experiment is displayed as
+    "images_nxs": None,  # the .nxs whose <stem>_images sidecar 2D sources resolve against
 }
 
 
@@ -79,6 +73,16 @@ def cleanup_session_cache() -> None:
             logger.debug(f"Removed cache images dir: {images_dir}")
     except OSError as e:
         logger.debug(f"Could not remove cache file {path}: {e}")
+
+
+def reset_session() -> None:
+    """Clean up the session cache (as cleanup_session_cache), then forget the loaded experiment."""
+    cleanup_session_cache()
+    # The file cache holds the forgotten experiment's 2D images
+    clear_global_cache()
+    _session.update(nxs_path=None, input_paths=None, exported=False,
+                    standard_echem=[], global_metadata={}, stem=None, data_source=None,
+                    images_nxs=None)
 
 
 # ============================================================================
@@ -123,8 +127,6 @@ def _scan_to_dict(sd: ScanData) -> Dict[str, Any]:
         "timestamp": sd.timestamp,
         "original_timestamp": sd.timestamp,
         "exposure_time": sd.exposure_time,
-        "oned_exposure": None,
-        "twod_exposure": None,
         "neutron_start": sd.neutron_start,
         "neutron_end": sd.neutron_end,
         "timestamp_for_correlation": timestamp_for_correlation,
@@ -133,17 +135,11 @@ def _scan_to_dict(sd: ScanData) -> Dict[str, Any]:
 
 
 def _apply_relative_view(scan_dicts: List[Dict[str, Any]],
-                         echem_df: Optional[pd.DataFrame],
-                         data_source: DataSourceType) -> None:
+                         echem_df: Optional[pd.DataFrame]) -> None:
     """Rewrite scan and echem timestamps in place as HH:MM:SS offsets (display only).
-    Scan t=0 is the earliest correlation midpoint (XRD scans only, all scans for neutron) and
-    echem t=0 its earliest point; mirrors ScanProcessor._apply_relative_time (off in generate())."""
-    if data_source == DataSourceType.NEUTRON:
-        candidates = scan_dicts
-    else:
-        candidates = [s for s in scan_dicts if s.get("oned") or s.get("twod")]
-
-    refs = [s["timestamp_for_correlation"] for s in candidates
+    Scan t=0 is the earliest correlation midpoint of all scans, as the correlator set it,
+    and echem t=0 its earliest point."""
+    refs = [s["timestamp_for_correlation"] for s in scan_dicts
             if s.get("timestamp_for_correlation") is not None]
     reference_time = min(refs) if refs else None
 
@@ -177,7 +173,7 @@ def _apply_relative_view(scan_dicts: List[Dict[str, Any]],
 def process_paths(selected_paths: List[str],
                   progress_callback: Optional[Callable] = None,
                   time_method: Optional[TimeMethod] = None,
-                  data_source: DataSourceType = DataSourceType.INHOUSE,
+                  data_source: DataSourceType = DataSourceType.INHOUSE, *,
                   standard_echem_files: Optional[List[str]] = None,
                   include_2d_images: bool = False,
                   twod_max_display_size: int = 0,
@@ -186,11 +182,16 @@ def process_paths(selected_paths: List[str],
                   sample_description: Optional[str] = None,
                   sample_preparation_date: Optional[str] = None,
                   cycling_protocol: Optional[Dict[str, Any]] = None,
-                  echem_time_tolerance: Optional[float] = None
+                  echem_time_tolerance: Optional[float] = None,
+                  cancel: Optional[threading.Event] = None
                   ) -> tuple:
     """Generate (or open) the canonical .nxs, load it and return (scan_dicts, echem_df, method).
-    time_method defaults to absolute and echem_time_tolerance (s) to the core default; options
-    after data_source only shape the generated file and are ignored for a directly opened .nxs."""
+    time_method defaults to absolute and echem_time_tolerance (s) to the core default. A directly
+    opened .nxs ignores the generation options after data_source and shows its recorded source
+    and correlation method. Raises RuntimeError with the fatal messages when generation fails,
+    or is cancelled through `cancel` (core.generate)."""
+    if isinstance(selected_paths, (str, os.PathLike)):
+        selected_paths = [selected_paths]
     paths = [str(p) for p in selected_paths]
     empty = ([], pd.DataFrame(columns=["timestamp", "echem_data", "current"]),
              TimeMethod.ABSOLUTE.value)
@@ -200,11 +201,20 @@ def process_paths(selected_paths: List[str],
 
     if time_method is None:
         time_method = TimeMethod.ABSOLUTE
+    time_method, data_source = TimeMethod(time_method), DataSourceType(data_source)
     if echem_time_tolerance is None:
         echem_time_tolerance = ECHEM_TIME_TOLERANCE
 
     # A new load replaces the session: drop the previous unsaved cache file
     cleanup_session_cache()
+
+    # A .nxs HDF5 cannot open is named here: the canonical check would take it for raw data
+    if len(paths) == 1 and paths[0].lower().endswith(".nxs"):
+        try:
+            h5py.File(paths[0], "r").close()
+        except OSError as e:
+            raise RuntimeError(f"{os.path.basename(paths[0])} could not be opened "
+                               f"(damaged, incomplete or in use by another program: {e})") from e
 
     # Direct canonical .nxs upload skips generation
     direct_nxs = (len(paths) == 1 and paths[0].lower().endswith(".nxs")
@@ -230,39 +240,67 @@ def process_paths(selected_paths: List[str],
             cycling_protocol=cycling_protocol,
             echem_time_tolerance=echem_time_tolerance,
             progress_callback=progress_callback,
+            cancel=cancel,
         )
         if not success:
-            logger.error(f"NeXus generation failed: {messages}")
-            return empty
-        if progress_callback:
-            # Non-fatal warnings (e.g. a 2D sidecar that could not be
-            # persisted) would otherwise never reach the user on success
-            for msg in messages:
-                if msg.startswith("Warning"):
-                    progress_callback(msg)
+            # The box shows why; non-fatal warnings stay in the terminal log
+            fatal = [m.removeprefix("Error: ") for m in messages if not m.startswith("Warning")]
+            if cancel is None or not cancel.is_set():
+                logger.error(f"NeXus generation failed: {'; '.join(fatal) or 'unknown error'}")
+            # A ZIP load's 2D sidecar is written before the .nxs; nothing else uses it now
+            images_dir = os.path.splitext(nxs_path)[0] + "_images"
+            if os.path.isfile(os.path.join(images_dir, ".operaxn_images")):
+                shutil.rmtree(images_dir, ignore_errors=True)
+            raise RuntimeError("\n".join(fatal) or "NeXus generation failed")
 
     _session["nxs_path"] = os.path.abspath(nxs_path)
+    _session["images_nxs"] = _session["nxs_path"]
     _session["input_paths"] = None if direct_nxs else paths
     _session["exported"] = False
+
+    _session["stem"] = os.path.splitext(os.path.basename(nxs_path))[0]
 
     model = load(nxs_path)
     _session["global_metadata"] = dict(model.global_metadata or {})
     _session["standard_echem"] = [dict(item) for item in model.standard_echem]
 
-    if model.data_source and model.data_source != data_source.value:
-        logger.warning(
-            f"Loaded file was generated as '{model.data_source}' but "
-            f"'{data_source.value}' was selected; displaying file contents as-is")
+    # A directly opened file is shown as the source it records, whatever
+    # was selected; an unknown or missing record keeps the selection
+    if direct_nxs and model.data_source and model.data_source != data_source.value:
+        try:
+            recorded = DataSourceType(model.data_source)
+        except ValueError:
+            logger.warning(f"Unknown data source '{model.data_source}' in "
+                           f"{os.path.basename(nxs_path)}; using '{data_source.value}'")
+        else:
+            logger.info(f"Opening {os.path.basename(nxs_path)} as its recorded "
+                        f"source '{recorded.value}' (selected '{data_source.value}')")
+            data_source = recorded
+    _session["data_source"] = data_source
+
+    # Likewise its recorded correlation method: the stored scan voltages were
+    # matched with it, so the other method would misplace every scan marker
+    method = model.global_metadata.get("correlation_method")
+    if direct_nxs and method and method != time_method.value:
+        try:
+            recorded_method = TimeMethod(method)
+        except ValueError:
+            logger.warning(f"Unknown correlation method '{method}' in "
+                           f"{os.path.basename(nxs_path)}; using '{time_method.value}'")
+        else:
+            logger.info(f"Opening {os.path.basename(nxs_path)} with its recorded "
+                        f"'{method}' time correlation (selected '{time_method.value}')")
+            time_method = recorded_method
 
     scan_dicts = [_scan_to_dict(sd) for sd in model.scans]
     echem_df = model.echem_df if model.echem_df is not None else pd.DataFrame(
         columns=["timestamp", "echem_data", "current"])
 
     if time_method == TimeMethod.RELATIVE:
-        _apply_relative_view(scan_dicts, echem_df, data_source)
+        _apply_relative_view(scan_dicts, echem_df)
 
     if progress_callback:
-        progress_callback(f"Loaded {len(scan_dicts)} scans")
+        progress_callback(f"Loaded {len(scan_dicts)} scan{'s' if len(scan_dicts) != 1 else ''}")
 
     return scan_dicts, echem_df, time_method.value
 
@@ -274,6 +312,16 @@ def process_paths(selected_paths: List[str],
 def get_loaded_nxs_path() -> Optional[str]:
     """Return the path of the canonical .nxs backing the loaded experiment."""
     return _session["nxs_path"]
+
+
+def get_experiment_stem() -> Optional[str]:
+    """Return the export-name stem: the loaded file's, kept after an echem working copy."""
+    return _session.get("stem")
+
+
+def get_loaded_data_source() -> Optional[DataSourceType]:
+    """Return the source the loaded experiment is shown as (a direct .nxs: its recorded one)."""
+    return _session.get("data_source")
 
 
 def get_experiment_metadata() -> Dict[str, Any]:
@@ -357,7 +405,7 @@ def _geometry_rows(table: Any, label: str, value_format: str) -> List[Dict[str, 
         numbers = [int(n) for n in np.atleast_1d(columns[0])]
         distance = [float(d) for d in np.atleast_1d(columns[1])]
         polar = [float(p) for p in np.atleast_1d(columns[2])]
-    except (TypeError, ValueError):
+    except (ValueError, TypeError):
         return []
     if not len(numbers) == len(distance) == len(polar):
         return []
@@ -392,16 +440,17 @@ def add_standard_echem_files(paths: List[str]) -> List[Dict[str, Any]]:
     for path in paths:
         source_path = str(path)
         parse_path = convert_tabular_to_txt(source_path)
+        if parse_path.lower().endswith((".xlsx", ".csv")):
+            continue  # conversion failed, already logged
         try:
-            data = parser.parse(parse_path)
+            data = parser.parse(parse_path, os.path.basename(source_path))
         finally:
             if parse_path != source_path:
                 try:
                     os.remove(parse_path)
                 except OSError:
                     pass
-        if data is None or data.empty:
-            logger.warning("No electrochemistry data found in %s", source_path)
+        if data is None:  # the parser named the file
             continue
         additions.append({
             "source_file": os.path.basename(source_path),
@@ -432,6 +481,7 @@ def add_standard_echem_files(paths: List[str]) -> List[Dict[str, Any]]:
         # Carry an OperaXN 2D images sidecar along with the working copy so
         # later exports keep their by-reference images viewable
         src_images = os.path.splitext(nxs_path)[0] + "_images"
+        sidecar_copied = True
         if (os.path.isdir(src_images) and
                 os.path.isfile(os.path.join(src_images, ".operaxn_images"))):
             work_images = os.path.splitext(working_path)[0] + "_images"
@@ -441,8 +491,12 @@ def add_standard_echem_files(paths: List[str]) -> List[Dict[str, Any]]:
                 shutil.copytree(src_images, work_images)
             except OSError as e:
                 logger.warning(f"Could not copy 2D images sidecar: {e}")
+                # 2D sources keep resolving against the opened file's sidecar
+                sidecar_copied = False
         nxs_path = working_path
         _session["nxs_path"] = nxs_path
+        if sidecar_copied:
+            _session["images_nxs"] = nxs_path
         _session["input_paths"] = [os.path.abspath(paths[0])]
 
     _write_standard_echem_group(nxs_path, combined)
@@ -451,24 +505,27 @@ def add_standard_echem_files(paths: List[str]) -> List[Dict[str, Any]]:
     return additions
 
 
-def export_nxs(destination: str,
-               progress_callback: Optional[Callable] = None) -> tuple:
+def export_nxs(destination: str) -> tuple:
     """Save the loaded experiment's canonical .nxs to destination; return (success, messages).
     The <stem>_images sidecar (ZIP loads persist 2D sources there) is copied alongside."""
     source = _session["nxs_path"]
     if not source or not os.path.isfile(source):
         return False, ["No experiment loaded"]
 
-    if progress_callback:
-        progress_callback("Exporting NeXus file...")
     messages = ["NeXus file exported"]
-    if os.path.abspath(source) != os.path.abspath(destination):
-        shutil.copyfile(source, destination)
+    # realpath + normcase: another spelling of the open file (a mapped drive against its UNC
+    # name, a link, a case-only rename on Windows) is the same file
+    if (os.path.normcase(os.path.realpath(source))
+            != os.path.normcase(os.path.realpath(destination))):
+        with replace_when_done(destination) as part:
+            shutil.copyfile(source, part)
         # ZIP loads persist their 2D sources in a sidecar folder; copy it so
         # the exported file stays viewable after the session cache is cleaned
-        images_dir = os.path.splitext(source)[0] + "_images"
-        if os.path.isdir(images_dir):
-            dest_images = os.path.splitext(destination)[0] + "_images"
+        images_dir = os.path.splitext(_session.get("images_nxs") or source)[0] + "_images"
+        dest_images = os.path.splitext(destination)[0] + "_images"
+        # Saving over the opened file: its own sidecar is already in place
+        if (os.path.isdir(images_dir) and os.path.normcase(os.path.realpath(images_dir))
+                != os.path.normcase(os.path.realpath(dest_images))):
             try:
                 if os.path.isdir(dest_images):
                     # Only replace a sidecar this tool created; never a
@@ -505,7 +562,7 @@ def _resolve_twod_source(path: Any) -> Optional[str]:
     if not path:
         return None
     path = str(path)
-    nxs = _session.get("nxs_path")
+    nxs = _session.get("images_nxs") or _session.get("nxs_path")
     if nxs:
         # Recorded paths may carry the other OS's separators
         norm = (path.replace("/", os.sep) if os.sep == "\\"
@@ -551,7 +608,7 @@ def _load_twod_image(sd: ScanData, state: Any = None) -> Optional[np.ndarray]:
         return None
 
 
-def make_oned_arrays(scans: List[Dict[str, Any]], state: Any = None
+def make_oned_arrays(scans: List[Dict[str, Any]]
                      ) -> Dict[int, Dict[str, Any]]:
     """Build {scan_num: {x, y, timestamp, echem, current}} from 1D scans."""
     plot_data = {}
@@ -572,30 +629,48 @@ def make_oned_arrays(scans: List[Dict[str, Any]], state: Any = None
     return plot_data
 
 
+class _TwoDArrays(Mapping):
+    """Read-on-access {scan_num: {image, timestamp, echem, current}} over the 2D scans.
+    Images come through the reader cache when a scan is shown; an unreadable one maps to
+    {"error": True} from its first read on."""
+
+    def __init__(self, scans: List[Dict[str, Any]], state: Any = None) -> None:
+        self._scans = {scan["scan_num"]: scan for scan in scans
+                       if _scan_data(scan) is not None and scan.get("twod")}
+        self._state = state
+        self._failed: set = set()
+
+    def __getitem__(self, scan_num: int) -> Dict[str, Any]:
+        scan = self._scans[scan_num]
+        image = (None if scan_num in self._failed
+                 else _load_twod_image(_scan_data(scan), self._state))
+        if image is None:
+            # A missing source (drive away, folder moved) is retried when next shown
+            if _resolve_twod_source(_scan_data(scan).twod_source) is not None:
+                self._failed.add(scan_num)
+            return {"error": True}
+        return {
+            "image": image,
+            "timestamp": scan["timestamp"],
+            "echem": scan.get("echem"),
+            "current": scan.get("current"),
+        }
+
+    def __contains__(self, scan_num: object) -> bool:
+        return scan_num in self._scans
+
+    def __iter__(self):
+        return iter(self._scans)
+
+    def __len__(self) -> int:
+        return len(self._scans)
+
+
 def make_twod_arrays(scans: List[Dict[str, Any]], state: Any = None
-                     ) -> Dict[int, Dict[str, Any]]:
-    """Build {scan_num: {image, timestamp, echem, current}} from 2D scans.
+                     ) -> Mapping:
+    """Return {scan_num: {image, timestamp, echem, current}} over the 2D scans, read on access.
     A scan whose image cannot be read maps to {"error": True}."""
-    plot_data = {}
-
-    for scan in scans:
-        sd = _scan_data(scan)
-        if sd is None or not scan.get("twod"):
-            continue
-
-        image = _load_twod_image(sd, state)
-
-        if image is not None:
-            plot_data[scan["scan_num"]] = {
-                "image": image,
-                "timestamp": scan["timestamp"],
-                "echem": scan.get("echem"),
-                "current": scan.get("current"),
-            }
-        else:
-            plot_data[scan["scan_num"]] = {"error": True}
-
-    return plot_data
+    return _TwoDArrays(scans, state)
 
 
 def _neutron_xy(sd: ScanData) -> Dict[Any, Dict[str, Dict[str, Any]]]:
@@ -611,7 +686,7 @@ def _neutron_xy(sd: ScanData) -> Dict[Any, Dict[str, Dict[str, Any]]]:
     return neutron_data
 
 
-def make_neutron_arrays(scans: List[Dict[str, Any]], state: Any = None
+def make_neutron_arrays(scans: List[Dict[str, Any]]
                         ) -> Dict[int, Dict[str, Dict[str, Any]]]:
     """Build {scan_num: {measurement: {type: {x, y}}}} from neutron scans."""
     plot_data = {}
@@ -665,7 +740,6 @@ def make_echem_arrays(echem_df: Optional[pd.DataFrame],
 
 
 def get_correlated_data(scans: List[Dict[str, Any]],
-                        echem_df: Optional[pd.DataFrame],
                         scan_num: int,
                         state: Any = None) -> Optional[Dict[str, Any]]:
     """Collect all data (1D, 2D, neutron, echem values) for a single scan."""

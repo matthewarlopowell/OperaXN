@@ -1,9 +1,10 @@
-"""Assertion and skip helpers shared by the test suite.
+"""Assertion, skip and Tk event-loop helpers shared by the test suite.
 
 The writer stamps timestamps with the generating machine's local UTC
 offset; the reader returns naive local wall time. Assertions therefore
 compare wall-clock strings only, never raw ISO strings.
 """
+import logging
 import os
 import shutil
 import subprocess
@@ -12,7 +13,7 @@ import sys
 import pandas as pd
 import pytest
 
-import core
+from operaxn import core
 
 
 def need_dataset(relpath):
@@ -56,6 +57,19 @@ def tz_aware(value):
     return pd.to_datetime(_iso(value)).tzinfo is not None
 
 
+def named_records(caplog, *names, level=logging.WARNING):
+    """Return caplog's records at or above level whose message contains every name."""
+    return [r for r in caplog.records
+            if r.levelno >= level and all(name in r.getMessage() for name in names)]
+
+
+def export_failed(what, error):
+    """Return the decided 'Export failed' box; a list of errors is shown one per line."""
+    if isinstance(error, (list, tuple)):
+        return "Export failed", f"{what} could not be exported:\n" + "\n".join(error)
+    return "Export failed", f"{what} could not be exported: {error}"
+
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -69,9 +83,8 @@ def _same_bytes(a, b):
 
 
 def _register_definitions():
-    """Copy definitions/*.nxdl.xml into pynxtools; return False on failure.
-    Repo copies are authoritative and overwrite site-packages when bytes differ;
-    validate_nexus crashes on an unresolvable definition, so callers skip on False."""
+    """Copy definitions/*.nxdl.xml over pynxtools' copies when bytes differ; False on failure.
+    The validator crashes on an unresolvable definition, so callers skip on False."""
     try:
         import pynxtools
         dest = os.path.join(os.path.dirname(pynxtools.__file__),
@@ -91,17 +104,15 @@ def _register_definitions():
 
 
 def pynxtools_verdict(path):
-    """Return validate_nexus stdout+stderr for path, or None when unavailable.
-    None means no CLI, unregistrable definitions or a 300 s timeout. The CLI is
-    sought beside sys.executable first (unactivated venvs), then on PATH."""
-    exe = os.path.join(os.path.dirname(sys.executable),
-                       "validate_nexus.exe" if os.name == "nt" else "validate_nexus")
+    """Return `pynx validate` stdout+stderr for path; None without the CLI or the definitions,
+    or after 300 s. The CLI is sought beside sys.executable first (unactivated venvs), then PATH."""
+    exe = os.path.join(os.path.dirname(sys.executable), "pynx.exe" if os.name == "nt" else "pynx")
     if not os.path.isfile(exe):
-        exe = shutil.which("validate_nexus")
+        exe = shutil.which("pynx")
     if not exe or not _register_definitions():
         return None
     try:
-        result = subprocess.run([exe, path], capture_output=True, text=True,
+        result = subprocess.run([exe, "validate", path], capture_output=True, text=True,
                                 stdin=subprocess.DEVNULL, timeout=300)
     except subprocess.TimeoutExpired:
         return None
@@ -109,13 +120,48 @@ def pynxtools_verdict(path):
 
 
 def assert_pynxtools_valid(path, tag=""):
-    """Assert validate_nexus declares path valid; skip when validation is unavailable.
-    OPERAXN_REQUIRE_VALIDATION (set on every CI leg) turns that skip into a failure."""
+    """Assert `pynx validate` declares path valid; skip when validation is unavailable.
+    OPERAXN_REQUIRE_VALIDATION=1 (set on every CI leg) turns that skip into a failure."""
     out = pynxtools_verdict(path)
     if out is None:
-        if os.environ.get("OPERAXN_REQUIRE_VALIDATION"):
+        if os.environ.get("OPERAXN_REQUIRE_VALIDATION") == "1":
             pytest.fail("pynxtools validation unavailable but "
-                        "OPERAXN_REQUIRE_VALIDATION is set")
+                        "OPERAXN_REQUIRE_VALIDATION=1")
         pytest.skip("pynxtools validation unavailable")
     tail = out.strip().splitlines()[-1] if out.strip() else "no output"
     assert "is valid" in out, (f"{tag}: {tail}" if tag else tail)
+
+
+def modules_after(statement):
+    """Run `statement` in a fresh interpreter on this tree; return the names in its sys.modules."""
+    package_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(core.__file__))))
+    path = os.pathsep.join(filter(None, [package_root, os.environ.get("PYTHONPATH")]))
+    code = f"{statement}; import sys; print(' '.join(sys.modules))"
+    run = subprocess.run([sys.executable, "-c", code], env=dict(os.environ, PYTHONPATH=path),
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    return run.stdout.split()
+
+
+def pump(widget, ms):
+    """Run the Tk event loop for ms milliseconds, blocking the caller."""
+    widget.after(ms, widget.setvar, "pump_done", 1)
+    widget.wait_variable("pump_done")
+
+
+def pending_after_ids(root):
+    """Return the ids of the Tk timers still queued."""
+    return set(root.tk.splitlist(root.tk.call("after", "info")))
+
+
+def background_errors(root, run):
+    """Run run(), pump the event loop for 400 ms and return the Tcl background errors raised."""
+    errors = []
+    previous = root.tk.call("interp", "bgerror", "")
+    root.tk.call("interp", "bgerror", "", root.register(lambda *args: errors.append(args)))
+    try:
+        run()
+        pump(root, 400)
+    finally:
+        root.tk.call("interp", "bgerror", "", previous)
+    return errors

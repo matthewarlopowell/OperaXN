@@ -13,11 +13,13 @@ from .config import (
     SYNCHROTRON_MAX_DISPLAY_SIZE,
 )
 from .model import (
+    Cancelled,
     DataSourceType,
     DataType,
     ExperimentModel,
     FileRecord,
     FileType,
+    InputError,
     Scan,
     ScanData,
     TimeMethod,
@@ -51,22 +53,29 @@ from .correlate import (
     format_relative_time,
     parse_relative_time,
 )
-from .nxs_writer import NXSWriter, get_profile, write_standard_echem_group
-from .nxs_reader import is_canonical_nxs, load
-from .generate import (
+from .nxs_writer import (
+    CYCLING_PROTOCOL_FIELDS,
+    NXSWriter,
+    get_profile,
+    write_standard_echem_group,
+)
+from .nxs_reader import is_canonical_nxs, load, read_correlation_method, read_data_source
+from .pipeline import (
     FileProcessor,
     cache_dir,
+    check_scans,
     convert_tabular_to_txt,
     default_cache_path,
     generate,
     process_raw,
-    validate,
 )
 
 __all__ = [
     # Model
     'DataSourceType', 'DataType', 'ExperimentModel', 'FileRecord', 'FileType',
     'Scan', 'ScanData', 'TimeMethod',
+    # Exceptions
+    'Cancelled', 'InputError',
     # Readers
     'DataReaderFactory', 'DATReader', 'EDFReader', 'HDFReader', 'XYReader',
     'FABIO_AVAILABLE', 'clear_global_cache',
@@ -74,15 +83,16 @@ __all__ = [
     'DATClassifier', 'EDFClassifier', 'FileClassificationManager',
     'NeutronFileGrouper', 'NeutronMetadataParser', 'NexusMetadataExtractor',
     'SynchrotronFileGrouper', 'TXTClassifier',
-    'extract_edf_scan_fields', 'parse_mantid_header', 'get_profile',
+    'extract_edf_scan_fields', 'parse_mantid_header',
     'profile_from_mantid_nexus', 'format_profile_block',
     # Correlation
     'EchemParser', 'ScanProcessor', 'format_relative_time', 'parse_relative_time',
     # NeXus I/O
-    'NXSWriter', 'write_standard_echem_group', 'is_canonical_nxs', 'load',
+    'CYCLING_PROTOCOL_FIELDS', 'NXSWriter', 'get_profile', 'write_standard_echem_group',
+    'is_canonical_nxs', 'load', 'read_correlation_method', 'read_data_source',
     # Pipeline
-    'FileProcessor', 'cache_dir', 'convert_tabular_to_txt',
-    'default_cache_path', 'generate', 'process_raw', 'validate',
+    'FileProcessor', 'cache_dir', 'check_scans', 'convert_tabular_to_txt',
+    'default_cache_path', 'generate', 'process_raw',
     # Config
     'ECHEM_TIME_TOLERANCE', 'GENERATOR_NAME', 'GENERATOR_VERSION',
     'SYNCHROTRON_MAX_DISPLAY_SIZE',

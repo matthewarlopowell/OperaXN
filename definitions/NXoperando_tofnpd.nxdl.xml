@@ -117,11 +117,11 @@
                     synchronised and matched on absolute timestamps.
                     relative: streams are aligned on elapsed time
                     (unsynchronised clocks): the first electrochemistry point
-                    is taken as simultaneous with the first scan's correlation
-                    timestamp (scan_timestamp, the acquisition midpoint) and
-                    every scan is matched at its elapsed time from that
-                    origin; voltage_timestamp then stays in the
-                    electrochemistry clock.
+                    is taken as simultaneous with the earliest scan correlation
+                    timestamp (scan_timestamp, the acquisition midpoint;
+                    normally the first scan's) and every scan is matched at its
+                    elapsed time from that origin; voltage_timestamp then stays
+                    in the electrochemistry clock.
                 </doc>
                 <enumeration>
                     <item value="absolute"/>
@@ -316,6 +316,19 @@
             </attribute>
             <attribute name="auxiliary_signals" optional="true"/>
             <field name="time" type="NX_FLOAT" units="NX_TIME">
+                <doc>
+                    Elapsed time of each point in seconds from start.
+                    OperaXN keeps electrochemistry times as the local
+                    wall-clock times the potentiostat logged, so these are
+                    wall-clock differences. start is the first point's time,
+                    with the UTC offset of the generating computer's time
+                    zone at that moment. Across a daylight-saving change,
+                    start plus time taken in UTC is therefore one clock shift
+                    (normally one hour) off for the points after the change.
+                    To recover the logged times, drop the offset from start
+                    and add time; these match the local times of the scan
+                    timestamps, and OperaXN reads the record this way.
+                </doc>
                 <dimensions rank="1">
                     <dim index="1" value="nE"/>
                 </dimensions>
@@ -342,7 +355,7 @@
                     than the tolerance before the first point or after the last point
                     of the record is matched to that end point, and a scan
                     at least the tolerance from every point stays
-                    uncorrelated. Set per run at generation (OperaXN default
+                    uncorrelated. Set at generation (OperaXN default
                     300 s; a file without this field was matched with 300 s);
                     recommended because an OperaXN file always carries
                     it and a file holding only the Figure 4 content does not.
@@ -362,6 +375,7 @@
                 <doc>One source file, named file_NNN (file_001, file_002, ...).</doc>
                 <attribute name="source_file" optional="true"/>
                 <field name="time" type="NX_FLOAT" units="NX_TIME">
+                    <doc>Elapsed seconds from start, on the same local wall-clock convention as operando_electrochemistry/time.</doc>
                     <attribute name="start" type="NX_DATE_TIME"/>
                 </field>
                 <field name="voltage" type="NX_FLOAT" units="NX_VOLTAGE"/>
@@ -474,7 +488,12 @@
                     the same bank is a sibling group named bank_N_d carrying
                     the d_spacing axis. Exactly one of time_of_flight or
                     d_spacing must be present in each group (not expressible
-                    in NXDL for variable-name groups).
+                    in NXDL for variable-name groups). A bank whose file
+                    cannot be read is left out; when no bank file of an
+                    acquisition can be read the writer leaves out every bank
+                    group and logs a warning rather than writing empty groups,
+                    so that subentry then holds only instrument and
+                    environment.
                 </doc>
                 <attribute name="signal" optional="true">
                     <enumeration>
