@@ -30,6 +30,7 @@ _EXPORTS = {
     'make_oned_arrays': 'input',
     'make_twod_arrays': 'input',
     'make_echem_arrays': 'input',
+    'make_neutron_arrays': 'input',
     'get_correlated_data': 'input',
     'add_standard_echem_files': 'input',
     'get_scan_time_positions': 'output',
@@ -72,11 +73,13 @@ _VERSION_INFO = {
     '__email__': 'SUPPORT_EMAIL',
 }
 
-__all__ = [*_EXPORTS, *_VERSION_INFO, '__license__']
+__all__ = ['core', *_EXPORTS, *_VERSION_INFO, '__license__']
 
 
 def __getattr__(name: str) -> Any:
     """Import a public name's module on first access and keep the value."""
+    if name == 'core':
+        return importlib.import_module(".core", __name__)
     if name in _EXPORTS:
         value = getattr(importlib.import_module(f".{_EXPORTS[name]}", __name__), name)
     elif name in _VERSION_INFO:

@@ -24,7 +24,7 @@ from .config import (CSV_ENCODING, FIGURE_DPI, MASS_REPLOT_DELAY_MS, MAX_LEGEND_
 from .ici import (
     BG, BG2, BG3, BORDER, DIM, INPUT, TEXT, _FONT, _PAD_S,
     PLOT_BG, PLOT_BORDER, PLOT_TEXT,
-    _Btn, _canvas_frame, _label, _separator, _spinbox, _style_ax,
+    _Btn, _canvas_frame, _int_value, _label, _separator, _spinbox, _style_ax,
     echem_source_button, embed_figure, entered_mass_mg, maximise_window, show_mass_in_use,
     trace_write, watch_figure_sync,
 )
@@ -80,7 +80,7 @@ def assign_cycles(echem_df: pd.DataFrame) -> pd.DataFrame:
             cycle_num += 1
         if labels[i] in ("charge", "discharge"):
             cycles[i] = cycle_num
-        # leading rests stay cycle 0
+        # Leading rests stay cycle 0
         prev = labels[i]
 
     df["cycle"] = cycles
@@ -301,7 +301,7 @@ class CapacityWindow(tk.Toplevel):
                 text.set_color(PLOT_TEXT)
 
     # ------------------------------------------------------------------
-    # Cycles, mass and plotting
+    # Cycles, Mass and Plotting
     # ------------------------------------------------------------------
 
     def _refresh_available(self) -> None:
@@ -319,10 +319,7 @@ class CapacityWindow(tk.Toplevel):
 
     def _selected_cycle(self) -> Optional[int]:
         """Return the stepper's cycle, or None while its text is not a number."""
-        try:
-            return self.cycle_var.get()
-        except (tk.TclError, OverflowError):
-            return None
+        return _int_value(self.cycle_var)
 
     def _get_mass_mg(self) -> float:
         """Return the entered sample mass in mg (0 unless a finite positive number)."""
@@ -343,7 +340,7 @@ class CapacityWindow(tk.Toplevel):
         selected = self._selected_cycle()
         return [selected] if selected in self._available else []
 
-    def _replot(self, *_args) -> None:
+    def _replot(self) -> None:
         """Redraw both panels for the selected cycles and mass."""
         selected = self._get_cycles()
         if len(selected) == 1:
@@ -404,7 +401,7 @@ class CapacityWindow(tk.Toplevel):
             self._replot()
 
     # ------------------------------------------------------------------
-    # Sources and export
+    # Sources and Export
     # ------------------------------------------------------------------
 
     def _apply_source_change(self, name: str) -> None:

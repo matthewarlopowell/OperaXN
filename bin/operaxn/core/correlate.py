@@ -1,5 +1,5 @@
 """
-Electrochemistry parsing and scan/echem time-correlation for the core pipeline.
+Electrochemistry parsing and scan/echem time correlation for the core pipeline.
 
 The canonical .nxs file always stores absolute timestamps. RELATIVE mode,
 selected at upload, matches scans to echem by relative offsets (for
@@ -242,8 +242,7 @@ class EchemParser:
                 if col_name == "current":  # a lost time or voltage gets the skip line
                     logger.warning(
                         f"{name}: default column '{col_name}' at index {columns[col_name]} "
-                        f"collides with a detected column; it is not read"
-                    )
+                        "collides with a detected column; it is not read")
                 columns[col_name] = -1
 
         # A voltage or current taken by position must carry its unit (V or mV; a current unit
@@ -336,7 +335,7 @@ class EchemParser:
 
             for parts in rows:
                 # Skip epoch-zero placeholder rows
-                ts_str = parts[columns["time"]]
+                ts_str = parts[columns["time"]].strip()
                 if ts_str.startswith("1970/01/01"):
                     continue
 
@@ -352,7 +351,7 @@ class EchemParser:
                     else:
                         timestamp = pd.to_datetime(ts_str, dayfirst=True)
                 except (ValueError, TypeError):
-                    unreadable += bool(ts_str.strip())
+                    unreadable += bool(ts_str)
                     continue
 
                 # Blank cells parse to NaT without raising; a NaT row would
@@ -408,10 +407,10 @@ class ScanProcessor:
     """Processor building the ordered scan list and correlating it with echem data."""
 
     def __init__(self, time_method: TimeMethod = TimeMethod.ABSOLUTE,
-                 data_source: DataSourceType = DataSourceType.INHOUSE,
+                 data_source: DataSourceType = DataSourceType.INHOUSE, *,
                  echem_time_tolerance: float = ECHEM_TIME_TOLERANCE):
-        self.time_method = time_method
-        self.data_source = data_source
+        self.time_method = TimeMethod(time_method)
+        self.data_source = DataSourceType(data_source)
         self.echem_time_tolerance = echem_time_tolerance
         self.xrd_reference_time: Optional[pd.Timestamp] = None
         self.echem_reference_time: Optional[pd.Timestamp] = None
@@ -449,7 +448,7 @@ class ScanProcessor:
         """Parse and concatenate every logbook file; None when none parse."""
         neutron_meta_paths = df[df["neutron_meta"].notna()]["neutron_meta"].tolist()
 
-        logger.info(f"Found {len(neutron_meta_paths)} neutron metadata "
+        logger.info(f"Found {len(neutron_meta_paths)} logbook "
                     f"file{'s' if len(neutron_meta_paths) != 1 else ''}")
 
         if not neutron_meta_paths:
@@ -471,7 +470,7 @@ class ScanProcessor:
                                "and were skipped" if duplicates != 1 else
                                "1 logbook entry repeats a run already listed and was skipped")
                 combined_df = combined_df.drop_duplicates(subset="scan_id").reset_index(drop=True)
-            logger.info(f"Combined neutron metadata: {len(combined_df)} total "
+            logger.info(f"Combined logbook: {len(combined_df)} total "
                         f"{'entries' if len(combined_df) != 1 else 'entry'}")
             return combined_df
 
@@ -500,7 +499,7 @@ class ScanProcessor:
             logger.info(f"Echem data from {len(names)} files: {name_list(names)}")
         if echem_dfs:
             combined_df = (pd.concat(echem_dfs, ignore_index=True)
-                           .sort_values("timestamp").reset_index(drop=True))
+                           .sort_values("timestamp", kind="stable").reset_index(drop=True))
             logger.info(f"Echem data: {len(combined_df)} row{'s' if len(combined_df) != 1 else ''}")
             return combined_df
 
@@ -903,7 +902,7 @@ def format_relative_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def parse_relative_time(value: str) -> Optional[float]:
+def parse_relative_time(value: str) -> Optional[int]:
     """Parse an HH:MM:SS relative string back to seconds; None if not one."""
     if not isinstance(value, str) or "-" in value:
         return None

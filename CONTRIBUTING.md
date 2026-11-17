@@ -69,7 +69,7 @@ The `[test]` extra includes FAIRmat's pynxtools, so the NeXus
 schema-validation tests run by default; they skip if it is missing or cannot
 run (they fail instead with `OPERAXN_REQUIRE_VALIDATION=1`, which CI sets).
 Those tests copy the two NXDL files from `definitions/` into pynxtools'
-installed `contributed_definitions` directory, because the validator cannot
+installed `contributed_definitions` folder, because the validator cannot
 resolve `NXoperando_monopd` / `NXoperando_tofnpd` otherwise. Run them in a virtual
 environment rather than against a system Python install.
 

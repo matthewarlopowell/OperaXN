@@ -83,7 +83,7 @@ def neutron_dir(tmp_path):
 
 @pytest.fixture(scope="module")
 def inhouse_src(tmp_path_factory):
-    """Return the detailed in-house source directory, shared across the module."""
+    """Return the detailed laboratory source directory, shared across the module."""
     d = str(tmp_path_factory.mktemp("schema_src") / "inhouse")
     _builders.write_detailed_inhouse_dir(d)
     return d
@@ -98,7 +98,7 @@ def inhouse_nxs(tmp_path_factory, inhouse_src):
     out = str(base / "inhouse.nxs")
     ok, msgs = core.generate([inhouse_src], out, core.DataSourceType.INHOUSE,
                              standard_echem_files=[std])
-    assert ok, f"in-house generation failed: {msgs}"
+    assert ok, f"laboratory generation failed: {msgs}"
     return out
 
 
@@ -195,8 +195,8 @@ def legacy_v3_nxs(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def legacy_v1_nxs(tmp_path_factory):
-    """Return a hand-built file in the released v1.0.0 layout: root scan_NNNN groups, global_metadata and
-    operando_electrochemistry, as v1.0.0's writer laid them out."""
+    """Return a hand-built file in the released v1.0.0 layout: root scan_NNNN groups,
+    global_metadata and operando_electrochemistry, as v1.0.0's writer laid them out."""
     path = str(tmp_path_factory.mktemp("layout_v1") / "legacy_v1.nxs")
     with h5py.File(path, "w") as f:
         f.attrs["NX_class"] = "NXroot"

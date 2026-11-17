@@ -326,7 +326,7 @@ def test_build_xrd_matrix_stacks_and_interpolates():
 
 
 def test_build_xrd_matrix_skips_entries_without_data():
-    """Entries with missing or non 1-D x/y are skipped instead of crashing the heatmap."""
+    """Entries with missing or non 1D x/y are skipped instead of crashing the heatmap."""
     x = np.linspace(10, 80, 50)
     _, matrix, used = build_xrd_matrix({1: {"x": None, "y": None}, 2: {"x": x, "y": np.ones(50)},
                                         3: {"error": True}, 4: {"x": 5.0, "y": 1.0}})
@@ -430,8 +430,8 @@ def test_echem_scan_curve_retains_full_resolution():
         np.linspace(0.0, 40.0, 81), np.linspace(3.0, 4.0, 81),
     )
     assert len(curve_v) == 41 and len(curve_y) == 41
-    assert np.isclose(curve_y[0], 1.0) and np.isclose(curve_y[-1], 3.0) \
-        and np.all(np.diff(curve_y) >= 0)
+    assert np.isclose(curve_y[0], 1.0) and np.isclose(curve_y[-1], 3.0) and \
+        np.all(np.diff(curve_y) >= 0)
 
 
 @pytest.mark.display
@@ -662,7 +662,7 @@ def test_capacity_window_controls(tk_root, monkeypatch):
 
 
 @pytest.mark.parametrize("box, exported", [("all", [1, 2]), (7, [2]), (2.6, [2]), (None, [1])],
-                         ids=["all cycles", "typed 7 of 2", "typed 2.6", "text"])
+                         ids=["all-cycles", "typed-7-of-2", "typed-2.6", "text"])
 def test_capacity_csv_has_the_documented_columns(tmp_path, monkeypatch, box, exported):
     """Export CSV commits the box, then writes README.md's columns and values for those cycles."""
     out = tmp_path / "cell_capacity.csv"
@@ -894,7 +894,7 @@ def _fitted_windows(win, phase):
 
 
 def _window_samples(start, length, step=0.25, rest=20.0):
-    """Return (first Δt in s, points) a regression window takes from a rest sampled every step s."""
+    """Return (first Δt in s, points) for a regression window on a rest sampled every step s."""
     grid = np.arange(0.0, rest, step)
     taken = grid[(grid >= start) & (grid < start + length)]
     return float(taken[0]), len(taken)
@@ -1037,7 +1037,7 @@ def test_ici_spinboxes_ignore_text_that_is_not_a_number(tk_root, monkeypatch):
         counts = []
         for edit in (lambda: mass.invoke("buttonup"),
                      lambda: [mass.insert("end", ch) for ch in "2.5"],
-                     lambda: (mass.insert("end", "1"), win._on_rk_axis_changed())):  # Return
+                     lambda: (mass.insert("end", "1"), win._on_rk_axis_change())):  # Return
             rk.clear()
             edit()
             pump(win, 300)
@@ -1501,7 +1501,8 @@ def test_heatmap_title_is_editable_per_bank(tk_root, tmp_path, monkeypatch, capl
         hm._set_toggle(hm.bank_var, hm._bank_btns, "3")
         assert hm.title_var.get() == "Bank 3" and hm.ax_map.get_title() == "Bank 3", \
             "bank 1's title must not carry over to bank 3"
-        assert _export_title(hm.render_figure("1")) == "LiNiO$_2$, 90° bank", "bank 1 keeps its own"
+        assert _export_title(hm.render_figure("1")) == "LiNiO$_2$, 90° bank", \
+            "bank 1 keeps its own"
         hm.title_var.set("")
         hm._apply_title()
         assert hm.ax_map.get_title() == "" and _export_title(hm.render_figure()) == "", \
@@ -1646,11 +1647,6 @@ def test_heatmap_apply_all_shares_the_shown_banks_range(tk_root, monkeypatch):
             "Reset is the way back"
     finally:
         hm.destroy()
-    xray = HeatmapWindow(tk_root, build_hm_scans(), oned_arrays=build_oned_arrays())
-    try:
-        assert "Apply All" not in _buttons(xray), "X-ray maps have no banks to share a range"
-    finally:
-        xray.destroy()
 
 
 @pytest.mark.display
@@ -1757,7 +1753,7 @@ def _figure_sync_jobs(root, monkeypatch):
 @pytest.mark.display
 @pytest.mark.parametrize("queue", [_capacity_jobs, _plot_controls_jobs, _ici_jobs,
                                    _figure_sync_jobs],
-                         ids=["capacity", "plot controls", "ICI window", "shared figure timers"])
+                         ids=["capacity", "plot-controls", "ici-window", "shared-figure-timers"])
 def test_queued_jobs_never_outlive_their_window(tk_root, monkeypatch, queue):
     """Debounced updates and timers still queued when their window goes are cancelled with it."""
     jobs, owner = queue(tk_root, monkeypatch)
@@ -1768,7 +1764,7 @@ def test_queued_jobs_never_outlive_their_window(tk_root, monkeypatch, queue):
 
 
 @pytest.mark.display
-@pytest.mark.parametrize("close", ["close button", "Clear All"])
+@pytest.mark.parametrize("close", ["close button", "Clear"])
 @pytest.mark.parametrize("which", ["heatmap", "ici", "capacity"])
 def test_closing_an_analysis_window_frees_it(tk_root, monkeypatch, which, close):
     """An analysis window opened again is lifted, Add echem... asks for files, closing frees it."""

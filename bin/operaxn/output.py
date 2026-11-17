@@ -10,7 +10,7 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple, Union, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import matplotlib
 matplotlib.use('Agg')
@@ -21,6 +21,7 @@ from matplotlib.colors import LogNorm
 from matplotlib.ticker import ScalarFormatter
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
+from .core import parse_relative_time
 from .config import (
     DSPACING_LABEL,
     TIME_HOURS_LABEL,
@@ -189,8 +190,6 @@ class PlotFormatter:
         ax.grid(grid, alpha=GRID_ALPHA)
 
         if scientific_y:
-            ax.ticklabel_format(style="scientific", axis="y", scilimits=(0, 0),
-                                useMathText=True)
             ax.yaxis.set_major_formatter(ScalarFormatter(useMathText=True))
 
         ax.tick_params(axis='both', which='major', labelsize=TICK_FONT_SIZE)
@@ -774,31 +773,31 @@ class EchemPlotter(BasePlotter):
 
     def _plot_voltage_only(self, ax: plt.Axes, time_hours: np.ndarray,
                            voltage_data: np.ndarray,
-                           config: Optional[PlotConfig] = None) -> None:
+                           config: PlotConfig) -> None:
         """Plot voltage trace on primary axis."""
         color = "tab:red"
         ax.set_ylabel("Voltage [V]", color=color, fontsize=LABEL_FONT_SIZE)
         line, = ax.plot(time_hours, voltage_data, color=color,
                         linewidth=1.5, label="Voltage")
         ax.tick_params(axis="y", labelcolor=color, labelsize=TICK_FONT_SIZE)
-        if config is None or config.use_cache:
+        if config.use_cache:
             _plot_cache.set(self._get_cache_key(ax, "echem_v"), line)
 
     def _plot_current_only(self, ax: plt.Axes, time_hours: np.ndarray,
                            current_data: np.ndarray,
-                           config: Optional[PlotConfig] = None) -> None:
+                           config: PlotConfig) -> None:
         """Plot current trace on primary axis."""
         color = "tab:blue"
         ax.set_ylabel("Current [mA]", color=color, fontsize=LABEL_FONT_SIZE)
         line, = ax.plot(time_hours, current_data, color=color,
                         linewidth=1.5, label="Current")
         ax.tick_params(axis="y", labelcolor=color, labelsize=TICK_FONT_SIZE)
-        if config is None or config.use_cache:
+        if config.use_cache:
             _plot_cache.set(self._get_cache_key(ax, "echem_c"), line)
 
     def _plot_both(self, ax: plt.Axes, time_hours: np.ndarray,
                    voltage_data: np.ndarray, current_data: np.ndarray,
-                   config: Optional[PlotConfig] = None) -> None:
+                   config: PlotConfig) -> None:
         """Plot voltage on primary and current on secondary axis."""
         self._plot_voltage_only(ax, time_hours, voltage_data, config)
 
@@ -810,7 +809,7 @@ class EchemPlotter(BasePlotter):
                           linewidth=1.5, label="Current")
         ax2.tick_params(axis="y", labelcolor=color, labelsize=TICK_FONT_SIZE)
 
-        if config is None or config.use_cache:
+        if config.use_cache:
             _plot_cache.set(self._get_cache_key(ax, "echem_c"), line2)
 
         ax.set_zorder(ax2.get_zorder() + 1)
@@ -818,7 +817,7 @@ class EchemPlotter(BasePlotter):
 
     def _update_scan_marker(self, ax: plt.Axes, scan_times: Optional[List[float]],
                             current_scan_idx: Optional[int],
-                            config: Optional[PlotConfig] = None) -> None:
+                            config: PlotConfig) -> None:
         """Place, move or hide the dashed scan-position marker."""
         cache_key = self._get_cache_key(ax, "echem_marker")
         marker_line = _plot_cache.get(cache_key)
@@ -839,7 +838,7 @@ class EchemPlotter(BasePlotter):
             else:
                 marker_line = ax.axvline(x=scan_time_hours, color="red",
                                          linestyle="--", alpha=1.0, linewidth=2)
-                if config is None or config.use_cache:
+                if config.use_cache:
                     _plot_cache.set(cache_key, marker_line)
         elif marker_line:
             marker_line.set_visible(False)
@@ -1149,12 +1148,7 @@ def get_scan_time_positions(scans: List[Dict[str, Any]],
 
     if time_method == "relative":
         for scan in scans:
-            seconds = None
-            ts = scan.get("timestamp")
-            if isinstance(ts, str) and ":" in ts:
-                parts = ts.split(":")
-                seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-            scan_times.append(seconds)
+            scan_times.append(parse_relative_time(scan.get("timestamp")))
     else:
         echem_start = pd.to_datetime(echem_df["timestamp"].min())
         for scan in scans:

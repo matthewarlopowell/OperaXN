@@ -65,8 +65,9 @@ def test_echem_logger_with_one_ctime_column_stays_echem(tmp_path):
     """An echem table with a record counter above 10,000 and one ctime column is not a logbook."""
     path = tmp_path / "cell_logger.txt"
     rows = ["Record\tTime\tEwe/V\tI/mA\tT1\tT2\tT3\tT4"]
-    rows += [f"{100001 + i}\tWed Oct 15 09:{i:02d}:00 2025\t{3.7 + i / 100:.2f}\t0.1\t25\t25\t25\t25"
-             for i in range(6)]
+    rows += [
+        f"{100001 + i}\tWed Oct 15 09:{i:02d}:00 2025\t{3.7 + i / 100:.2f}\t0.1\t25\t25\t25\t25"
+        for i in range(6)]
     path.write_text("\n".join(rows) + "\n")
     assert core.TXTClassifier().classify(str(path))[0] == "echem"
 
@@ -113,7 +114,7 @@ def test_strip_utc_offset_keeps_the_wall_clock(value, expected):
 
 
 def test_classification_manager_inhouse(inhouse_dir):
-    """classify_files fills oned/echem columns over the in-house dir and returns a copy."""
+    """classify_files fills oned/echem columns over the laboratory dir and returns a copy."""
     paths = [os.path.join(inhouse_dir, name) for name in sorted(os.listdir(inhouse_dir))]
     df = pd.DataFrame({"path": paths})
     out = core.FileClassificationManager(core.DataSourceType.INHOUSE).classify_files(df)
@@ -172,7 +173,7 @@ def test_neutron_logbook_single_surname_user(tmp_path):
     assert rows["123456"]["proposal"] == "7654321", str(rows["123456"])
 
 
-@pytest.mark.parametrize("users,title", [
+@pytest.mark.parametrize("users, title", [
     ("Sato,Menon", "Op-Run1-SC1-Diag"),
     ("Perez,Montgomery", "Op-Run1-SC1-Diag"),
     ("Smith,Jones", "Monitor check"),
@@ -336,7 +337,8 @@ def test_parse_mantid_header(tmp_path):
 @pytest.mark.parametrize("filename, expected", [
     pytest.param(_builders.polaris_bank_names("153868", 1)[0], ("153868", "1", "tof"),
                  id="polaris-tof"),
-    pytest.param(_builders.polaris_bank_names("153868", 5)[1], ("153868", "5", "d"), id="polaris-d"),
+    pytest.param(_builders.polaris_bank_names("153868", 5)[1], ("153868", "5", "d"),
+                 id="polaris-d"),
     pytest.param(_builders.wish_bank_names("59268", 1)[0], ("59268", "1", "tof"), id="wish-tof"),
     pytest.param(_builders.wish_bank_names("59268", 5)[1], ("59268", "5", "d"), id="wish-d"),
     pytest.param("POL153868-b_13-d.dat", None, id="polaris-bank-13"),

@@ -19,21 +19,19 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from .core import ECHEM_TIME_TOLERANCE, SYNCHROTRON_MAX_DISPLAY_SIZE
 from .core import (  # noqa: F401  (GUI scan labels)
     NeutronFileGrouper,
     SynchrotronFileGrouper,
 )
-from .core import EchemParser, format_relative_time, parse_relative_time
 from .core import (
-    cache_dir, convert_tabular_to_txt, default_cache_path, generate,
+    CYCLING_PROTOCOL_FIELDS, ECHEM_TIME_TOLERANCE, SYNCHROTRON_MAX_DISPLAY_SIZE,
+    DataReaderFactory, DataSourceType, EchemParser, HDFReader, ScanData, TimeMethod,
+    cache_dir, clear_global_cache, convert_tabular_to_txt, default_cache_path,
+    format_relative_time, generate, is_canonical_nxs, load, parse_relative_time,
+    write_standard_echem_group,
 )
-from .core import DataSourceType, ScanData, TimeMethod
-from .core import is_canonical_nxs, load
-from .core import write_standard_echem_group
 # gui.py imports replace_when_done from here
-from .core.nxs_writer import CYCLING_PROTOCOL_FIELDS, replace_when_done
-from .core import DataReaderFactory, HDFReader, clear_global_cache
+from .core.nxs_writer import replace_when_done
 
 logger = logging.getLogger(__name__)
 
@@ -129,8 +127,6 @@ def _scan_to_dict(sd: ScanData) -> Dict[str, Any]:
         "timestamp": sd.timestamp,
         "original_timestamp": sd.timestamp,
         "exposure_time": sd.exposure_time,
-        "oned_exposure": None,
-        "twod_exposure": None,
         "neutron_start": sd.neutron_start,
         "neutron_end": sd.neutron_end,
         "timestamp_for_correlation": timestamp_for_correlation,
@@ -177,7 +173,7 @@ def _apply_relative_view(scan_dicts: List[Dict[str, Any]],
 def process_paths(selected_paths: List[str],
                   progress_callback: Optional[Callable] = None,
                   time_method: Optional[TimeMethod] = None,
-                  data_source: DataSourceType = DataSourceType.INHOUSE,
+                  data_source: DataSourceType = DataSourceType.INHOUSE, *,
                   standard_echem_files: Optional[List[str]] = None,
                   include_2d_images: bool = False,
                   twod_max_display_size: int = 0,
@@ -194,6 +190,8 @@ def process_paths(selected_paths: List[str],
     opened .nxs ignores the generation options after data_source and shows its recorded source
     and correlation method. Raises RuntimeError with the fatal messages when generation fails,
     or is cancelled through `cancel` (core.generate)."""
+    if isinstance(selected_paths, (str, os.PathLike)):
+        selected_paths = [selected_paths]
     paths = [str(p) for p in selected_paths]
     empty = ([], pd.DataFrame(columns=["timestamp", "echem_data", "current"]),
              TimeMethod.ABSOLUTE.value)
@@ -203,6 +201,7 @@ def process_paths(selected_paths: List[str],
 
     if time_method is None:
         time_method = TimeMethod.ABSOLUTE
+    time_method, data_source = TimeMethod(time_method), DataSourceType(data_source)
     if echem_time_tolerance is None:
         echem_time_tolerance = ECHEM_TIME_TOLERANCE
 
@@ -406,7 +405,7 @@ def _geometry_rows(table: Any, label: str, value_format: str) -> List[Dict[str, 
         numbers = [int(n) for n in np.atleast_1d(columns[0])]
         distance = [float(d) for d in np.atleast_1d(columns[1])]
         polar = [float(p) for p in np.atleast_1d(columns[2])]
-    except (TypeError, ValueError):
+    except (ValueError, TypeError):
         return []
     if not len(numbers) == len(distance) == len(polar):
         return []
@@ -506,19 +505,18 @@ def add_standard_echem_files(paths: List[str]) -> List[Dict[str, Any]]:
     return additions
 
 
-def export_nxs(destination: str,
-               progress_callback: Optional[Callable] = None) -> tuple:
+def export_nxs(destination: str) -> tuple:
     """Save the loaded experiment's canonical .nxs to destination; return (success, messages).
     The <stem>_images sidecar (ZIP loads persist 2D sources there) is copied alongside."""
     source = _session["nxs_path"]
     if not source or not os.path.isfile(source):
         return False, ["No experiment loaded"]
 
-    if progress_callback:
-        progress_callback("Exporting NeXus file...")
     messages = ["NeXus file exported"]
-    # normcase: a case-only rename of the open file is the same file on Windows
-    if os.path.normcase(os.path.abspath(source)) != os.path.normcase(os.path.abspath(destination)):
+    # realpath + normcase: another spelling of the open file (a mapped drive against its UNC
+    # name, a link, a case-only rename on Windows) is the same file
+    if (os.path.normcase(os.path.realpath(source))
+            != os.path.normcase(os.path.realpath(destination))):
         with replace_when_done(destination) as part:
             shutil.copyfile(source, part)
         # ZIP loads persist their 2D sources in a sidecar folder; copy it so
@@ -526,8 +524,8 @@ def export_nxs(destination: str,
         images_dir = os.path.splitext(_session.get("images_nxs") or source)[0] + "_images"
         dest_images = os.path.splitext(destination)[0] + "_images"
         # Saving over the opened file: its own sidecar is already in place
-        if (os.path.isdir(images_dir) and os.path.normcase(os.path.abspath(images_dir))
-                != os.path.normcase(os.path.abspath(dest_images))):
+        if (os.path.isdir(images_dir) and os.path.normcase(os.path.realpath(images_dir))
+                != os.path.normcase(os.path.realpath(dest_images))):
             try:
                 if os.path.isdir(dest_images):
                     # Only replace a sidecar this tool created; never a

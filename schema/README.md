@@ -11,6 +11,6 @@ International Advisory Committee definitions repository:
   licence covering the rest of this repository.
 
 They are used by the test suite (`tests/test_nxdl.py`) to validate the
-application definitions in `definitions/`. When updating, fetch the three
-files from the same tag and record the new tag here and in
+application definitions in `definitions/`. When updating, fetch both `.xsd`
+files and `LGPL.txt` from the same tag and record the new tag here and in
 `definitions/README.md`.

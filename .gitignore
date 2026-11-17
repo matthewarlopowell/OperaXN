@@ -13,6 +13,7 @@ dist/
 
 # IDE
 .idea/
+.vscode/
 
 # Testing / cache
 .pytest_cache/
@@ -40,6 +41,7 @@ Thumbs.db
 *.nxs
 *.hdf
 *.edf
+*.part
 
 # Generated example data
 /examples/example_data/

@@ -20,7 +20,7 @@ SCAN_TIMES = ["2024-02-05T10:05:00", "2024-02-05T10:10:00", "2024-02-05T10:15:00
 
 
 def write_echem(path):
-    """Write the echem log: a 3.70-4.09 V ramp at 60 s cadence from 10:00, dayfirst dates."""
+    """Write the echem log: a 3.70-4.09 V ramp at 60 s cadence from 10:00, day-first dates."""
     rows = ["Time\tEwe/V\tI/mA"]
     for m in range(40):
         rows.append(f"05/02/2024 10:{m:02d}:00\t{3.7 + m * 0.01:.4f}\t{0.1 + m * 0.001:.4f}")

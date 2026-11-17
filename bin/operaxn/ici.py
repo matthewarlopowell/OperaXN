@@ -2,7 +2,7 @@
 ICI (intermittent current interruption) analysis window and the analysis windows' shared helpers.
 
 Pulse detection and regression follow the pyICI conventions
-(https://github.com/joe-arroyo/pyICI): a pulse is an active period
+(https://github.com/Joe-Arroyo/pyICI): a pulse is an active period
 (current != 0) followed by a rest (current == 0) no longer than max_rest;
 for each pulse a linear fit of ΔV against √Δt over a configurable time
 window yields R = -intercept/I and k = -slope/I, with errors propagated
@@ -32,7 +32,7 @@ from .config import (
 
 logger = logging.getLogger(__name__)
 
-# Theme shorthands, also imported by heatmap.py
+# Theme shorthands, also imported by capacity.py and heatmap.py
 _C = OPERAXNTheme.COLORS
 BG = _C['bg_primary']
 BG2 = _C['bg_secondary']
@@ -256,7 +256,7 @@ def _compute_all_pulses(seg: pd.DataFrame, pulses: List[dict], get_r1) -> List[d
     """Fit every pulse in seg; get_r1(1-based pulse_idx) -> (r1_start_s, r1_length_s)."""
     # Imported here: capacity.py builds its window from this module's widgets
     from .capacity import compute_capacity
-    cap_arr = compute_capacity(seg) if not seg.empty else np.array([])
+    cap_arr = compute_capacity(seg)
     results = []
     for i, p in enumerate(pulses):
         r1_start, r1_length = get_r1(i + 1)
@@ -378,8 +378,6 @@ def echem_source_button(master, var, values, command=None,
                         on_add=None) -> tk.Menubutton:
     """Build a compact themed menu button for choosing an echem dataset.
     Shared by the ICI and Capacity windows; button.set_values(names) refreshes the menu."""
-    values = list(values)
-
     def display_text(value) -> str:
         value = str(value)
         short = value if len(value) <= 16 else f'{value[:13]}...'
@@ -686,8 +684,7 @@ class _RegressionBar(tk.Frame):
 
         _separator(row, horizontal=False).pack(
             side='left', fill='y', padx=_PAD_S, pady=3)
-        _Btn(row, 'Export CSV', style='secondary',
-             command=self._on_export).pack(side='left', padx=2)
+        _Btn(row, 'Export CSV', command=self._on_export).pack(side='left', padx=2)
 
 
 # ============================================================================
@@ -795,7 +792,7 @@ def embed_figure(fig, parent) -> FigureCanvasTkAgg:
     # Every resize on a scaled display can re-run matplotlib's device-pixel-
     # ratio race (see sync_figure_to_widget), not just the opening layout
     # the windows' startup watchdogs cover. Reconcile after each resize
-    # settles; the sync is a no-op when figure and widget already agree.
+    # settles, forced: the sizes can agree while the photo buffer is stale.
     def _sync_after_resize(_event=None):
         job = getattr(canvas, '_operaxn_sync_job', None)
         if job is not None:
@@ -833,7 +830,7 @@ def sync_figure_to_widget(canvas: FigureCanvasTkAgg, force: bool = False) -> Non
     height = parent.winfo_height()
     if toolbar is not None:
         height -= toolbar.winfo_height()
-    # the canvas widget (no border of its own) sits inside the frame's 2px
+    # The canvas widget (no border of its own) sits inside the frame's 2px
     # highlight on each side: its actual size is parent - 4 in each dimension
     width = max(1, width - 4)
     height = max(1, height - 4)
@@ -887,6 +884,7 @@ class ICIWindow(tk.Toplevel):
         maximise_window(self)
 
         self._sources = dict(echem_sources)
+        self._source_name = next(iter(self._sources), None)
         self._df: Optional[pd.DataFrame] = None
         self._pulses: dict = {}
         self._ici_cache: dict = {}
@@ -953,7 +951,7 @@ class ICIWindow(tk.Toplevel):
                               highlightbackground=BORDER,
                               highlightthickness=1)
         rk_wrapper.pack(fill='x', padx=_PAD_S, pady=(_PAD_S, 0))
-        self.rk_axis_bar = _RKAxisBar(rk_wrapper, on_change=self._on_rk_axis_changed,
+        self.rk_axis_bar = _RKAxisBar(rk_wrapper, on_change=self._on_rk_axis_change,
                                       on_mass_change=self._queue_mass_replot)
         self.rk_axis_bar.pack(fill='x')
 
@@ -1043,7 +1041,7 @@ class ICIWindow(tk.Toplevel):
         self.ax_dv = self._fig_bot.add_subplot(gs[0, 0])
         self.ax_r2 = self._fig_bot.add_subplot(gs[0, 1])
         _style_ax(self.ax_dv, _SQRT_DT_LABEL, _DELTA_V_LABEL, 'ICI fit')
-        _style_ax(self.ax_r2, 'Pulse #', 'R²', 'R² vs Pulse')
+        _style_ax(self.ax_r2, 'Pulse number', 'R²', 'R² vs pulse')
         _stub(self.ax_dv)
         _stub(self.ax_r2)
 
@@ -1132,7 +1130,7 @@ class ICIWindow(tk.Toplevel):
         """Switch datasets once Tk is idle, avoiding menu callback re-entry."""
         self._source_change_job = None
         df = self._sources.get(name)
-        if df is None:
+        if df is None or name == self._source_name:
             return
         self.configure(cursor='watch')
         self.update_idletasks()
@@ -1141,6 +1139,7 @@ class ICIWindow(tk.Toplevel):
             self._drop_pending_regression_edit()
             self._r1_pulse_overrides.clear()
             self._r1_phase_overrides.clear()
+            self._source_name = name
             self._load(df)
         finally:
             self.configure(cursor='')
@@ -1288,14 +1287,12 @@ class ICIWindow(tk.Toplevel):
     # ICI Analysis
     # ------------------------------------------------------------------
 
-    def _get_r1(self, cycle: Optional[int] = None, phase: Optional[str] = None,
-                pulse_idx: Optional[int] = None) -> Tuple[float, float]:
+    def _get_r1(self, cycle: int, phase: str, pulse_idx: int) -> Tuple[float, float]:
         """Return a pulse's regression window (start_s, length_s).
         Resolves the pulse override, then the phase override, then _R1_DEFAULT."""
-        if cycle is not None and phase is not None and pulse_idx is not None:
-            override = self._r1_pulse_overrides.get(self._pulse_key(cycle, phase, pulse_idx))
-            if override is not None:
-                return override
+        override = self._r1_pulse_overrides.get(self._pulse_key(cycle, phase, pulse_idx))
+        if override is not None:
+            return override
         return self._r1_phase_overrides.get(phase, _R1_DEFAULT)
 
     def _pulse_key(self, cycle: int, phase: str, pulse_idx: int) -> Optional[tuple]:
@@ -1344,7 +1341,7 @@ class ICIWindow(tk.Toplevel):
 
         ax.plot(fit['X_fit'], fit['y_fit'],
                 color=PLOT_TEXT, lw=2, zorder=4,
-                label=f'fit  R²={fit["r2"]:.3f}')
+                label=f'Fit  R²={fit["r2"]:.3f}')
 
         ax.legend(fontsize=7, loc='best',
                   labelcolor=PLOT_TEXT, facecolor=PLOT_BG, edgecolor=PLOT_BORDER)
@@ -1358,7 +1355,7 @@ class ICIWindow(tk.Toplevel):
         """Plot R² of every fit in the selected scope, starring the current pulse."""
         ax = self.ax_r2
         ax.cla()
-        _style_ax(ax, 'Pulse #', 'R²', 'R² vs Pulse')
+        _style_ax(ax, 'Pulse number', 'R²', 'R² vs pulse')
 
         datasets = []
         if scope == 'phase':
@@ -1370,7 +1367,7 @@ class ICIWindow(tk.Toplevel):
                              DISCHARGE_COLOR, 0.85))
         else:
             for c in range(1, self._max_cycle() + 1):
-                alpha = 1.0 if c == cycle else 0.35   # same shading rule as the R/k panels
+                alpha = 1.0 if c == cycle else 0.35   # the other cycles are dimmed
                 for ph, colour in (('charge', CHARGE_COLOR), ('discharge', DISCHARGE_COLOR)):
                     datasets.append((self._compute_ici(c, ph), f'{ph.capitalize()} C{c}',
                                      colour, alpha))
@@ -1503,7 +1500,7 @@ class ICIWindow(tk.Toplevel):
             if not any(len(table) for table in tables.values()):
                 messagebox.showwarning('No data', 'No fitted pulses to export', parent=self)
                 return
-            directory = filedialog.askdirectory(title='Export ICI CSV', parent=self)
+            directory = filedialog.askdirectory(parent=self, title='Export ICI CSV')
             if not directory:
                 return
             paths = {phase: os.path.join(directory, f'{self._export_stem}_ici_{phase}.csv')
@@ -1543,7 +1540,7 @@ class ICIWindow(tk.Toplevel):
             tables[phase] = pd.DataFrame(rows, columns=ICI_CSV_COLUMNS)
         return tables
 
-    def _on_rk_axis_changed(self, *_) -> None:
+    def _on_rk_axis_change(self) -> None:
         """Redraw the right panel when the mass or x-axis selection changes."""
         self._cancel_mass_replot()  # this redraw already reads the current mass
         cycle = _int_value(self.selector.cycle_var)
@@ -1554,7 +1551,7 @@ class ICIWindow(tk.Toplevel):
     def _queue_mass_replot(self) -> None:
         """Redraw the R/k panel shortly after the last mass edit, so typing stays responsive."""
         self._cancel_mass_replot()
-        self._mass_job = self.after(MASS_REPLOT_DELAY_MS, self._on_rk_axis_changed)
+        self._mass_job = self.after(MASS_REPLOT_DELAY_MS, self._on_rk_axis_change)
 
     def _cancel_mass_replot(self) -> None:
         """Drop a queued mass redraw."""
@@ -1665,7 +1662,7 @@ class ICIWindow(tk.Toplevel):
         scope = self.selector.scope_var.get()
         self._plot_overview(cycle, pulse, phase)
         self._plot_pulse_zoom(cycle, pulse, phase)
-        self._fig_top.canvas.draw_idle()
+        self._canvas_top.draw_idle()
         self._plot_ici_fit(cycle, pulse, phase)
         self._plot_r2_panel(cycle, pulse, phase, scope)
         self._canvas_bot.draw_idle()

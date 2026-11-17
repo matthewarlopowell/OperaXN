@@ -1,6 +1,6 @@
 # OperaXN
 
-**OPERAndo X-ray and Neutron diffraction data visualisation tool**
+**OPERAndo X-ray and Neutron data visualisation tool**
 
 [![CI](https://github.com/matthewarlopowell/OperaXN/actions/workflows/ci.yml/badge.svg)](https://github.com/matthewarlopowell/OperaXN/actions/workflows/ci.yml)
 
@@ -28,7 +28,7 @@ not just the raw files, is what gets analysed, shared and archived.
 
 ## Features
 
-- Automated time-correlation of electrochemical (voltage/current) and
+- Automated time correlation of electrochemical (voltage/current) and
   diffraction datasets by absolute timestamp or elapsed time
 - Generation of NeXus files conforming to the
   `NXoperando_monopd` / `NXoperando_tofnpd` application definitions
@@ -87,7 +87,7 @@ pip install .
 ### For development
 
 ```bash
-pip install -e .
+pip install -e ".[test]"   # editable install with the test dependencies
 ```
 
 ## Usage
@@ -136,10 +136,11 @@ inside it) is read once.
   field. A `.dat` and an `.edf` with the same date are one scan; a file
   without a readable date is skipped and named in the terminal.
 - **Synchrotron X-ray diffraction** (Diamond i11-1): one scan `.nxs` per
-  acquisition, timed by its `start_time` (the exposure is the detector's
-  `exposure_time`, `count_time` or `preset`, else `end_time` minus
-  `start_time`; a window of an hour or more is ignored and the scan correlates
-  at its start time), with the integrated pattern `.xy` and the detector image
+  acquisition, timed by its `start_time` (the exposure is `end_time` minus
+  `start_time`, as for i11-1 files, unless the file holds an
+  `instrument/detector` `exposure_time`, `count_time` or `preset`; a window of
+  an hour or more is ignored and the scan correlates at its start time), with
+  the integrated pattern `.xy` and the detector image
   `.hdf` that carry the same scan number: the last run of digits in the name,
   for an `.xy` named `..._integration_...` the digits before `_integration_`.
   An `.xy` or `.hdf` without its `.nxs` is not read.
@@ -154,8 +155,9 @@ inside it) is read once.
   logbook line is named in the terminal.
 - **Electrochemistry** (any source): a `.txt` (tab-separated), `.csv`
   (comma, semicolon or tab; a semicolon or tab table uses decimal commas) or
-  `.xlsx` (first sheet) whose first line names its columns: a time column of
-  dates with clock times (not elapsed seconds), a voltage column (`Ewe`,
+  `.xlsx` (first sheet) whose first line names its columns: a time column
+  (`Time` or `Date` in its name) of dates with clock times (not elapsed
+  seconds), a voltage column (`Ewe`,
   `Ecell` or `Voltage` in its name) and a current column (`Current` or `I/`).
   Columns are found by name; a voltage or current column found only by its
   position must carry its unit (a voltage label in V or mV; a current label
@@ -200,7 +202,8 @@ written before that field was added used 300 s.
 Echem timestamps, and slash dates in a laboratory `.dat` file's `# Date`
 line or an EDF `Date` header, are read day-first (the UK convention).
 Year-first dates are never swapped: `2024-02-05` and `2024/02/05` everywhere,
-and in those headers also `20240205` and `2024.02.05`. Arbin exports use US
+and in those headers also `20240205` and `2024.02.05` (in an echem file these
+two forms are read day-first, as 2 May). Arbin exports use US
 month/day order: a date whose day is 12 or below is then read with month and
 day swapped, so an Arbin file correlates correctly only when every day number
 in it is above 12.
@@ -217,11 +220,17 @@ file's name, or the name of the first uploaded folder or file.
 **Heatmap** stacks the 1D patterns as an intensity map, against elapsed time
 or scan number, beside the correlated voltage. X-ray data is shown on 2θ or
 d-spacing, and neutron data one detector bank at a time on time of flight or
-d-spacing. The map can be limited to the scans with a correlated voltage, or
-can leave out listed scans. For neutron data the **Intensity** limits belong to
-the bank shown (blank is automatic) and are kept when you switch bank;
-**Apply All** gives every bank the shown bank's range after a confirmation,
-and **Reset** clears the ranges of every bank. **Title** sets the map's title
+d-spacing. X-ray d-spacing, here and in **Plot Settings**, is calculated from
+2θ with a fixed wavelength set by the data source, 1.5406 Å (Cu Kα) for
+laboratory data and 0.495 Å for synchrotron data, not the wavelength recorded
+in the files. The map can be limited to the scans with a correlated voltage, or
+can leave out listed scans. Blank **Intensity** limits are automatic; the upper
+one is the **Ceiling (%)** percentile of the data (50 to 100; 100, the default,
+is the maximum), so a few strong points need not hide weak peaks. For neutron
+data the limits belong to the bank shown and are kept when you switch bank, and
+**Apply All** gives every bank the shown bank's range after a confirmation.
+**Reset** clears the X range and every intensity range and puts the ceiling
+back to 100. **Title** sets the map's title
 on screen and in the exports (by default the bank for neutron data, none for
 X-ray; clear it for no title); like the limits, each bank keeps its own, and
 the **Apply All** beside it gives every bank the shown title. Text between
@@ -316,10 +325,12 @@ sample description plus the full electrochemical cycling record, and one
 of the cell during that scan. Files also capture the cycling protocol
 (technique, voltage window and C-rate from the upload dialog, plus the
 electrochemistry files used) and the cell preparation date; deviations from
-the paper's Figure 4 are tabulated in
-[definitions/README.md](definitions/README.md). Files can be inspected with any HDF5
+Figure 4 of the accompanying perspective (see [Citing](#citing)) are tabulated
+in [definitions/README.md](definitions/README.md). Files can be inspected with any HDF5
 tool (e.g. [DAWN](https://dawnsci.org/), NeXpy, h5web) and validated with
-FAIRmat's [pynxtools](https://github.com/FAIRmat-NFDI/pynxtools).
+FAIRmat's [pynxtools](https://github.com/FAIRmat-NFDI/pynxtools), once the
+two definitions have been copied into it: see
+[Validating generated files](definitions/README.md#validating-generated-files).
 
 ## Dependencies
 

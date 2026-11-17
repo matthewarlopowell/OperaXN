@@ -8,7 +8,7 @@ import pytest
 from operaxn import core
 
 import _builders
-from _helpers import s, wall, tz_aware, assert_pynxtools_valid, needs_fabio
+from _helpers import assert_pynxtools_valid, needs_fabio, s, tz_aware, wall
 
 
 def test_monopd_root_and_entry(inhouse_nxs):
@@ -85,7 +85,7 @@ def test_monopd_data(inhouse_nxs):
     with h5py.File(inhouse_nxs) as f:
         d = f["entry/scan_000001/data"]
         assert d["polar_angle"].attrs.get("units") == "degrees"
-        assert "polar_angle_indices" not in d.attrs, "redundant for a 1-D axis"
+        assert "polar_angle_indices" not in d.attrs, "redundant for a 1D axis"
         assert d.attrs.get("signal") == "data"
         assert "data_errors" in d, "1D uncertainties dropped"
         assert "errors" not in d, "deprecated NXdata errors name written"
@@ -440,7 +440,7 @@ def test_monopd_image_member_order(tmp_path):
 
 @needs_fabio
 def test_monopd_monitor_integral_from_positive_counter(tmp_path):
-    """Positive EDF Monitor counts write scan monitor/integral; mode and preset sit once at entry."""
+    """Positive EDF Monitor counts give scan monitor/integral; mode and preset sit once at entry."""
     src = str(tmp_path / "monitored")
     os.makedirs(src)
     _builders.write_edf_image(os.path.join(src, "image_001.edf"),

@@ -14,7 +14,7 @@ import tkinter as tk
 import tkinter.ttk as ttk
 from dataclasses import dataclass, field
 from tkinter import filedialog, messagebox
-from typing import Dict, List, Callable, Optional, Set, Tuple, Any
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,7 +23,6 @@ from .core import (ECHEM_TIME_TOLERANCE, TimeMethod, is_canonical_nxs,
                    read_correlation_method, read_data_source)
 from .core.config import MAX_ECHEM_TIME_TOLERANCE
 
-from .output import clear_plot_cache
 from .config import (
     DataSourceType,
     DSPACING_TEXT,
@@ -68,8 +67,8 @@ class GIFSettings:
 class UploadOptions:
     """Structured result from UploadOptionsDialog."""
     paths: List[str]
-    data_source: "DataSourceType"
-    time_method: "TimeMethod"
+    data_source: DataSourceType
+    time_method: TimeMethod
     display_size: int
     include_2d: bool
     title: str = None
@@ -103,7 +102,6 @@ class BaseDialog(tk.Toplevel):
 
     def __init__(self, master: tk.Misc, title: str, geometry: Optional[str] = None) -> None:
         super().__init__(master)
-        self.master = master
         self.result = None
         self.configure(bg=OPERAXNTheme.COLORS['bg_primary'])
 
@@ -145,7 +143,7 @@ class BaseDialog(tk.Toplevel):
             if ctypes.windll.user32.SystemParametersInfoW(
                     0x0030, 0, ctypes.byref(rect), 0):  # SPI_GETWORKAREA
                 return tuple(rect)
-        except Exception as exc:  # pragma: no cover - platform dependent
+        except Exception as exc:  # platform dependent
             logger.debug(f"Work area query failed: {exc}")
         return None
 
@@ -186,7 +184,7 @@ class BaseDialog(tk.Toplevel):
         dw = self.winfo_width() if width is None else width
         dh = self.winfo_height() if height is None else height
 
-        # Calculate centered position
+        # Calculate centred position
         x = px + (pw - dw) // 2
         y = py + (ph - dh) // 2
 
@@ -277,11 +275,6 @@ class BaseDialog(tk.Toplevel):
                 "bg": OPERAXNTheme.COLORS['bg_tertiary'],
                 "fg": OPERAXNTheme.COLORS['text_primary'],
                 "hover": OPERAXNTheme.COLORS['bg_secondary']
-            },
-            "danger": {
-                "bg": OPERAXNTheme.COLORS['danger'],
-                "fg": OPERAXNTheme.COLORS['text_primary'],
-                "hover": '#ff5252'
             }
         }
 
@@ -432,7 +425,7 @@ class BaseDialog(tk.Toplevel):
 
     def create_themed_checkbutton(self, parent: tk.Widget, text: str, variable: tk.Variable,
                                   command: Callable = None) -> tk.Checkbutton:
-        """Create a surface-matched check box with accent active text."""
+        """Create a surface-matched checkbox with accent active text."""
         bg = self._surface_bg(parent)
         return tk.Checkbutton(
             parent, text=text, variable=variable, command=command,
@@ -544,7 +537,7 @@ class PlotSettingsDialog(BaseDialog):
             ("Apply", apply, "primary"),
             ("Close", self.destroy, "secondary")
         ], pady=14, side="bottom")
-        self.create_themed_label(self, "Leave a field blank for automatic scaling.",
+        self.create_themed_label(self, "Leave a field blank for automatic scaling",
                                  font_type="small",
                                  fg_color=OPERAXNTheme.COLORS['text_secondary'],
                                  side="bottom", pady=(10, 0))
@@ -568,15 +561,14 @@ class PlotSettingsDialog(BaseDialog):
             entry.bind("<FocusOut>", lambda _e, k=key, v=var: self._validate_entry(k, v))
 
     def _validate_entry(self, key: str, var: tk.StringVar) -> None:
-        """Store an entry's limit in config; blank or 'auto' means None (auto-scale).
-        Anything else unparseable or not finite is cleared to blank and stored as None."""
+        """Store an entry's limit in config; blank means None (auto-scale).
+        Anything unparseable or not finite is cleared to blank and stored as None."""
         try:
             value_str = var.get().strip()
 
-            if not value_str or value_str.lower() == 'auto':
+            if not value_str:
                 self._set_config_value(key, None)
-                if not value_str:
-                    var.set("")
+                var.set("")
             else:
                 value = float(value_str)
                 if not np.isfinite(value):
@@ -636,13 +628,11 @@ class PlotSettingsDialog(BaseDialog):
         self._apply_neutron_settings()
 
     def _apply_neutron_settings(self) -> None:
-        """Validate neutron fields into config, clear plot cache, redraw."""
+        """Validate neutron fields into config and redraw."""
         self.config.show_neutron_dspacing = self.neutron_display_var.get()
 
         for key in ['neutron_xmin', 'neutron_xmax', 'neutron_ymin', 'neutron_ymax']:
             self._validate_entry(key, getattr(self, f"{key}_var"))
-
-        clear_plot_cache()
 
         if self.on_update:
             self.on_update()
@@ -753,31 +743,22 @@ class PlotSettingsDialog(BaseDialog):
                     logger.debug("Could not convert d-spacing to 2θ: %s", e)
 
     def _apply_settings(self) -> None:
-        """Validate every field into config and redraw; a d-spacing toggle clears the plot cache."""
-        try:
-            old_dspacing = self.config.show_dspacing
-            self.config.show_dspacing = self.dspacing_var.get()
+        """Validate every field into config and redraw."""
+        self.config.show_dspacing = self.dspacing_var.get()
 
-            # Validate all 1D fields
-            for key in ['xmin', 'xmax', 'ymin', 'ymax']:
-                self._validate_entry(key, getattr(self, f"{key}_var"))
+        # Validate all 1D fields
+        for key in ['xmin', 'xmax', 'ymin', 'ymax']:
+            self._validate_entry(key, getattr(self, f"{key}_var"))
 
-            # Update 2D settings
-            for key, var_name in [('twod_ymin_percent', 'ymin_2d_var'),
-                                  ('twod_ymax_percent', 'ymax_2d_var'),
-                                  ('twod_xmin_percent', 'xmin_2d_var'),
-                                  ('twod_xmax_percent', 'xmax_2d_var')]:
-                setattr(self.config, key, getattr(self, var_name).get())
+        # Update 2D settings
+        for key, var_name in [('twod_ymin_percent', 'ymin_2d_var'),
+                              ('twod_ymax_percent', 'ymax_2d_var'),
+                              ('twod_xmin_percent', 'xmin_2d_var'),
+                              ('twod_xmax_percent', 'xmax_2d_var')]:
+            setattr(self.config, key, getattr(self, var_name).get())
 
-            if self.on_update:
-                self.on_update()
-
-            # Clear cache if d-spacing changed
-            if old_dspacing != self.config.show_dspacing:
-                clear_plot_cache()
-
-        except ValueError as e:
-            messagebox.showerror("Error", f"Failed to apply the plot settings: {e}", parent=self)
+        if self.on_update:
+            self.on_update()
 
 
 # ============================================================================
@@ -1109,7 +1090,7 @@ class UploadOptionsDialog(BaseDialog):
         self._small_button(input_frame, "Directory", self._select_directory)
 
         # --- Data source ---
-        self.create_themed_label(self._body, "Data source type:",
+        self.create_themed_label(self._body, "Data source:",
                                  font_type="heading", pady=(14, 4))
         source_frame = self._block()
         self.source_var = tk.StringVar(value="inhouse")
@@ -1323,7 +1304,7 @@ class UploadOptionsDialog(BaseDialog):
         files = filedialog.askopenfilenames(
             parent=self, title="Select Files",
             filetypes=[
-                ("All Supported",
+                ("Supported files",
                  "*.zip *.dat *.edf *.txt *.xlsx *.csv *.hdf *.nxs *.xy"),
                 ("NeXus files", "*.nxs"),
                 ("ZIP files", "*.zip"),

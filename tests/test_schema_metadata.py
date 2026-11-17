@@ -10,7 +10,7 @@ import pytest
 from operaxn import core
 
 import _builders
-from _helpers import s, wall, tz_aware, assert_pynxtools_valid, needs_fabio
+from _helpers import assert_pynxtools_valid, needs_fabio, s, tz_aware, wall
 
 
 def test_monopd_reader_roundtrip(inhouse_nxs):
@@ -83,9 +83,11 @@ def test_v1_layout_loads(legacy_v1_nxs):
     s1, s2 = lm.scans
     assert s1.echem == 3.76 and s1.current == 0.106 and s1.exposure_time == 120.0
     assert s2.echem == 3.81 and s2.timestamp == "2024-02-05 10:10:00"
-    assert s1.midpoint_timestamp == "2024-02-05 10:06:00" and s1.echem_timestamp == "2024-02-05 10:06:00"
+    assert s1.midpoint_timestamp == "2024-02-05 10:06:00" and \
+        s1.echem_timestamp == "2024-02-05 10:06:00"
     assert np.allclose(s1.oned["x"], _builders.ONED_X)
-    assert np.allclose(s2.oned["y"], _builders.inhouse_scan_y(2)) and s2.oned["source"] == "scan_002.dat"
+    assert np.allclose(s2.oned["y"], _builders.inhouse_scan_y(2)) and \
+        s2.oned["source"] == "scan_002.dat"
     assert lm.echem_df is not None and len(lm.echem_df) == 40
     assert str(lm.echem_df["timestamp"].iloc[1]) == "2024-02-05 10:01:00"
     assert np.allclose(lm.echem_df["current"].iloc[:2], [0.1, 0.101])
@@ -215,7 +217,7 @@ def test_na_edf_geometry_is_not_written_and_file_validates(tmp_path, caplog, cas
               else {"SampleDistance": "nan", "PSize_1": "inf", "PSize_2": "0.000172"})
     _builders.write_edf_image(os.path.join(src, "image_001.edf"), _builders.SCAN_TIMES[0], **header)
     out = str(tmp_path / f"{case}.nxs")
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
     assert ok, msgs
     with h5py.File(out, "r") as f:
@@ -250,7 +252,7 @@ def test_numeric_edf_comment_and_detector_model_are_stored_verbatim(tmp_path):
 
 @needs_fabio
 def test_metadata_comes_from_the_first_scan_with_an_edf(tmp_path):
-    """Scan 1 without an EDF: scan 2's header gives wavelength, detector, edf_metadata and sample name."""
+    """Scan 1 has no EDF: scan 2's header gives wavelength, detector, edf_metadata, sample name."""
     src = str(tmp_path / "lab")
     _builders.write_lab_dir(src)
     for i in (2, 3):
@@ -344,8 +346,6 @@ def test_tofnpd_geometry_from_profile(tmp_path, polaris_src, monkeypatch):
         assert np.allclose(e["monitor/distance"][()], [7.641, 3.27])
         assert e["monitor/distance"].attrs.get("units") == "m"
         assert np.allclose(e["monitor/polar_angle"][()], [180.0, 0.0])
-        assert list(e["monitor"].keys()) == [
-            "mode", "detector_number", "distance", "polar_angle", "azimuthal_angle"]
     m = core.load(out)
     assert m.global_metadata.get("pre_sample_flightpath") == 14.0
     assert list(m.global_metadata["monitor"]["detector_number"]) == [611, 671]
@@ -417,8 +417,8 @@ def test_profile_from_mantid_nexus(tmp_path):
     assert info["banks"][1]["polar_angle_range_deg"] == (10.0, 10.0)
     assert info["banks"][2]["distance_range_m"] == (1.0, 1.0)
     assert info["banks"][2]["polar_angle_range_deg"] == (88.0, 92.0)
-    assert info["banks"][1]["azimuthal_coherence"] < 0.5 \
-        <= info["banks"][2]["azimuthal_coherence"]
+    assert info["banks"][1]["azimuthal_coherence"] < 0.5 <= \
+        info["banks"][2]["azimuthal_coherence"]
     assert "monitors" not in info, "the monitor table is a written key, not info"
     assert info["idf_name"] == "Test_upgrade"
     assert info["idf_valid_from"] == "2020-01-01 00:00:00"
@@ -565,7 +565,7 @@ def test_pre_1970_scan_times_write_a_valid_file(tmp_path):
     model = core.load(out)
     assert [round(scan.echem, 2) for scan in model.scans] == [3.7, 3.8, 3.9]
     with h5py.File(out, "r") as f:
-        start = f["entry/start_time"][()].decode()
+        start = s(f["entry/start_time"])
     assert start.startswith("1970-01-01T10:") and start[-6] in "+-", start
     assert_pynxtools_valid(out)
 

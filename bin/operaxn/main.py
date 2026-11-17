@@ -11,17 +11,17 @@ import sys
 import time
 import tkinter as tk
 from tkinter import messagebox
-from typing import List, Optional, Tuple, Callable
+from typing import Callable, List, Optional, Tuple
 
 from .config import (
-    DEBUG_MODE,
+    APP_COPYRIGHT,
     APP_NAME,
     APP_VERSION as __version__,
-    APP_COPYRIGHT,
-    OPERAXNTheme,
-    LOG_FORMAT,
+    DEBUG_MODE,
     LOG_FILE,
-    log_config_summary
+    LOG_FORMAT,
+    OPERAXNTheme,
+    log_config_summary,
 )
 from .core import format_profile_block, profile_from_mantid_nexus
 
@@ -50,7 +50,7 @@ def setup_logging(debug: bool = False) -> logging.Logger:
         force=True
     )
 
-    if LOG_FILE and (debug or DEBUG_MODE):
+    if LOG_FILE:
         file_handler = logging.FileHandler(LOG_FILE, mode='w')
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
@@ -58,14 +58,9 @@ def setup_logging(debug: bool = False) -> logging.Logger:
 
     # Application loggers follow the chosen level
     logging.getLogger("operaxn").setLevel(level)
-    logging.getLogger("operaxn.input").setLevel(level)
-    logging.getLogger("operaxn.output").setLevel(level)
-    logging.getLogger("operaxn.gui").setLevel(level)
 
     # Keep third-party debug output quiet
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
-    logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
-    logging.getLogger("matplotlib.ticker").setLevel(logging.WARNING)
     logging.getLogger("PIL").setLevel(logging.WARNING)
     logging.getLogger("fabio").setLevel(logging.WARNING)
 
@@ -142,7 +137,6 @@ class EnhancedSplashScreen(WindowManager):
         self.splash = None
         self.canvas = None
         self.animation_items = []
-        self.animation_running = False
         # Pending after() id per animation step, cancelled by close()
         self._jobs = {}
         self.progress_var = tk.DoubleVar(value=0)
@@ -236,7 +230,7 @@ class EnhancedSplashScreen(WindowManager):
             if tag == 'inner_hex':
                 self.animation_items.append(('rotate', hex_id, 0))
 
-        # Center dot
+        # Centre dot
         self.canvas.create_oval(
             center_x - 5, center_y - 5,
             center_x + 5, center_y + 5,
@@ -252,7 +246,7 @@ class EnhancedSplashScreen(WindowManager):
         subtitle_font = (OPERAXNTheme._SANS, 11)
         version_font = (OPERAXNTheme._SANS, 9)
 
-        # Split title for coloring
+        # Split title for colouring
         opera_text = "OPERA"
         xn_text = "XN"
 
@@ -423,8 +417,6 @@ class EnhancedSplashScreen(WindowManager):
 
     def _start_animations(self) -> None:
         """Schedule all splash animation callbacks."""
-        self.animation_running = True
-
         animations = [
             (30, self._animate_progress),
             (500, self._animate_loading_dots),
@@ -528,9 +520,8 @@ class EnhancedSplashScreen(WindowManager):
         """Finish the progress fill, then fade out and destroy the splash window."""
         if self.splash and self.splash.winfo_exists():
             # A slow GUI build can leave the bar short of its last announced value
-            while self.animation_running and self.progress_var.get() < self.progress_target:
+            while self.progress_var.get() < self.progress_target:
                 self._animate_progress()
-        self.animation_running = False
         if self.splash and self.splash.winfo_exists():
             # Pending steps would fire into the destroyed window's deleted callbacks
             for job in self._jobs.values():
@@ -560,8 +551,8 @@ class ApplicationManager:
         self.root = None
         self.splash_manager = None
         self._window_class = None  # OPERAXN, imported by run()
-        self.initialization_complete = False
-        self.initialization_failed = False
+        self.initialisation_complete = False
+        self.initialisation_failed = False
 
     def run(self) -> int:
         """Launch the GUI event loop; return 0 on success, 1 on error."""
@@ -569,7 +560,7 @@ class ApplicationManager:
             if not self._validate_environment():
                 return 1
 
-            # Imported here, before the splash, so --version and --profile load no GUI
+            # Imported here, before the splash: --version and --profile load no operaxn.gui
             from .gui import OPERAXN
             self._window_class = OPERAXN
             self._initialise_ui()
@@ -581,7 +572,7 @@ class ApplicationManager:
             self.logger.info("Starting main event loop")
             self.root.mainloop()
 
-            if self.initialization_failed:
+            if self.initialisation_failed:
                 return 1
             self.logger.info("Application closed normally")
             return 0
@@ -608,7 +599,7 @@ class ApplicationManager:
     def _initialise_ui(self) -> None:
         """Create the root Tk window and show the splash screen."""
         self.root = tk.Tk()
-        self.root.withdraw()  # Hidden until the splash closes
+        self.root.withdraw()  # Hidden while the splash shows
 
         self.root.title(f"{APP_NAME} v{__version__}")
 
@@ -632,7 +623,7 @@ class ApplicationManager:
 
     def _initialise_application(self) -> None:
         """Create the OPERAXN main window unless already created."""
-        if self.initialization_complete or self.initialization_failed:
+        if self.initialisation_complete or self.initialisation_failed:
             return
 
         self.logger.info("Initialising %s v%s", APP_NAME, __version__)
@@ -643,14 +634,14 @@ class ApplicationManager:
         try:
             # Tk keeps the main frame alive as a child of root
             self._window_class(master=self.root)
-            self.initialization_complete = True
+            self.initialisation_complete = True
             self.logger.info("Application initialised successfully")
             if self.splash_manager:
                 self.splash_manager.update_status("Ready to launch!", 100)
         except Exception as e:
             # One error box, then end the main loop: the splash is topmost and has no close button
             self.logger.exception("Failed to initialise application")
-            self.initialization_failed = True
+            self.initialisation_failed = True
             if self.splash_manager:
                 self.splash_manager.close()
             self._show_error(f"Failed to initialise:\n\n{e}")
@@ -658,9 +649,9 @@ class ApplicationManager:
 
     def _show_main_window(self) -> None:
         """Close the splash and reveal the main application window."""
-        if not self.initialization_complete:
+        if not self.initialisation_complete:
             self._initialise_application()
-        if not self.initialization_complete:
+        if not self.initialisation_complete:
             return
 
         if self.splash_manager:

@@ -283,7 +283,6 @@ def _render(fig):
 
 def test_twod_update_keeps_norm_and_pixels():
     """A 2D update re-limits the image's own LogNorm and renders exactly like a fresh plot."""
-    operaxn.clear_plot_cache()
     fig = Figure(figsize=(5, 4), dpi=95)
     ax = fig.subplots()
     im = operaxn.plot_twod_data(ax, IMG, intensity_limits=(2.0, 900.0))
@@ -296,28 +295,25 @@ def test_twod_update_keeps_norm_and_pixels():
     fresh_fig = Figure(figsize=(5, 4), dpi=95)
     operaxn.plot_twod_data(fresh_fig.subplots(), IMG * 1.5, intensity_limits=(5.0, 400.0))
     assert np.array_equal(updated, _render(fresh_fig))
-    operaxn.clear_plot_cache()
 
 
 def test_intensity_handler_keeps_norm():
     """The 2D intensity handler re-limits the image in place without replacing its norm."""
-    operaxn.clear_plot_cache()
     fig = Figure()
     ax = fig.subplots()
     im = operaxn.plot_twod_data(ax, IMG, intensity_limits=(2.0, 900.0))
     norm = im.norm
     fake = SimpleNamespace(
-        state=SimpleNamespace(twod_arrays={1: {"image": IMG}}, intensity_limits={}, current_scan_idx=0),
+        state=SimpleNamespace(twod_arrays={1: {"image": IMG}}, intensity_limits={},
+                              current_scan_idx=0),
         axes={"twod": ax}, twod_image=im, canvas=None,
         controls=SimpleNamespace(get_intensity_limits=lambda: (3.0, 300.0)))
     OPERAXN._update_plots_with_intensity(fake)
     assert im.norm is norm and (norm.vmin, norm.vmax) == (3.0, 300.0)
-    operaxn.clear_plot_cache()
 
 
 def test_settings_change_keeps_1d_2d_artists_and_rebuilds_echem():
-    """A Plot Settings change keeps the cached 1D line and 2D image; only the echem pane rebuilds."""
-    operaxn.clear_plot_cache()
+    """Plot Settings changes keep the cached 1D line and 2D image; only the echem pane rebuilds."""
     fig = Figure()
     a1, a2, a3 = fig.subplots(3)
     operaxn.plot_oned_data(a1, np.linspace(10, 80, 50), np.arange(50.0))
@@ -334,7 +330,6 @@ def test_settings_change_keeps_1d_2d_artists_and_rebuilds_echem():
     assert output_module._plot_cache.get(f"twod_{id(a2)}") is im
     assert output_module._plot_cache.get(f"echem_v_{id(a3)}") is None and not a3.lines, \
         "the echem pane is rebuilt"
-    operaxn.clear_plot_cache()
 
 
 def test_log_limits_floors_and_orders():
@@ -581,7 +576,8 @@ def _gif(out, files, monkeypatch=None, fail_on=None, fps=2, loop=0):
         dst = os.path.join(temp_dir, f"frame_{idx:04d}.png")
         shutil.copyfile(files[idx], dst)
         return dst
-    fake = SimpleNamespace(state=SimpleNamespace(scans=[{"scan_num": i + 1} for i in range(len(files))]),
+    fake = SimpleNamespace(state=SimpleNamespace(scans=[{"scan_num": i + 1}
+                                                        for i in range(len(files))]),
                            _gif_layout=lambda nums: (True, False, False, False),
                            _create_gif_frame=frame, _show_message=lambda *a: msgs.append(a),
                            _close_dialog=lambda d: None)
@@ -616,7 +612,7 @@ def test_gif_export_needs_no_imageio_and_keeps_its_bytes(tmp_path, monkeypatch):
 
 
 def test_failed_gif_write_keeps_the_previous_gif(tmp_path, monkeypatch):
-    """A write that fails part-way shows the error, leaves the old GIF byte for byte and no .part."""
+    """A write failing part-way shows the error, leaves the old GIF byte for byte and no .part."""
     files = _frames(tmp_path)
     out = str(tmp_path / "anim.gif")
     assert _gif(out, files)[0] == "Export complete"
@@ -731,7 +727,7 @@ def test_intensity_entries_and_sliders_keep_valid_limits(tk_root, monkeypatch):
 
 
 def _limit_stub():
-    """Return (stand-in dialog, its config, a text box) for PlotSettingsDialog._validate_entry."""
+    """Return (stand-in dialog, its config, a text box, its variable) for _validate_entry."""
     config = VisualiserConfig()
     stub = SimpleNamespace(config=config)
     stub._set_config_value = lambda k, v: PlotSettingsDialog._set_config_value(stub, k, v)
@@ -766,7 +762,8 @@ def test_dspacing_blank_limit_is_filled_decreasing():
     plotter = OneDPlotter()
     d = plotter.transformer.theta_to_d_spacing(tth)
     # A scalar input gives a 0-d value, so take it through atleast_1d
-    d40, d25 = (float(np.atleast_1d(plotter.transformer.theta_to_d_spacing(v))[0]) for v in (40.0, 25.0))
+    d40, d25 = (float(np.atleast_1d(plotter.transformer.theta_to_d_spacing(v))[0])
+                for v in (40.0, 25.0))
     for xmin, xmax, expected in [(None, d40, (d.max(), d40)), (d25, None, (d25, d.min())),
                                  (None, None, (d.max(), d.min()))]:
         ax = Figure().subplots()
@@ -796,7 +793,7 @@ def test_cropped_image_extent_follows_the_crop(source, expected):
 
 
 def test_failed_plot_update_leaves_drawing_switched_on():
-    """A plot error inside the update block restores draw_idle without drawing; the next update draws."""
+    """A plot error in the update block restores draw_idle without drawing; the next one draws."""
     calls = []
     canvas = SimpleNamespace(draw_idle=lambda: calls.append("draw"))
     original = canvas.draw_idle
@@ -816,7 +813,8 @@ def test_failed_plot_update_leaves_drawing_switched_on():
                          ids=["drawing-error", "written"])
 def test_failed_single_scan_export_closes_its_figure(tmp_path, twod, written):
     """export_single_scan closes its figure whether the drawing fails or the PNG is written."""
-    scan = {"scan_num": 1, "oned": {"x": np.linspace(10, 80, 100), "y": np.ones(100)}, "twod": twod}
+    scan = {"scan_num": 1, "oned": {"x": np.linspace(10, 80, 100), "y": np.arange(100.0)},
+            "twod": twod}
     out = tmp_path / "scan.png"
     before = len(plt.get_fignums())
     for _ in range(3):

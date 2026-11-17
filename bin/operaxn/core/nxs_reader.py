@@ -272,7 +272,7 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
         scan.neutron_start = start
         scan.neutron_end = end
 
-    # Monitor record (in-house EDF counters), when present
+    # Monitor record (laboratory EDF counters), when present
     mon = sub.get('monitor')
     if isinstance(mon, h5py.Group):
         monitor: Dict[str, Any] = {}
@@ -293,7 +293,7 @@ def _read_scan_v3(sub: h5py.Group, name: str) -> ScanData:
     if isinstance(note, h5py.Group):
         scan.twod_source = _decode(_dataset_scalar(note, 'file_name'))
         embedded = _dataset_scalar(note, 'embedded')
-        scan.twod_embedded = bool(embedded) if embedded is not None else False
+        scan.twod_embedded = bool(embedded)
         image = sub.get('image_data')
         if (scan.twod_embedded and isinstance(image, h5py.Group)
                 and 'data' in image):
@@ -339,10 +339,10 @@ def _read_xrd_v3(grp: h5py.Group, scan: ScanData) -> None:
 
 def _read_twod_attrs(grp: h5py.Group, scan: ScanData) -> None:
     """Set the 2D source, embed flag and embedded image from twod_* attrs (v3 and legacy)."""
-    scan.twod_source = _decode(grp.attrs.get('twod_source_path')) or \
-        _decode(grp.attrs.get('twod_source'))
+    scan.twod_source = (_decode(grp.attrs.get('twod_source_path'))
+                        or _decode(grp.attrs.get('twod_source')))
     embedded = grp.attrs.get('twod_embedded')
-    scan.twod_embedded = bool(embedded) if embedded is not None else False
+    scan.twod_embedded = bool(embedded)
 
     if scan.twod_embedded and 'twod_image' in grp:
         scan.twod = np.asarray(grp['twod_image'][()], dtype=float)
@@ -488,9 +488,9 @@ def _read_echem_series(grp: h5py.Group) -> Optional[pd.DataFrame]:
         if start is not None and len(seconds) == len(v):
             start_ts = pd.to_datetime(start)
             if start_ts.tzinfo is not None:
-                # in-memory model uses naive local wall time throughout
+                # The in-memory model uses naive local wall time throughout
                 start_ts = start_ts.tz_localize(None)
-            # float-seconds storage can be ~1 ns off; source data (and the
+            # Float-seconds storage can be ~1 ns off; source data (and the
             # v3 string format) never exceeds microsecond resolution
             timestamps = (start_ts + pd.to_timedelta(seconds, unit='s')).round('us')
             df = pd.DataFrame({"timestamp": timestamps,
@@ -596,8 +596,6 @@ def _decode(value: Any) -> Optional[Any]:
         return None
     if isinstance(value, bytes):
         return value.decode('utf-8', errors='ignore')
-    if isinstance(value, np.bytes_):
-        return bytes(value).decode('utf-8', errors='ignore')
     if isinstance(value, (np.integer, np.floating, np.bool_)):
         return value.item()
     if isinstance(value, np.ndarray):

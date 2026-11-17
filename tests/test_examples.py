@@ -6,8 +6,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import _builders
 from operaxn import core
+
+import _builders
 
 pytestmark = pytest.mark.gui
 

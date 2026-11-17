@@ -326,8 +326,8 @@ class TXTClassifier(FileClassifierBase):
             for line in lines[:5]:
                 parts = line.strip().split('\t')
 
-                if _valid_scan_id(parts[0]) and sum(map(_is_logbook_time, parts)) >= 2:
-                    logger.debug(f"Identified {path} as neutron metadata")
+                if _valid_scan_id(parts[0].strip()) and sum(map(_is_logbook_time, parts)) >= 2:
+                    logger.debug(f"Identified {path} as a logbook")
                     return DataType.NEUTRON_META.value, None, None
 
             first_line_lower = lines[0].lower()
@@ -346,14 +346,14 @@ class FileClassificationManager:
     """Dispatcher running the per-extension classifiers over a DataFrame of files."""
 
     def __init__(self, data_source: DataSourceType = DataSourceType.INHOUSE):
-        self.data_source = data_source
+        self.data_source = DataSourceType(data_source)
         self.classifiers: Dict[FileType, FileClassifierBase] = {
             FileType.DAT: DATClassifier(),
             FileType.EDF: EDFClassifier(),
             FileType.TXT: TXTClassifier()
         }
 
-    def classify_files(self, df: pd.DataFrame,
+    def classify_files(self, df: pd.DataFrame, *,
                        cancel: Optional[threading.Event] = None) -> pd.DataFrame:
         """Classify unclassified rows into the type/timestamp/exposure columns of a copy of df.
         Neutron mode classifies .txt files only; a set cancel raises Cancelled at the next row."""
@@ -399,7 +399,7 @@ class FileClassificationManager:
             elif file_path in classifier.reported:
                 continue  # its classifier's own warning already named it
             elif file_type == FileType.TXT or self.data_source == DataSourceType.INHOUSE:
-                # Name the user's file, not a converted .csv/.xlsx temp copy; an in-house
+                # Name the user's file, not a converted .csv/.xlsx temp copy; a laboratory
                 # .dat or .edf lands here without a readable Date (e.g. a stripped header)
                 original = row.get("original_path")
                 unrecognised.append(os.path.basename(original if isinstance(original, str)
@@ -435,7 +435,7 @@ class NeutronMetadataParser:
     def parse(path: str) -> Optional[pd.DataFrame]:
         """Parse a logbook into a scans DataFrame; None when no valid entries."""
         try:
-            logger.debug(f"Parsing neutron metadata file: {path}")
+            logger.debug(f"Parsing logbook: {path}")
 
             with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
                 lines = f.readlines()
@@ -490,7 +490,7 @@ class NeutronMetadataParser:
                 logger.warning(
                     f"{n} logbook lines have no readable start and end time and were skipped: "
                     f"{name_list(unreadable)}" if n != 1 else
-                    f"1 logbook line has no readable start and end time and was skipped: "
+                    "1 logbook line has no readable start and end time and was skipped: "
                     f"{unreadable[0]}")
 
             if data:
@@ -502,7 +502,7 @@ class NeutronMetadataParser:
             return None
 
         except Exception as e:
-            logger.error(f"Error parsing neutron metadata file {os.path.basename(path)}: {e}")
+            logger.error(f"Error parsing logbook {os.path.basename(path)}: {e}")
             return None
 
     @staticmethod
@@ -581,7 +581,7 @@ class NeutronFileGrouper:
 
         if skipped:
             if len(skipped) == 1:
-                logger.warning(f"1 .dat file was not recognised as a neutron bank 1-5 file "
+                logger.warning("1 .dat file was not recognised as a neutron bank 1-5 file "
                                f"and was ignored: {skipped[0]}")
             else:
                 logger.warning(f"{len(skipped)} .dat files were not recognised as neutron "

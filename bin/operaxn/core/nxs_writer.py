@@ -19,8 +19,8 @@ import numpy as np
 import pandas as pd
 
 from .config import (DEFAULT_PROFILES, DEFINITION_URL_BASE, DEFINITION_VERSION,
-                     ECHEM_TIME_TOLERANCE,
-                     GENERATOR_NAME, GENERATOR_VERSION, INSTRUMENT_PROFILES)
+                     ECHEM_TIME_TOLERANCE, GENERATOR_NAME, GENERATOR_VERSION,
+                     INSTRUMENT_PROFILES)
 from .classify import (extract_edf_scan_fields, parse_mantid_header,
                        parse_mantid_header_lines)
 from .correlate import EchemParser
@@ -381,10 +381,10 @@ class NXSWriter:
                  sample_preparation_date: Optional[str] = None,
                  cycling_protocol: Optional[Dict[str, Any]] = None,
                  echem_time_tolerance: float = ECHEM_TIME_TOLERANCE):
-        self.data_source = data_source
+        self.data_source = DataSourceType(data_source)
         self.include_2d_images = include_2d_images
         self.max_display_size = max_display_size  # 0 = full resolution
-        self.time_method = time_method
+        self.time_method = TimeMethod(time_method)
         self.title = title
         self.sample_name = sample_name
         self.sample_description = sample_description
@@ -399,10 +399,13 @@ class NXSWriter:
     # --- top level ---
 
     def write(self, output_path: str, scans: List[Scan], echem_df: pd.DataFrame,
-              standard_echem_files: Optional[List[Union[str, Tuple[str, str]]]] = None,
+              standard_echem_files: Optional[List[Union[str, Tuple[str, str]]]] = None, *,
               cancel: Optional[threading.Event] = None) -> None:
         """Write the full canonical file: metadata, scans, and echem layers.
         A set cancel raises Cancelled before the next scan; output_path keeps its old content."""
+        output_path = os.fspath(output_path)
+        if isinstance(standard_echem_files, (str, os.PathLike)):
+            standard_echem_files = [standard_echem_files]
         harvest = self._harvest_experiment_metadata(scans)
 
         # track_order: members list in the order written here (the NXmonopd /
@@ -471,7 +474,7 @@ class NXSWriter:
                         harvested[key] = logbook[key]
 
         profile = get_profile(self.data_source, harvested.get('instrument_name'))
-        # harvested values win over profile defaults
+        # Harvested values win over profile defaults
         return {**profile, **{k: v for k, v in harvested.items() if v is not None}}
 
     def _write_process(self, entry: h5py.Group, scans: List[Scan]) -> None:
@@ -522,8 +525,8 @@ class NXSWriter:
             ds = entry.create_dataset('pre_sample_flightpath', data=float(flightpath))
             ds.attrs['units'] = 'm'
         except (ValueError, TypeError):
-            logger.warning(f"Skipping non-numeric pre_sample_flightpath "
-                           f"{flightpath!r}")
+            logger.warning(f"Skipping pre_sample_flightpath {flightpath!r}: "
+                           "non-numeric value")
 
     def _write_instrument(self, entry: h5py.Group, harvest: Dict[str, Any]) -> None:
         """Write the NXinstrument: source, crystal, detector and the raw-harvest collections."""
@@ -560,7 +563,7 @@ class NXSWriter:
                 wavelength = None
         if wavelength and self.data_source != DataSourceType.NEUTRON:
             crystal = _nx_group(inst, 'crystal', 'NXcrystal')
-            ds = crystal.create_dataset('wavelength', data=float(wavelength))
+            ds = crystal.create_dataset('wavelength', data=wavelength)
             ds.attrs['units'] = 'angstrom'
 
         # Detector fields and profile geometry are gathered first so the
@@ -637,7 +640,7 @@ class NXSWriter:
             sample.create_dataset('description', data=str(self.sample_description))
         if not _is_blank(self.sample_preparation_date):
             # ISO 8601 only: bare pd.to_datetime is month-first and would
-            # misread UK dates (the app's dayfirst convention)
+            # misread UK dates (the app's day-first convention)
             try:
                 ts = pd.to_datetime(self.sample_preparation_date, format='ISO8601')
                 iso = _iso(ts)
@@ -646,8 +649,8 @@ class NXSWriter:
             if iso:
                 sample.create_dataset('preparation_date', data=iso)
             else:
-                logger.warning(f"Skipping unparseable sample preparation_date "
-                               f"{self.sample_preparation_date!r} (expected ISO 8601)")
+                logger.warning("Skipping sample preparation_date "
+                               f"{self.sample_preparation_date!r}: not an ISO 8601 date")
 
     @staticmethod
     def _geometry_arrays(table: Optional[Dict[Any, Dict[str, Any]]],
@@ -728,7 +731,7 @@ class NXSWriter:
     def _write_monitor(self, entry: h5py.Group, scans: List[Scan],
                        harvest: Dict[str, Any]) -> None:
         """Write the entry NXmonitor: tofnpd mode and monitor geometry from the profile.
-        In-house: mode timer, plus the preset when all exposures match; synchrotron: none."""
+        Laboratory: mode timer, plus the preset when all exposures match; synchrotron: none."""
         if self.data_source == DataSourceType.NEUTRON:
             mode = harvest.get('monitor_mode')
             if _is_blank(mode):
@@ -822,15 +825,15 @@ class NXSWriter:
             env.create_dataset('logbook_entry', data=str(scan.logbook['full_line']))
 
     def _write_scan_monitor(self, sub: h5py.Group, scan: Scan) -> None:
-        """Write one in-house acquisition's monitor integral from its EDF Monitor counter.
+        """Write one laboratory acquisition's monitor integral from its EDF Monitor counter.
         No group unless the count is finite and positive; mode and preset live at entry level."""
         if not (scan.twod and str(scan.twod).lower().endswith('.edf')):
             return
         integral = extract_edf_scan_fields(str(scan.twod)).get('monitor', {}).get('Monitor')
-        if not integral or not np.isfinite(float(integral)) or float(integral) <= 0:
+        if not integral or not np.isfinite(integral) or integral <= 0:
             return
         monitor = _nx_group(sub, 'monitor', 'NXmonitor')
-        integral_ds = monitor.create_dataset('integral', data=float(integral))
+        integral_ds = monitor.create_dataset('integral', data=integral)
         integral_ds.attrs['units'] = 'counts'
 
     def _write_xrd_data(self, sub: h5py.Group, scan: Scan) -> None:
@@ -929,7 +932,7 @@ class NXSWriter:
                     continue
                 bank = _nx_group(sub, name, 'NXdata')
                 try:
-                    # grouper keys are strings; the schema wants NX_INT
+                    # Grouper keys are strings; the schema wants NX_INT
                     bank.attrs['measurement_number'] = (
                         int(meas_num) if str(meas_num).isdigit() else meas_num)
                     bank.attrs['source_file'] = os.path.basename(path)
@@ -985,13 +988,14 @@ class NXSWriter:
         for item in standard_echem_files:
             # (parse_path, display_path) pairs keep the user's filename as
             # provenance when the parsed file is a converted temp copy
-            parse_path, display_path = item if isinstance(item, tuple) else (item, item)
+            parse_path, display_path = map(
+                os.fspath, item if isinstance(item, tuple) else (item, item))
             name = os.path.basename(display_path)
             if parse_path.lower().endswith(('.xlsx', '.csv')):
                 # A generate pair holding a table is a failed conversion, already logged
                 if not isinstance(item, tuple):
-                    logger.warning(f"Standard electrochemistry file {name} is not converted"
-                                   f" to text; skipped")
+                    logger.warning(f"Standard electrochemistry file {name} is not converted "
+                                   "to text; skipped")
                 continue
             if not os.path.isfile(parse_path):
                 logger.warning(f"Standard electrochemistry file {name} not found; skipped")
@@ -1001,9 +1005,8 @@ class NXSWriter:
                 continue
             datasets.append({'source_file': name,
                              'data': standard_echem_df})
-            logger.info(f"Added standard electrochemistry file"
-                        f" {name}"
-                        f" ({len(standard_echem_df)} "
+            logger.info(f"Added standard electrochemistry file {name} "
+                        f"({len(standard_echem_df)} "
                         f"point{'s' if len(standard_echem_df) != 1 else ''})")
 
         if datasets:

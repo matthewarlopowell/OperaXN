@@ -31,7 +31,7 @@ LOGBOOK_LINE = ("123456\tuser\tsample title\tMon Feb 05 10:00:00 2024\t"
 
 
 def inhouse_scan_y(i):
-    """Return the intensity array written for 1-based in-house scan number `i`."""
+    """Return the intensity array written for 1-based laboratory scan number `i`."""
     return 100 + 10 * i + np.arange(50, dtype=float)
 
 
@@ -50,7 +50,7 @@ def write_xrd_dat(path, timestamp, exposure="120.0", y=None):
 
 def write_echem_txt(path, n_rows=40, v0=3.7, dv=0.01, i0=0.1, di=0.001,
                     date="05/02/2024", hour=10):
-    """Write an echem .txt: tab-delimited header and dayfirst timestamps at 60 s cadence."""
+    """Write an echem .txt: tab-delimited header and day-first timestamps at 60 s cadence."""
     rows = ["Time\tEwe/V\tI/mA"]
     for m in range(n_rows):
         rows.append(f"{date} {hour}:{m:02d}:00\t{v0 + m * dv:.4f}\t{i0 + m * di:.4f}")
@@ -197,7 +197,7 @@ def write_detailed_neutron_dir(dirpath):
 # Real-file shapes
 # ============================================================================
 # Tiny synthetic files laid out like the instrument exports in the reference
-# sets, so tests take the code paths real data takes: the in-house azimAvg .dat
+# sets, so tests take the code paths real data takes: the laboratory azimAvg .dat
 # (a '#' key block, then an uncommented column line), EC-Lab absolute-time echem
 # (header ending in a tab, CRLF, E+000 numbers), Mantid focussed banks (leading
 # XYDATA line; POLARIS CRLF, WISH LF with "Spectrum N "), POLARIS and WISH bank

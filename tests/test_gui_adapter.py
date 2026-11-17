@@ -1,4 +1,4 @@
-"""operaxn.input adapter and main window: the GUI contract over the core pipeline, exports and lifecycle."""
+"""operaxn.input adapter and main window: the GUI over the core pipeline, exports and lifecycle."""
 import argparse
 import gc
 import glob
@@ -12,6 +12,7 @@ import zipfile
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -22,22 +23,19 @@ pytestmark = pytest.mark.gui
 pytest.importorskip("tkinter")
 from tkinter import Toplevel, filedialog, messagebox  # noqa: E402
 
-import h5py
-
 import operaxn
 import operaxn.gui as gui_module
 import operaxn.main as main_module
 from operaxn import core
 from operaxn import input as gui_input
+from operaxn.capacity import CapacityWindow
 from operaxn.config import APP_VERSION, OPERAXNTheme, log_config_summary
 from operaxn.core import nxs_writer, pipeline, readers
-from operaxn.capacity import CapacityWindow
 from operaxn.core.config import MAX_ECHEM_TIME_TOLERANCE
 from operaxn.dialog import ExportOptions, GIFSettings, UploadOptions, UploadOptionsDialog
 from operaxn.gui import (ButtonPanel, FileListPanel, OPERAXN, PerformanceMonitor, UIState,
                          VisualiserConfig, _experiment_stem)
 from operaxn.heatmap import HeatmapWindow
-from operaxn.main import EnhancedSplashScreen, main as cli_main
 from operaxn.input import (
     DataSourceType,
     TimeMethod,
@@ -58,6 +56,7 @@ from operaxn.input import (
     process_paths,
     reset_session,
 )
+from operaxn.main import EnhancedSplashScreen, main as cli_main
 from operaxn.output import get_scan_time_positions
 
 import _builders
@@ -91,7 +90,7 @@ def _discard(path):
 
 @pytest.fixture
 def inhouse_edf_dir(inhouse_dir):
-    """Return the in-house dataset plus an EDF 2D image paired with scan 1 by Date."""
+    """Return the laboratory dataset plus an EDF 2D image paired with scan 1 by Date."""
     _builders.write_edf_image(os.path.join(inhouse_dir, "image_001.edf"), _builders.SCAN_TIMES[0])
     return inhouse_dir
 
@@ -137,21 +136,21 @@ def _wait_for_worker(win, app, timeout=120.0):
 
 
 def _inhouse_options(path):
-    """Return the options of an absolute in-house load of path without 2D images."""
+    """Return the options of an absolute laboratory load of path without 2D images."""
     return UploadOptions(paths=[path], data_source=DataSourceType.INHOUSE,
                          time_method=TimeMethod.ABSOLUTE, display_size=0,
                          include_2d=False)
 
 
 def _load_inhouse(win, app, inhouse_dir):
-    """Run a raw in-house load through the app's worker and wait for it."""
+    """Run a raw laboratory load through the app's worker and wait for it."""
     app._process_files_async(_inhouse_options(inhouse_dir))
     _wait_for_worker(win, app)
     assert app.state.scans
 
 
 def test_package_exports_core_enums():
-    """Every operaxn.__all__ name resolves to its module's object; config re-exports the core enum."""
+    """Every operaxn.__all__ name resolves to an object; config re-exports the core enum."""
     for name in operaxn.__all__:
         assert getattr(operaxn, name) is not None, name
     assert operaxn.OPERAXN is OPERAXN and operaxn.TimeMethod is core.TimeMethod
@@ -160,7 +159,7 @@ def test_package_exports_core_enums():
 
 
 def test_raw_upload_absolute(inhouse_dir):
-    """One in-house upload gives correlated scans, 1D/echem arrays and get_correlated_data."""
+    """One laboratory upload gives correlated scans, 1D/echem arrays and get_correlated_data."""
     progress = []
     scans, echem_df, method = process_paths(
         [inhouse_dir], progress.append,
@@ -241,7 +240,7 @@ def test_relative_view_transform(inhouse_dir):
 
 @needs_fabio
 def test_relative_view_reference_survives_unreadable_data(tmp_path):
-    """t=0 is the earliest midpoint of all scans, as at write time, even when that scan's data is gone."""
+    """t=0 is the earliest scan midpoint, as at write time, even when that scan's data is gone."""
     src = tmp_path / "src"
     src.mkdir()
     _builders.write_edf_image(str(src / "image_000.edf"), "2024-02-05T10:00:00")
@@ -249,7 +248,8 @@ def test_relative_view_reference_survives_unreadable_data(tmp_path):
     _builders.write_xrd_dat(str(src / "scan_003.dat"), "2024-02-05T10:15:00")
     _builders.write_echem_txt(str(src / "echem.txt"))
     out = str(tmp_path / "rel.nxs")
-    assert core.generate([str(src)], out, DataSourceType.INHOUSE, time_method=TimeMethod.RELATIVE)[0]
+    assert core.generate([str(src)], out, DataSourceType.INHOUSE,
+                         time_method=TimeMethod.RELATIVE)[0]
     (src / "image_000.edf").unlink()
     scans, echem_df, method = process_paths([out], time_method=TimeMethod.RELATIVE,
                                             data_source=DataSourceType.INHOUSE)
@@ -267,7 +267,8 @@ def test_relative_view_of_edf_only_file_with_no_reachable_image(tmp_path):
         _builders.write_edf_image(str(src / f"image_{i:03d}.edf"), ts)
     _builders.write_echem_txt(str(src / "echem.txt"))
     out = str(tmp_path / "edf.nxs")
-    assert core.generate([str(src)], out, DataSourceType.INHOUSE, time_method=TimeMethod.RELATIVE)[0]
+    assert core.generate([str(src)], out, DataSourceType.INHOUSE,
+                         time_method=TimeMethod.RELATIVE)[0]
     for f in src.glob("*.edf"):
         f.unlink()
     scans, echem_df, method = process_paths([out], time_method=TimeMethod.RELATIVE,
@@ -614,6 +615,27 @@ def test_export_after_a_partial_sidecar_copy_keeps_every_image(tmp_path, monkeyp
 
 
 @needs_fabio
+def test_export_over_the_opened_file_by_another_path_keeps_its_images(tmp_path):
+    """Saving over the opened file through a linked folder is a save: its 2D sidecar stays."""
+    data, alias = tmp_path / "data", tmp_path / "alias"
+    data.mkdir()
+    process_paths([_write_twod_zip(data)], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    opened = str(data / "run.nxs")
+    assert export_nxs(opened)[0]
+    process_paths([opened], time_method=TimeMethod.ABSOLUTE,
+                  data_source=DataSourceType.INHOUSE)
+    if os.name == "nt":
+        import _winapi
+        _winapi.CreateJunction(str(data), str(alias))  # a junction needs no privilege
+    else:
+        os.symlink(data, alias, target_is_directory=True)
+    assert export_nxs(str(alias / "run.nxs"))[0]
+    images = data / "run_images"
+    assert images.is_dir() and os.listdir(images), "the opened file's images folder was deleted"
+
+
+@needs_fabio
 def test_resolution_handles_foreign_separator_paths(tmp_path):
     """A recorded path with the other OS's separators still resolves."""
     zpath = _write_twod_zip(tmp_path)
@@ -624,7 +646,8 @@ def test_resolution_handles_foreign_separator_paths(tmp_path):
     assert ok
     process_paths([dest], time_method=TimeMethod.ABSOLUTE,
                   data_source=DataSourceType.INHOUSE)
-    recorded = "/tmp/operaxn_cache/cell_images/zip1/image_001.edf"  # POSIX form, one level per archive
+    # POSIX form, one level per archive
+    recorded = "/tmp/operaxn_cache/cell_images/zip1/image_001.edf"
     resolved = gui_input._resolve_twod_source(recorded)
     assert resolved and resolved.endswith("image_001.edf") and \
         os.path.isfile(resolved), f"got {resolved}"
@@ -948,7 +971,7 @@ def test_experiment_metadata_rows_bank_geometry(polaris_src):
         {"field": "detector bank 2", "value": "L2 1.783 m, 2theta 25.99 deg"},
         {"field": "monitor mode", "value": "timer"},
         {"field": "monitor 671", "value": "3.270 m, 2theta 0.00 deg"}]
-    # An in-house monitor (mode and preset, no element arrays) and a monitor
+    # A laboratory monitor (mode and preset, no element arrays) and a monitor
     # table whose arrays disagree in length yield no element rows
     inhouse = {"monitor": {"mode": "timer", "preset": 120.0}}
     assert experiment_metadata_rows(inhouse) == [
@@ -999,15 +1022,16 @@ def test_cli_prints_its_version_and_name_and_has_no_dependency_check(monkeypatch
 
 
 def test_cli_module_loads_no_gui_or_matplotlib():
-    """operaxn.main, all that --version and --profile import, loads no GUI module or matplotlib."""
+    """operaxn.main, all that --version and --profile import, loads no matplotlib or operaxn.gui."""
     loaded = modules_after("import operaxn.main")
     assert not [m for m in loaded if m.split(".")[0] == "matplotlib"]
-    ours = sorted(m for m in loaded if m.startswith("operaxn.") and not m.startswith("operaxn.core"))
+    ours = sorted(m for m in loaded
+                  if m.startswith("operaxn.") and not m.startswith("operaxn.core"))
     assert ours == ["operaxn.config", "operaxn.main"]
 
 
 def test_excel_sheet_widths_survive_nan_and_empty_frames():
-    """Column fitting handles NaN (pandas 3 keeps it through astype(str)) and a header-only sheet."""
+    """Column fitting handles NaN (pandas 3 keeps it through astype(str)) and header-only sheets."""
     frames = (pd.DataFrame({"Voltage (V)": pd.Series([3.71, np.nan], dtype=object),
                             "note": ["a", None]}),
               pd.DataFrame(columns=["scan number", "Has Echem"]))
@@ -1021,7 +1045,7 @@ def test_excel_sheet_widths_survive_nan_and_empty_frames():
 
 
 def test_neutron_statistics_sheet_reads_echem_columns(tmp_path):
-    """Neutron Statistics rows carry the correlated voltage and current (mA); uncorrelated say No."""
+    """Neutron Statistics rows carry correlated voltage and current (mA); uncorrelated say No."""
     def scan(num, volts, amps):
         return {"scan_num": num, "timestamp": "2026-06-01 10:00:00", "echem": volts,
                 "current": amps, "echem_timestamp": "", "exposure_time": 120.0,
@@ -1106,7 +1130,7 @@ def test_excel_export_writes_a_workbook(tmp_path, monkeypatch):
 @pytest.mark.display
 def test_excel_export_writes_the_scan_summary_and_echem_sheets(gui_app, monkeypatch, inhouse_dir,
                                                               tmp_path):
-    """An in-house load exports a workbook of each scan's voltage and files, and the echem rows."""
+    """A laboratory load exports a workbook of each scan's voltage and files and the echem rows."""
     win, app, messages = gui_app
     _load_inhouse(win, app, inhouse_dir)
     path = str(tmp_path / "summary.xlsx")
@@ -1324,7 +1348,7 @@ def test_direct_nxs_uses_its_recorded_time_method(inhouse_dir, tmp_path):
     assert method == "relative"
     arrays = make_echem_arrays(echem_df, method)
     for scan, t in zip(scans, get_scan_time_positions(scans, echem_df, method)):
-        assert abs(np.interp(t, arrays["x"], arrays["y"]) - scan["echem"]) < 0.011
+        assert abs(np.interp(t, arrays["x"], arrays["y"]) - scan["echem"]) < 1e-9
 
 
 def test_working_copy_keeps_the_export_stem(inhouse_dir, tmp_path):
@@ -1366,7 +1390,7 @@ def test_reset_session_forgets_the_experiment(inhouse_dir, tmp_path):
 
 @needs_fabio
 def test_reset_session_empties_the_reader_cache(inhouse_edf_dir):
-    """Clear All (reset_session) drops the forgotten experiment's images from the cache."""
+    """Clear (reset_session) drops the forgotten experiment's images from the cache."""
     scans, _, _ = process_paths([inhouse_edf_dir], time_method=TimeMethod.ABSOLUTE,
                                 data_source=DataSourceType.INHOUSE)
     assert make_twod_arrays(scans)[1]["image"] is not None
@@ -1474,7 +1498,8 @@ def test_scan_list_wheel_steps_one_row_on_every_platform():
     """A wheel notch or X11 button event scrolls the scan list one row, a zero delta none; each
     returns "break", so the X11 Listbox class binding adds no rows of its own."""
     steps = []
-    fake_panel = SimpleNamespace(listbox=SimpleNamespace(yview_scroll=lambda n, _what: steps.append(n)))
+    fake_panel = SimpleNamespace(
+        listbox=SimpleNamespace(yview_scroll=lambda n, _what: steps.append(n)))
     results = [FileListPanel._on_wheel(fake_panel, SimpleNamespace(delta=delta, num=num))
                for delta, num in ((120, "??"), (-120, "??"), (0, "??"), (0, 4), (0, 5))]
     assert steps == [-1, 1, -1, 1] and results == ["break"] * 5
@@ -1516,9 +1541,7 @@ def test_replot_closes_old_figure_and_rebinds_plot_settings(gui_app, monkeypatch
     """Each Plot frees the figure it replaces, an open Plot Settings dialog reopens on the
     new config, and Clear frees the figure and forgets the session."""
     win, app, messages = gui_app
-    app._process_files_async(_inhouse_options(inhouse_dir))
-    _wait_for_worker(win, app)
-    assert app.state.scans, messages
+    _load_inhouse(win, app, inhouse_dir)
 
     def open_figures():
         # Compare objects: pyplot hands a closed figure's number to the next one
@@ -1552,10 +1575,10 @@ def test_replot_closes_old_figure_and_rebinds_plot_settings(gui_app, monkeypatch
     ("arrays", "simulated neutron build failure"),
     ("rows shown", "simulated failure after the rows are shown"),
     ("processing", "unreadable input"),
-], ids=["generate", "arrays", "rows shown", "processing"])
+], ids=["generate", "arrays", "rows-shown", "processing"])
 def test_failed_load_leaves_the_window_as_clear_all_does(gui_app, monkeypatch, tmp_path,
                                                          neutron_dir, failure, reason):
-    """A failed load shows why and leaves the window, session and buttons as Clear All does."""
+    """A failed load shows why and leaves the window, session and buttons as Clear does."""
     path = neutron_dir
     if failure == "generate":
         path = tmp_path / "junk"
@@ -1885,7 +1908,7 @@ def test_upload_dialog_takes_source_from_nxs(tk_root, neutron_dir, inhouse_dir, 
         assert dlg.source_var.get() == "neutron"
         assert all(str(r.cget("state")) == "disabled" for r in dlg._source_radios)
         assert "source and generation options" in dlg.note_var.get()
-        assert dlg._note_label.cget("fg") == OPERAXNTheme.COLORS['text_secondary']
+        assert dlg._note_label.cget("fg") == OPERAXNTheme.COLORS["text_secondary"]
 
         dlg._paths = [inhouse_dir]
         dlg._update_option_states()
@@ -1917,7 +1940,8 @@ def test_upload_dialog_wheel_scrolls_on_every_platform_and_unbinds_on_close(tk_r
         steps = []
         dlg._scrollbar.winfo_ismapped = lambda: True
         dlg._canvas.yview_scroll = lambda n, _what: steps.append(n)
-        for delta, num in ((120, "??"), (-240, "??"), (1, "??"), (-1, "??"), (0, "??"), (0, 4), (0, 5)):
+        for delta, num in ((120, "??"), (-240, "??"), (1, "??"), (-1, "??"), (0, "??"),
+                           (0, 4), (0, 5)):
             dlg._on_wheel(SimpleNamespace(delta=delta, num=num))
         assert steps == [-1, 2, -1, 1, -1, 1]
         dlg.cancel()  # what <Escape> runs
@@ -1942,6 +1966,6 @@ def test_upload_file_picker_separates_patterns_by_spaces(tk_root, monkeypatch):
             shown.append(dlg.std_echem_var.get())
     finally:
         dlg.destroy()
-    patterns = dict(asked[0])["All Supported"]
+    patterns = dict(asked[0])["Supported files"]
     assert patterns == "*.zip *.dat *.edf *.txt *.xlsx *.csv *.hdf *.nxs *.xy", patterns
     assert shown == ["1 file", "2 files"], shown

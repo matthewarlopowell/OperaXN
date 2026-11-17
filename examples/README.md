@@ -34,7 +34,8 @@ Then:
    10:15 logbook midpoint).
 4. Export the NeXus file to see the standardised `.nxs` output; it conforms
    to the application definitions in [../definitions/](../definitions) and
-   can be re-opened directly by OperaXN or any HDF5 tool.
+   can be re-opened directly by OperaXN or any HDF5 tool. To validate it, see
+   [Validating generated files](../definitions/README.md#validating-generated-files).
 5. Try the analysis windows (see "Analysis windows" in the
    [main README](../README.md#analysis-windows) for the rules they apply).
    With `laboratory/` loaded, **Heatmap** shows the three scans as rows

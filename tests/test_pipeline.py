@@ -40,7 +40,7 @@ def _warning_messages(caplog):
 
 @pytest.fixture
 def pipeline(inhouse_dir):
-    """Return core.process_raw output over the synthetic in-house directory."""
+    """Return core.process_raw output over the synthetic laboratory directory."""
     return core.process_raw([inhouse_dir], core.DataSourceType.INHOUSE)
 
 
@@ -57,9 +57,9 @@ def test_process_raw_hands_its_cancel_to_classification(inhouse_dir, monkeypatch
     cancel = threading.Event()
     classify_files = core.FileClassificationManager.classify_files
 
-    def cancel_then_classify(self, df, event=None):
+    def cancel_then_classify(self, df, **kwargs):
         cancel.set()
-        return classify_files(self, df, event)
+        return classify_files(self, df, **kwargs)
 
     monkeypatch.setattr(core.FileClassificationManager, "classify_files", cancel_then_classify)
     with pytest.raises(core.Cancelled):
@@ -80,11 +80,8 @@ def test_window_extrema_absent_without_exposure(tmp_path):
     """A scan with no header exposure has no extrema but keeps its nearest-point voltage."""
     src = str(tmp_path / "no_exposure")
     os.makedirs(src)
-    lines = ["# Date 2024-02-05T10:05:00", "# tth Intensity"]
-    lines += [f"{x:.4f} {v:.4f}"
-              for x, v in zip(_builders.ONED_X, _builders.inhouse_scan_y(1))]
-    with open(os.path.join(src, "scan_001.dat"), "w") as f:
-        f.write("\n".join(lines) + "\n")
+    _builders.write_xrd_dat(os.path.join(src, "scan_001.dat"), "2024-02-05T10:05:00",
+                            exposure=None)
     _builders.write_echem_txt(os.path.join(src, "echem.txt"))
     scans, _ = core.process_raw([src], core.DataSourceType.INHOUSE)
     assert len(scans) == 1 and scans[0].exposure_time is None
@@ -367,7 +364,7 @@ def test_single_timestamps_skip_format_guessing(monkeypatch):
 
 
 def test_synchrotron_scan_without_start_time_is_dropped(tmp_path, caplog):
-    """A scan .nxs with no start_time is left out with a warning naming it, and the file validates."""
+    """A scan .nxs with no start_time is left out with a warning naming it; the file validates."""
     src = tmp_path / "syn"
     os.makedirs(src)
     _builders.write_synchrotron_scan(str(src), "000001", "2024-02-05T10:05:00",
@@ -457,10 +454,11 @@ def test_synchrotron_exposure_is_the_scan_window(tmp_path):
     pytest.param("inf", None, id="dat-inf"), pytest.param("-120", None, id="dat-negative"),
     pytest.param("120.0", "inf", id="edf-inf", marks=needs_fabio)])
 def test_unusable_header_exposure_counts_as_none(tmp_path, dat_exposure, edf_exposure):
-    """A non-finite or non-positive header exposure is no exposure: the scan correlates at its start."""
+    """A non-finite or non-positive header exposure is ignored: the scan correlates at its start."""
     src = tmp_path / "lab"
     src.mkdir()
-    _builders.write_xrd_dat(str(src / "scan_001.dat"), _builders.SCAN_TIMES[0], exposure=dat_exposure)
+    _builders.write_xrd_dat(str(src / "scan_001.dat"), _builders.SCAN_TIMES[0],
+                            exposure=dat_exposure)
     if edf_exposure is not None:
         _builders.write_edf_image(str(src / "image_001.edf"), _builders.SCAN_TIMES[0],
                                   ExposureTime=edf_exposure)
@@ -476,7 +474,7 @@ def test_unusable_header_exposure_counts_as_none(tmp_path, dat_exposure, edf_exp
 # ============================================================================
 
 def test_echem_parse_builder_file(tmp_path):
-    """A builder echem file parses to 40 dayfirst-timestamped voltage/current rows."""
+    """A builder echem file parses to 40 day-first-timestamped voltage/current rows."""
     path = tmp_path / "echem.txt"
     _builders.write_echem_txt(str(path))
     df = core.EchemParser().parse(str(path))
@@ -484,7 +482,7 @@ def test_echem_parse_builder_file(tmp_path):
     assert str(df["timestamp"].dtype).startswith("datetime64"), f"got {df['timestamp'].dtype}"
     first = df["timestamp"].iloc[0]
     assert first == pd.Timestamp("2024-02-05 10:00:00"), \
-        f"dayfirst violated: 05/02/2024 must be 5 February, got {first}"
+        f"day-first violated: 05/02/2024 must be 5 February, got {first}"
     assert np.allclose(df["echem_data"].values, 3.7 + 0.01 * np.arange(40))
     assert np.allclose(df["current"].values, 0.1 + 0.001 * np.arange(40))
 
@@ -542,7 +540,7 @@ ARBIN_FULL_HEADER = ("Data_Point\tTest_Time(s)\tDate_Time\tCurrent(A)\t"
                      "Cycle_Index")
 
 
-@pytest.mark.parametrize("header,sample,expected", [
+@pytest.mark.parametrize("header, sample, expected", [
     ("time/s\tEwe/V\tI/mA", None, {"time": 0, "voltage": 1, "current": 2}),
     ("Absolute Time\tVoltage\tCurrent", None, {"time": 0, "voltage": 1, "current": 2}),
     ("Date\tTime\tVoltage\tCurrent", "05/02/2024\t10:00:00\t3.7\t0.1", {"time": 1}),
@@ -556,8 +554,8 @@ ARBIN_FULL_HEADER = ("Data_Point\tTest_Time(s)\tDate_Time\tCurrent(A)\t"
         "derived-column-first", "aux-and-range-after",
         "aux-and-range-before"])
 def test_detect_columns_time_slot(header, sample, expected):
-    """Column detection matrix: Arbin's Date_Time beats elapsed seconds, a bare Date loses to a
-    clock column, and derived, aux and range columns never take the voltage or current slot."""
+    """Column detection matrix: a bare Date loses to a clock column, and derived, aux and range
+    columns never take the voltage or current slot."""
     columns = core.EchemParser()._detect_columns(header, sample)
     assert {k: columns[k] for k in expected} == expected, f"got {columns}"
 
@@ -572,7 +570,7 @@ def test_arbin_header_txt_parses(tmp_path):
     df = core.EchemParser().parse(str(path))
     assert df is not None and len(df) == 10, "all rows must parse"
     assert df["timestamp"].iloc[0] == pd.Timestamp("2024-02-05 10:00:00"), \
-        f"ISO timestamp mangled (elapsed-seconds column or day/month swap): " \
+        "ISO timestamp mangled (elapsed-seconds column or day/month swap): " \
         f"{df['timestamp'].iloc[0]}"
     assert np.allclose(df["echem_data"].values, 3.7 + 0.01 * np.arange(10))
     assert np.allclose(df["current"].values, 1000 * (0.1 + 0.001 * np.arange(10))), \
@@ -584,7 +582,7 @@ def test_arbin_full_export_parses_real_voltage(tmp_path):
     rows = [ARBIN_FULL_HEADER]
     rows += [f"{m + 1}\t{m * 60.0:.1f}\t2024-02-05 10:{m:02d}:00"
              f"\t{0.1 + m * 0.001:.4f}\t{3.7 + m * 0.01:.4f}\t0.001\t0\t0.004"
-             f"\t0\t-0.0001\t0.05\t0\t2\t1" for m in range(5)]
+             "\t0\t-0.0001\t0.05\t0\t2\t1" for m in range(5)]
     path = tmp_path / "arbin_full.txt"
     path.write_text("\n".join(rows) + "\n")
     df = core.EchemParser().parse(str(path))
@@ -604,7 +602,7 @@ def _arbin_rows(ts_list):
             for i, ts in enumerate(ts_list)]
 
 
-@pytest.mark.parametrize("rows,n,first_ts", [
+@pytest.mark.parametrize("rows, n, first_ts", [
     ([ARBIN_HEADER, ""] + _arbin_rows(_TS[:3]), 3, _TS[0]),
     ([ARBIN_HEADER] + _arbin_rows(_TS[:2] + [""] + _TS[3:]), 4, _TS[0]),
     (["Time\tVoltage\tCurrent"] +
@@ -634,7 +632,7 @@ def test_parse_timestamp_edge_cases(tmp_path, rows, n, first_ts):
 
 @pytest.mark.parametrize("kind", ["eclab-realistic", "arbin-month-first"])
 def test_echem_time_column_reads_the_real_layouts(tmp_path, kind):
-    """The EC-Lab and Arbin month-first echem layouts read every row's time, first to last, in order."""
+    """EC-Lab and Arbin month-first echem layouts read every row's time, first to last, in order."""
     path = tmp_path / "echem.txt"
     if kind == "eclab-realistic":
         _builders.write_eclab_echem(str(path))
@@ -659,14 +657,17 @@ def _write_offset_echem(path, stamps):
 
 @pytest.mark.parametrize("stamps, warned", [
     pytest.param([f"2024-10-27T01:{m:02d}:00+01:00" for m in range(0, 60, 5)]
-                 + [f"2024-10-27T01:{m:02d}:00+00:00" for m in range(0, 60, 5)], True, id="clock-back"),
+                 + [f"2024-10-27T01:{m:02d}:00+00:00" for m in range(0, 60, 5)],
+                 True, id="clock-back"),
     pytest.param([f"2024-03-31T00:{m:02d}:00+00:00" for m in range(30, 60, 5)]
-                 + [f"2024-03-31T02:{m:02d}:00+01:00" for m in range(0, 30, 5)], True, id="clock-forward"),
-    pytest.param([f"2024-06-05T10:{m:02d}:00+01:00" for m in range(0, 40, 5)], False, id="one-offset"),
+                 + [f"2024-03-31T02:{m:02d}:00+01:00" for m in range(0, 30, 5)],
+                 True, id="clock-forward"),
+    pytest.param([f"2024-06-05T10:{m:02d}:00+01:00" for m in range(0, 40, 5)],
+                 False, id="one-offset"),
     pytest.param([f"2024-06-05T10:{m:02d}:00Z" for m in range(0, 40, 5)], False, id="utc"),
 ])
 def test_echem_offset_change_is_warned_once(tmp_path, caplog, stamps, warned):
-    """An echem file whose times change UTC offset logs one warning naming it; rows stay wall clock."""
+    """An echem file whose times change UTC offset is named in one warning; rows stay wall clock."""
     path = tmp_path / "cycler.txt"
     _write_offset_echem(str(path), stamps)
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
@@ -721,7 +722,7 @@ def test_echem_rows_before_1900_are_dropped(tmp_path, caplog, placeholder):
         assert len(named_records(caplog, "echem.txt", "1 echem row", "1900")) == 1, caplog.messages
 
 
-@pytest.mark.parametrize("header,make_row", [
+@pytest.mark.parametrize("header, make_row", [
     ("Date_Time\tTest_Time(s)\tPotential(V)\tCurrent(A)",
      lambda m: f"2024-02-05 10:{m:02d}:00\t{m * 60.0:.1f}\t{3.7 + m * 0.01:.4f}\t0.1"),
     ("Data_Point\tTest_Time(s)\tStart_Date\tVoltage(V)\tCurrent(A)",
@@ -799,7 +800,7 @@ def test_combined_echem_files_are_named(tmp_path, caplog):
         caplog.messages
 
 
-@pytest.mark.parametrize("header,scale", [
+@pytest.mark.parametrize("header, scale", [
     ("time/s\tEwe/V\tI/A", 1000.0), ("time/s\tEwe/V\t<I>/A", 1000.0),
     ("Time\tVoltage\tCurrent/A", 1000.0), ("time/s\tEwe/V\tI/uA", 0.001),
     ("time/s\tEwe/V\t<I>/mA", 1.0), ("Time\tVoltage\tCurrent(A)", 1000.0),
@@ -817,8 +818,9 @@ def test_current_unit_scale_reads_the_unit(header, scale):
 
 
 def _write_echem(path, header, sep="\t", encoding="utf-8", current="2.0", eol="\r\n", tail=b"", n=5,
-                 volt=lambda m: f"{3.7 + m * 0.01:.4f}", time=lambda m: f"05/02/2024 10:{m:02d}:00"):
-    """Write an echem table (absolute day-first times) in `encoding`, then append raw `tail` bytes."""
+                 volt=lambda m: f"{3.7 + m * 0.01:.4f}",
+                 time=lambda m: f"05/02/2024 10:{m:02d}:00"):
+    """Write an echem table (absolute day-first times) in `encoding`, then append `tail` bytes."""
     rows = [sep.join(header)]
     for m in range(n):
         rows.append(sep.join([time(m), volt(m), current] + [""] * (len(header) - 3)))
@@ -843,7 +845,7 @@ def test_current_unit_after_slash_sets_milliamps(tmp_path, header, encoding, cur
         None if df is None else list(df["current"])
 
 
-@pytest.mark.parametrize("header,level,texts", [
+@pytest.mark.parametrize("header, level, texts", [
     ("I/A", logging.INFO, ("'I/A'", "cell7.txt", "converted to mA (x1000)")),
     ("Current (Amps)", logging.WARNING, ("'Current (Amps)'", "has no recognised unit")),
     ("I/mA", None, ()),
@@ -868,7 +870,8 @@ def test_stray_byte_after_a_utf8_header_keeps_microamps(tmp_path, suffix):
     sep = "\t" if suffix == ".txt" else ","
     path = tmp_path / f"echem{suffix}"
     _write_echem(path, ["time/s", "Ewe/V", "I/µA", "note"], sep=sep, current="100.0",
-                 tail=sep.join(["05/02/2024 10:05:00", "3.7500", "100.0", ""]).encode() + b"\x96\r\n")
+                 tail=sep.join(["05/02/2024 10:05:00", "3.7500", "100.0", ""]).encode()
+                 + b"\x96\r\n")
     txt = core.convert_tabular_to_txt(str(path), dest_dir=str(tmp_path))
     df = core.EchemParser().parse(txt)
     assert df is not None and len(df) == 6 and np.allclose(df["current"], 0.1), \
@@ -905,7 +908,7 @@ def test_stray_byte_glued_to_a_value_is_dropped(tmp_path, case):
      lambda m: [f"05/02/2024 10:{m:02d}:00", f"{3.7 + m * 0.01:.4f}", "2.0", f"{m * 60.0:.1f}"]),
 ], ids=["current-first", "time-first"])
 def test_echem_file_with_a_bom_reads_as_without(tmp_path, header, row):
-    """A UTF-8 BOM changes nothing: 'I/A' first still converts x1000 and time/s keeps the time slot."""
+    """A UTF-8 BOM changes nothing: 'I/A' first still converts x1000; time/s keeps the time slot."""
     rows = [header] + [row(m) for m in range(5)]
     text = ("\r\n".join("\t".join(r) for r in rows) + "\r\n").encode()
     (tmp_path / "plain.txt").write_bytes(text)
@@ -933,7 +936,8 @@ def test_voltage_unit_followed_by_more_text_is_read(tmp_path, caplog, header, mi
     """V is read silently, mV converted with an info line, another unit read as V with a warning."""
     path = tmp_path / "cell7.txt"
     _write_echem(path, header,
-                 volt=(lambda m: f"{3700 + m * 10}") if millivolts else (lambda m: f"{3.7 + m * 0.01:.4f}"))
+                 volt=(lambda m: f"{3700 + m * 10}") if millivolts
+                 else (lambda m: f"{3.7 + m * 0.01:.4f}"))
     with caplog.at_level(logging.INFO, logger="operaxn.core"):
         df = core.EchemParser().parse(str(path))
     assert df is not None and np.allclose(df["echem_data"], 3.7 + 0.01 * np.arange(5)), \
@@ -976,7 +980,8 @@ def test_unit_lines_name_the_users_csv_not_its_converted_copy(tmp_path, caplog):
     (src / "cell7.csv").write_text(text)
     (tmp_path / "std7.csv").write_text(text)
     with caplog.at_level(logging.INFO, logger="operaxn.core"):
-        ok, msgs = core.generate([str(src)], str(tmp_path / "units.nxs"), core.DataSourceType.INHOUSE,
+        ok, msgs = core.generate([str(src)], str(tmp_path / "units.nxs"),
+                                 core.DataSourceType.INHOUSE,
                                  standard_echem_files=[str(tmp_path / "std7.csv")])
     assert ok, msgs
     for name in ("cell7.csv", "std7.csv"):
@@ -984,7 +989,7 @@ def test_unit_lines_name_the_users_csv_not_its_converted_copy(tmp_path, caplog):
     assert not named_records(caplog, "'I/A'", ".txt", level=logging.INFO), caplog.messages
 
 
-@pytest.mark.parametrize("name,line", [
+@pytest.mark.parametrize("name, line", [
     ("gone.txt", "Standard electrochemistry file gone.txt not found; skipped"),
     ("notes.txt", "No electrochemistry data found in notes.txt; not stored"),
     ("volts.txt", "No electrochemistry data found in volts.txt; not stored"),
@@ -1038,13 +1043,15 @@ def _parse(path, tmp_path):
     return core.EchemParser().parse(txt)
 
 
-@pytest.mark.parametrize("text,current", [
-    ("Datum;Ewe/V;I/mA\r" + "".join(f"05.02.2024 10:{m:02d}:00,936;3,{70 + m};0,1\r" for m in range(5)), 0.1),
-    (("Time,Ewe/V,I/µA,note\r" + "".join(f"05/02/2024 10:{m:02d}:00,3.7,100.0,x\r" for m in range(5)))[:-2]
+@pytest.mark.parametrize("text, current", [
+    ("Datum;Ewe/V;I/mA\r"
+     + "".join(f"05.02.2024 10:{m:02d}:00,936;3,{70 + m};0,1\r" for m in range(5)), 0.1),
+    (("Time,Ewe/V,I/µA,note\r"
+      + "".join(f"05/02/2024 10:{m:02d}:00,3.7,100.0,x\r" for m in range(5)))[:-2]
      + "\x00\r", 0.1),
 ], ids=["semicolon-decimal-comma", "utf8-micro-stray-byte"])
 def test_cr_only_csv_is_read_by_its_first_line(tmp_path, text, current):
-    """A CR-only CSV (old Mac Excel) takes its separator and encoding from the first line, not the file."""
+    """A CR-only CSV takes its separator and encoding from the first line, not the whole file."""
     path = tmp_path / "echem.csv"
     path.write_bytes(text.encode("utf-8").replace(b"\x00", b"\x96"))
     df = _parse(path, tmp_path)
@@ -1235,7 +1242,7 @@ def test_folder_twod_references_untouched(tmp_path):
 
 
 def test_zip_with_dot_slash_members_loads(tmp_path):
-    """A ZIP made by Windows 'tar -a -cf x.zip .' (members './scan_001.dat') loads like any other."""
+    """A ZIP from Windows 'tar -a -cf x.zip .' (members './scan_001.dat') loads like any other."""
     src = tmp_path / "lab"
     _builders.write_lab_dir(str(src))
     zp = tmp_path / "lab.zip"
@@ -1281,7 +1288,7 @@ def test_zip_skips_nested_macos_forks(tmp_path):
 
 
 def test_unextractable_zip_member_costs_only_that_file(tmp_path, caplog):
-    """A member that cannot be extracted (bad CRC) is skipped with a warning; later members still load."""
+    """A member that fails to extract (bad CRC) is skipped with a warning; later members load."""
     src = tmp_path / "lab"
     _builders.write_lab_dir(str(src))
     zp = tmp_path / "lab.zip"
@@ -1586,15 +1593,15 @@ def test_one_d_file_without_data_rows_is_unreadable(tmp_path, name, text, read):
     assert not caught, [str(w.message) for w in caught]
 
 
-@pytest.mark.parametrize("text,expected", [
-    ("XYDATA\n1 2 3 4\n5 6 7 8\n", [[1, 2, 3], [5, 6, 7]]),          # X, Y, E only
-    ("XYDATA\n1 2 3\n4 5\n", [[1, 2], [4, 5]]),                         # ragged: error column dropped
+@pytest.mark.parametrize("text, expected", [
+    ("XYDATA\n1 2 3 4\n5 6 7 8\n", [[1, 2, 3], [5, 6, 7]]),             # X, Y, E only
+    ("XYDATA\n1 2 3\n4 5\n", [[1, 2], [4, 5]]),                         # ragged: E column dropped
     ("XYDATA\n1 2 abc\n4 5 6\n", [[1, 2], [4, 5]]),                     # non-numeric E
     ("XYDATA\n1 2 3\nfoo bar\n4 5 6\n", [[1, 2, 3], [4, 5, 6]]),        # stray text line skipped
-    ("XYDATA\n1 2 3#c\n4 5 6\n", [[1, 2], [4, 5]]),                     # glued comment as the line parse reads it
-    ("1 2 3 4\n5 6 7 8\n", [[1, 2, 3, 4], [5, 6, 7, 8]]),               # clean file: numpy reads every column
+    ("XYDATA\n1 2 3#c\n4 5 6\n", [[1, 2], [4, 5]]),                     # glued comment: E dropped
+    ("1 2 3 4\n5 6 7 8\n", [[1, 2, 3, 4], [5, 6, 7, 8]]),               # clean file: every column
     ("# h\n1 2\n3 4\n", [[1, 2], [3, 4]]),
-    ("1.0 2.0#c\n3.0 4.0\n", [[1, 2], [3, 4]]),                        # '#' glued to the first row
+    ("1.0 2.0#c\n3.0 4.0\n", [[1, 2], [3, 4]]),                         # '#' glued to the first row
     ("# Date 2024-02-05T10:05:00\n# tth Intensity\n1.0 2.0#first point\n3.0 4.0\n",
      [[1, 2], [3, 4]]),
 ], ids=["four-cols", "ragged", "text-error", "stray-line", "glued-comment", "clean-four",
@@ -1608,7 +1615,7 @@ def test_dat_reader_columns_per_layout(tmp_path, text, expected):
 
 @pytest.mark.parametrize("shape", ["lab", "polaris", "wish"])
 def test_real_dat_shapes_read_in_one_pass(tmp_path, monkeypatch, shape):
-    """Real .dat layouts load through numpy (no failed attempt, no line-by-line fallback) with X, Y and E as written."""
+    """Real .dat layouts load through numpy (no line-parser fallback) with X, Y and E as written."""
     path = str(tmp_path / f"{shape}.dat")
     x = np.linspace(1000.0, 20000.0, 40)
     y, e = 50.0 + np.arange(40.0), np.full(40, 0.25)
@@ -1629,7 +1636,8 @@ def test_real_dat_shapes_read_in_one_pass(tmp_path, monkeypatch, shape):
 
     monkeypatch.setattr(readers.np, "loadtxt", spy)
     data = core.DATReader(data_type="neutron").read(path, use_cache=False)
-    assert np.allclose(data[:, 0], x) and np.allclose(data[:, 1], y) and np.allclose(data[:, 2], e, atol=1e-6)
+    assert np.allclose(data[:, 0], x) and np.allclose(data[:, 1], y) and \
+        np.allclose(data[:, 2], e, atol=1e-6)
     assert raised == [], "fast path failed and fell back to the line parser"
 
 
@@ -1802,11 +1810,11 @@ def test_generate_leaves_the_reader_cache_empty(tmp_path, polaris_src):
 
 @pytest.fixture
 def inhouse_rt(inhouse_dir, tmp_path):
-    """Return pipeline scans plus the model reloaded from the generated in-house .nxs."""
+    """Return pipeline scans plus the model reloaded from the generated laboratory .nxs."""
     scans, _ = core.process_raw([inhouse_dir], core.DataSourceType.INHOUSE)
     nxs = str(tmp_path / "inhouse.nxs")
     ok, msgs = core.generate([inhouse_dir], nxs, core.DataSourceType.INHOUSE)
-    assert ok, f"generate in-house nxs failed: {msgs}"
+    assert ok, f"generate laboratory nxs failed: {msgs}"
     return scans, core.load(nxs)
 
 
@@ -1907,7 +1915,7 @@ def test_mantid_split_set_writes_banks_1_to_5_from_their_own_files(tmp_path):
 @pytest.mark.parametrize("rename", [lambda name: name[:-4] + ".DAT", str.upper],
                          ids=["upper-case-extension", "all-upper-case"])
 def test_upper_case_wish_set_writes_tof_and_d(tmp_path, rename):
-    """A WISH set whose bank files end in .DAT, or are all upper case, writes every bank's TOF and d."""
+    """A WISH set with .DAT or all-upper-case bank files writes every bank's TOF and d."""
     src = tmp_path / "upper"
     _builders.write_wish_dir(str(src))
     data = src / "diffraction-data"
@@ -1934,7 +1942,8 @@ def test_neutron_writer_parses_each_bank_header_from_its_read(tmp_path, monkeypa
     out = str(tmp_path / "n.nxs")
     ok, msgs = core.generate([src], out, core.DataSourceType.NEUTRON)
     assert ok, msgs
-    assert len(calls) == 1, f"only the entry-level instrument harvest may reopen a bank, got {len(calls)}"
+    assert len(calls) == 1, \
+        f"only the entry-level instrument harvest may reopen a bank, got {len(calls)}"
     with h5py.File(out) as f:
         b = f["entry/scan_000001/bank_1"]
         assert b.attrs["spectrum"] == 1 and b.attrs["x_label"] == "Time-of-flight"
@@ -1971,7 +1980,7 @@ def test_scan_whose_dat_has_no_rows_is_kept_without_a_pattern(tmp_path, caplog):
     with open(os.path.join(src, "scan_002.dat"), "w") as f:
         f.writelines(header)
     out = str(tmp_path / "no_rows.nxs")
-    with caplog.at_level(logging.ERROR):
+    with caplog.at_level(logging.ERROR, logger="operaxn.core"):
         ok, msgs = core.generate([src], out, core.DataSourceType.INHOUSE)
     assert ok, msgs
     with h5py.File(out, "r") as f:
@@ -1987,7 +1996,7 @@ def test_scan_whose_dat_has_no_rows_is_kept_without_a_pattern(tmp_path, caplog):
 
 
 def test_embedded_hdf_frame_keeps_its_dtype(tmp_path):
-    """'Include 2D images' stores a uint32 frame as uint32 with the floor applied, and it validates."""
+    """An embedded uint32 frame stays uint32 with the floor applied, and the file validates."""
     src = str(tmp_path / "synchrotron")
     os.makedirs(src)
     _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00", "2024-02-05T10:05:39")
@@ -2009,12 +2018,13 @@ def test_embedded_hdf_frame_keeps_its_dtype(tmp_path):
 
 @needs_fabio
 def test_embedded_edf_frame_keeps_its_dtype(tmp_path):
-    """'Include 2D images' stores a float32 EDF frame as float32 with the floor applied, and it validates."""
+    """An embedded float32 frame stays float32 with the floor applied, and the file validates."""
     src = str(tmp_path / "inhouse")
     os.makedirs(src)
     _builders.write_xrd_dat(os.path.join(src, "scan_001.dat"), _builders.SCAN_TIMES[0])
     # Values -2 to 61: the mask -2, -1 and the gap 0 are raised to the floor 1
-    _builders.write_edf_image(os.path.join(src, "image_001.edf"), _builders.SCAN_TIMES[0], offset=-2.0)
+    _builders.write_edf_image(os.path.join(src, "image_001.edf"), _builders.SCAN_TIMES[0],
+                              offset=-2.0)
     _builders.write_echem_txt(os.path.join(src, "echem.txt"))
     expected = np.maximum(np.arange(64, dtype=np.float32).reshape(8, 8) - 2, 1)
     out = str(tmp_path / "embedded.nxs")
@@ -2070,14 +2080,14 @@ def test_non_finite_monitor_counter_writes_no_integral(tmp_path, counter):
                                             ("nan", None), (float("inf"), None)])
 def test_profile_wavelength_is_written_when_numeric_and_skipped_with_a_warning_otherwise(
         tmp_path, monkeypatch, caplog, value, written):
-    """A finite profile 'wavelength' (angstrom) is written; text, nan or inf warns and is skipped."""
+    """A finite profile wavelength (angstrom) is written; text, nan or inf warns and is skipped."""
     monkeypatch.setitem(core.config.DEFAULT_PROFILES["synchrotron"], "wavelength", value)
     src = str(tmp_path / "synchrotron")
     os.makedirs(src)
     _builders.write_synchrotron_scan(src, "000001", "2024-02-05T10:05:00", "2024-02-05T10:05:39")
     _builders.write_echem_txt(os.path.join(src, "echem.txt"))
     out = str(tmp_path / "syn.nxs")
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         ok, msgs = core.generate([src], out, core.DataSourceType.SYNCHROTRON)
     assert ok, str(msgs)
     with h5py.File(out, "r") as f:
@@ -2125,7 +2135,7 @@ def test_failed_first_write_leaves_no_file(inhouse_dir, tmp_path, monkeypatch):
 
 
 def _interrupt(monkeypatch, stage):
-    """Return (generate keyword arguments, the expected message) for a 3-scan run stopped at `stage`:
+    """Return (generate keyword arguments, expected message) for a 3-scan run stopped at `stage`:
     "failure" (scan 2's write fails), "sidecar" (before the 2D moves) or "write" (after scan 1)."""
     cancel = threading.Event()
     if stage == "failure":
@@ -2154,7 +2164,7 @@ def _live_twod(out):
 @needs_fabio
 @pytest.mark.parametrize("stage", ["failure", "sidecar", "write"])
 def test_interrupted_zip_regenerate_keeps_previous_images(tmp_path, monkeypatch, stage):
-    """An interrupted ZIP regenerate keeps the old .nxs and its 2D images; a later success replaces both."""
+    """An interrupted ZIP regenerate keeps the old .nxs and its 2D images; success replaces both."""
     out = str(tmp_path / "run.nxs")
     ok, msgs = core.generate([_pairs_zip(tmp_path, "a.zip")], out, core.DataSourceType.INHOUSE)
     assert ok, msgs
@@ -2170,7 +2180,8 @@ def test_interrupted_zip_regenerate_keeps_previous_images(tmp_path, monkeypatch,
     ok, msgs = core.generate([moved], out, core.DataSourceType.INHOUSE)
     assert ok, msgs
     assert len(_live_twod(out)) == 3
-    assert sorted(n for n in os.listdir(tmp_path) if n.startswith("run")) == ["run.nxs", "run_images"]
+    assert sorted(n for n in os.listdir(tmp_path)
+                  if n.startswith("run")) == ["run.nxs", "run_images"]
 
 
 @needs_fabio
@@ -2206,12 +2217,14 @@ def test_default_cache_path_outside_data_dir(inhouse_dir):
 # Project files
 # ============================================================================
 
+REPO = Path(__file__).resolve().parents[1]
+
+
 def test_release_version_matches_package_and_citation():
     """pyproject.toml and CITATION.cff carry the GENERATOR_VERSION every file is stamped with."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
+    with open(REPO / "pyproject.toml", encoding="utf-8") as fh:
         project = fh.read().split("[project]", 1)[1].split("\n[", 1)[0]
-    with open(os.path.join(root, "CITATION.cff"), encoding="utf-8") as fh:
+    with open(REPO / "CITATION.cff", encoding="utf-8") as fh:
         citation = fh.read()
     package = re.search(r'^version\s*=\s*"([^"]+)"', project, re.M)
     cited = re.search(r"^version:\s*(\S+)", citation, re.M)
@@ -2222,10 +2235,8 @@ def test_release_version_matches_package_and_citation():
 
 def test_dependency_floors_agree():
     """pyproject.toml, requirements.txt and the README Dependencies list declare the same floors."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
     def read(name):
-        with open(os.path.join(root, name), encoding="utf-8") as fh:
+        with open(REPO / name, encoding="utf-8") as fh:
             return fh.read()
 
     deps = read("pyproject.toml").split("\ndependencies = [", 1)[1].split("]", 1)[0]
@@ -2241,7 +2252,7 @@ def test_dependency_floors_agree():
 
 
 def test_core_exports_its_exceptions_and_the_pipeline_module():
-    """core exports Cancelled and InputError; core.pipeline is the module, core.generate its function."""
+    """core exports Cancelled and InputError; core.pipeline is the module, generate its function."""
     assert core.Cancelled is core.model.Cancelled and core.InputError is core.model.InputError
     assert {"Cancelled", "InputError"} <= set(core.__all__)
     assert isinstance(core.pipeline, types.ModuleType)
@@ -2271,13 +2282,11 @@ def test_no_undefined_names_in_packages():
     assert issues == [], "\n".join(issues)
 
 
-BIN = Path(__file__).resolve().parents[1] / "bin"
-
-
-def test_no_production_line_over_100_characters():
-    """Every line under bin/ is at most 100 characters long."""
-    long_lines = [f"{path.relative_to(BIN).as_posix()}:{n} ({len(line)})"
-                  for path in sorted(BIN.rglob("*.py"))
+def test_no_line_over_100_characters():
+    """Every Python line under bin/, tests/ and examples/ is at most 100 characters long."""
+    long_lines = [f"{path.relative_to(REPO).as_posix()}:{n} ({len(line)})"
+                  for folder in ("bin", "tests", "examples")
+                  for path in sorted((REPO / folder).rglob("*.py"))
                   for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
                   if len(line) > 100]
     assert not long_lines, long_lines

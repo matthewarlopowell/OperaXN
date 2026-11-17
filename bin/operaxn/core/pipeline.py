@@ -113,9 +113,9 @@ class FileProcessor:
     """Context-managed collector turning input paths into FileRecords; `cancel` stops it per file.
     Exit removes its tempdir, so every read (the NeXus write too) must stay in the context."""
 
-    def __init__(self, data_source: DataSourceType = DataSourceType.INHOUSE,
+    def __init__(self, data_source: DataSourceType = DataSourceType.INHOUSE, *,
                  cancel: Optional[threading.Event] = None):
-        self.data_source = data_source
+        self.data_source = DataSourceType(data_source)
         self.cancel = cancel
         self.tempdir: Optional[str] = None
         self.processed_files: set = set()
@@ -133,14 +133,14 @@ class FileProcessor:
 
     def process_paths(self, selected_paths: List[str]) -> List[FileRecord]:
         """Collect files, group source-specific ones and build records for the rest."""
-        all_files = self._collect_all_files(selected_paths)
+        all_files = self._collect_all_files(_path_list(selected_paths))
 
         if not all_files:
             return []
 
         # On-access virus scanners (Sophos: about 60 ms per fresh .dat) delay each
         # file's first read; scanning all files in parallel here keeps later reads cheap
-        self._warm_up([path for path, _ in all_files], self.cancel)
+        self._warm_up([path for path, _ in all_files], cancel=self.cancel)
 
         # Source-specific grouping
         if self.data_source == DataSourceType.NEUTRON:
@@ -228,6 +228,8 @@ class FileProcessor:
                     all_files.append((path, path))
             elif os.path.isdir(path):
                 all_files.extend(self._collect_directory_files(path))
+            else:
+                logger.warning(f"Skipping {path}: not found")
 
         # A folder plus a file in it, or a folder plus its subfolder, reaches files twice;
         # dropped before conversion, so a table taken twice is converted once
@@ -432,7 +434,7 @@ def _run_pipeline(processor: FileProcessor,
         progress_callback("Classifying files...")
 
     classifier = FileClassificationManager(data_source)
-    classified_df = classifier.classify_files(records_df, processor.cancel)
+    classified_df = classifier.classify_files(records_df, cancel=processor.cancel)
     if data_source == DataSourceType.NEUTRON and not classified_df["neutron_meta"].notna().any():
         raise InputError("No neutron logbook found in the selection: "
                          "runs are timed from the logbook")
@@ -455,7 +457,7 @@ def process_raw(input_paths: List[str],
     """Collect, classify and correlate raw data; timestamps stay absolute whatever `time_method`.
     ZIP-extracted files the scans point to are deleted on return; use `generate` for the data."""
     data_source, time_method = DataSourceType(data_source), TimeMethod(time_method)
-    with FileProcessor(data_source, cancel) as processor:
+    with FileProcessor(data_source, cancel=cancel) as processor:
         return _run_pipeline(processor, _path_list(input_paths), data_source,
                              progress_callback, time_method,
                              echem_time_tolerance)
@@ -554,7 +556,7 @@ def _persist_zip_twod_sources(scans: List[Scan], output_path: str,
                     if not (getattr(e, "filename", None) == src and os.path.isfile(dest)
                             and os.path.getsize(dest) == os.path.getsize(src)):
                         # One failed copy (e.g. a path past MAX_PATH) costs one image, not the rest
-                        logger.warning(f"Could not persist zip-extracted 2D image "
+                        logger.warning("Could not persist ZIP-extracted 2D image "
                                        f"{os.path.relpath(src, temp_root)}: {e}")
                         failed += 1
                         continue
@@ -563,7 +565,7 @@ def _persist_zip_twod_sources(scans: List[Scan], output_path: str,
     except OSError as e:
         # Never abort generation over the sidecar: repointed scans keep
         # their valid copies, the rest keep the (temporary) extracted paths
-        logger.warning(f"Could not persist zip-extracted 2D images: {e}")
+        logger.warning(f"Could not persist ZIP-extracted 2D images: {e}")
         if messages is not None:
             messages.append("Warning: some 2D images from the ZIP could not "
                             "be copied and will not be viewable")
@@ -573,7 +575,7 @@ def _persist_zip_twod_sources(scans: List[Scan], output_path: str,
             messages.append(f"Warning: {failed} of {total} 2D image{'s' if total != 1 else ''} "
                             "from the ZIP could not be copied and will not be viewable")
         if copied:
-            logger.info(f"Persisted {len(copied)} zip-extracted 2D "
+            logger.info(f"Persisted {len(copied)} ZIP-extracted 2D "
                         f"image{'s' if len(copied) != 1 else ''} to {images_dir}")
     if copied:
         return images_dir
@@ -633,7 +635,7 @@ def generate(input_paths: List[str],
         # The FileProcessor context must span writing too: the writer reads
         # data from the scans' file paths, which for ZIP inputs live in the
         # processor's temp extraction directory.
-        with FileProcessor(data_source, cancel) as processor:
+        with FileProcessor(data_source, cancel=cancel) as processor:
             scans, echem_df = _run_pipeline(processor, input_paths, data_source,
                                             progress_callback, time_method,
                                             echem_time_tolerance)
@@ -678,8 +680,8 @@ def generate(input_paths: List[str],
             try:
                 if zip_twod:
                     _persist_zip_twod_sources(scans, output_path, processor.tempdir,
-                                              messages, cancel)
-                writer.write(output_path, scans, echem_df, std_files, cancel)
+                                              messages, cancel=cancel)
+                writer.write(output_path, scans, echem_df, std_files, cancel=cancel)
             except BaseException:
                 # The writer kept any previous .nxs: put back the images that belong to it
                 if undo:
@@ -710,6 +712,7 @@ def cache_dir() -> str:
 def default_cache_path(input_paths: List[str]) -> str:
     """Return the cache path for an auto-generated canonical file, named after the first input.
     Always the user cache, never beside the data: beamline mounts are often read-only."""
+    input_paths = _path_list(input_paths)
     if input_paths:
         stem = os.path.splitext(os.path.basename(os.path.normpath(input_paths[0])))[0]
     else:

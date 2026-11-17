@@ -176,7 +176,7 @@ def _quiet_loadtxt(source: Any, **kwargs: Any) -> np.ndarray:
 
 
 def _blocks_loadtxt(line: str) -> bool:
-    """Return True if numpy (comments='#') cannot read this line as an X Y row or skip it."""
+    """True when numpy (comments='#') cannot read this line as an X Y row or skip it."""
     parts = line.split('#', 1)[0].split()
     if not parts:
         return False
@@ -432,9 +432,6 @@ class HDFReader(DataReader):
         height, width = data.shape
 
         scale_factor = max(height / max_size, width / max_size)
-
-        if scale_factor <= 1:
-            return data
 
         step = int(np.ceil(scale_factor))
         # A copy, so the result does not keep the full-size frame alive

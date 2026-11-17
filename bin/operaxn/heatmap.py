@@ -54,8 +54,8 @@ XRD_AXES = {'twotheta': TWOTHETA_LABEL, 'd': DSPACING_LABEL}
 INTENSITY_LABEL = 'Intensity [arb. units]'
 VOLTAGE_LABEL = 'Voltage [V]'
 
-EXPORT_FILETYPES = (('PNG image', '*.png'), ('PDF document', '*.pdf'),
-                    ('SVG image', '*.svg'))
+EXPORT_FILETYPES = (('PNG files', '*.png'), ('PDF files', '*.pdf'),
+                    ('SVG files', '*.svg'))
 PUBLICATION_SIZE = (7.2, 5.0)  # inches; a two-column journal figure
 LOG_FLOOR_PERCENTILE = 1.0  # of the positive values, the auto log-scale floor
 
@@ -66,7 +66,7 @@ LOG_FLOOR_PERCENTILE = 1.0  # of the positive values, the auto log-scale floor
 
 def build_xrd_matrix(oned_arrays: Dict[int, Dict[str, Any]]):
     """Stack 1D patterns as (x_grid, matrix, scan_nums) on the first usable scan's grid.
-    Other grids are interpolated; entries without 1-D x and y are skipped;
+    Other grids are interpolated; entries without 1D x and y are skipped;
     (None, None, []) when nothing is usable."""
     scan_nums = sorted(oned_arrays)
     rows = []
@@ -238,7 +238,7 @@ def intensity_limits(matrix: np.ndarray, ceiling: float = 100.0,
     data = data[np.isfinite(data)]
     if log:
         data = data[data > 0]
-        # an uncommitted bound <= 0 cannot be used either: it returns to automatic
+        # An uncommitted bound <= 0 cannot be used either: it returns to automatic
         vmin = None if vmin is not None and vmin <= 0 else vmin
         vmax = None if vmax is not None and vmax <= 0 else vmax
     if data.size == 0:
@@ -363,7 +363,7 @@ def _parse_float(text: str) -> Optional[float]:
     """Parse an entry's text as a float; None when blank or not a finite number."""
     try:
         value = float(str(text).strip())
-    except (TypeError, ValueError):
+    except (ValueError, TypeError):
         return None
     return value if np.isfinite(value) else None
 
@@ -578,7 +578,7 @@ class HeatmapWindow(tk.Toplevel):
             _Btn(intensity, 'Apply All', padx=6,
                  command=self._apply_to_all_banks).pack(side='left', padx=2)
         # Ceiling percentile clips hot pixels so weak peaks show
-        _label(intensity, 'ceiling (%):', dim=True).pack(side='left', padx=(_PAD_S, 0))
+        _label(intensity, 'Ceiling (%):', dim=True).pack(side='left', padx=(_PAD_S, 0))
         self.ceiling_var = tk.DoubleVar(value=100.0)
         spin = _spinbox(intensity, self.ceiling_var, from_=50.0, to=100.0,
                         increment=0.5, format='%.1f', width=6)
@@ -602,7 +602,7 @@ class HeatmapWindow(tk.Toplevel):
         plot_frame.pack(fill='both', expand=True, padx=_PAD_S, pady=2)
 
         self._fig = Figure(facecolor=PLOT_BG, dpi=FIGURE_DPI)
-        # Keep a dedicated gutter after the colourbar so its tick labels and
+        # Keep a dedicated gutter after the colour bar so its tick labels and
         # scientific-notation offset cannot collide with the voltage panel.
         gs = GridSpec(1, 4, figure=self._fig,
                       width_ratios=(4, 0.12, 0.22, 1.1),
@@ -656,7 +656,7 @@ class HeatmapWindow(tk.Toplevel):
             entry.bind('<FocusOut>', lambda _e, v=var: self._commit_range(v))
 
     def _commit_range(self, var: tk.StringVar) -> None:
-        """Clear unusable text or a Log bound <= 0, or the other bound this one is not below."""
+        """Clear unusable text, a Log bound <= 0, or the other intensity bound when Min >= Max."""
         if var.get().strip() and _parse_float(var.get()) is None:
             var.set('')
         elif var is self.zmin_var or var is self.zmax_var:
@@ -935,7 +935,7 @@ class HeatmapWindow(tk.Toplevel):
     # Plotting
     # ------------------------------------------------------------------
 
-    def _queue_replot(self, *_):
+    def _queue_replot(self):
         """Debounce ceiling-spinbox edits into one replot."""
         if self._replot_job is not None:
             self.after_cancel(self._replot_job)
@@ -1060,7 +1060,7 @@ class HeatmapWindow(tk.Toplevel):
             messagebox.showwarning('No data', 'Nothing to export', parent=self)
             return
         path = filedialog.asksaveasfilename(
-            parent=self, title='Export heatmap figure',
+            parent=self, title='Export Heatmap Figure',
             defaultextension='.png', filetypes=EXPORT_FILETYPES,
             initialfile=self._export_stem() + '.png')
         if not path:
@@ -1080,7 +1080,7 @@ class HeatmapWindow(tk.Toplevel):
             messagebox.showwarning('No data', 'No bank has patterns on this axis', parent=self)
             return
         path = filedialog.asksaveasfilename(
-            parent=self, title='Export all banks (the bank number is appended)',
+            parent=self, title='Export All Banks (the bank number is appended)',
             defaultextension='.png', filetypes=EXPORT_FILETYPES,
             initialfile=f'{self._file_stem}_heatmap.png')
         if not path:

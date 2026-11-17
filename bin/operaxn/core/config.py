@@ -29,7 +29,7 @@ ECHEM_TIME_TOLERANCE = 300  # seconds, echem-to-scan nearest-neighbour matching
 # Largest usable tolerance (about 31.7 years): the correlator shifts timestamps by it,
 # and pandas timestamps must stay within 1677-2262
 MAX_ECHEM_TIME_TOLERANCE = 1e9  # seconds
-MAX_EXPOSURE_TIME = 3600  # seconds, reject computed exposures above this
+MAX_EXPOSURE_TIME = 3600  # seconds, reject computed exposures of this or more
 
 # --- Scan identification ---
 
