@@ -717,7 +717,8 @@ def test_echem_rows_before_1900_are_dropped(tmp_path, caplog, placeholder):
     with caplog.at_level(logging.WARNING, logger="operaxn.core"):
         df = core.EchemParser().parse(str(path))
     assert len(df) == 40 and df["timestamp"].min() == pd.Timestamp("2024-02-05 10:00:00")
-    assert len(named_records(caplog, "echem.txt", "1 echem row", "readable")) == 1, caplog.messages
+    skipped = named_records(caplog, "echem.txt", "skipped")  # pandas 2 cannot read year 1
+    assert sum(int(r.getMessage().split()[1]) for r in skipped) == 2, caplog.messages
     if placeholder.endswith("1899 00:00:00"):
         assert len(named_records(caplog, "echem.txt", "1 echem row", "1900")) == 1, caplog.messages
 
