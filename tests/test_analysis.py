@@ -955,15 +955,29 @@ def test_ici_regression_window_resolves_pulse_then_phase_then_default(tk_root, m
 
 
 @pytest.mark.display
-def test_ici_opens_with_the_overview_panel_focused(tk_root, monkeypatch):
-    """Opening the ICI window focuses its overview/pulse panel, the first plot region."""
+@pytest.mark.parametrize("which", ["ici", "capacity", "heatmap"])
+def test_analysis_window_opens_with_its_plot_panel_focused(tk_root, monkeypatch, which):
+    """Each analysis window opens with the keyboard focus on its first plot's canvas."""
     focused = []
-    real_focus_set = tk.Misc.focus_set
-    monkeypatch.setattr(tk.Misc, "focus_set",
-                        lambda self: (focused.append(self), real_focus_set(self))[1])
-    win = _open_ici(tk_root, monkeypatch, {"cell": _ici_df()})
+    for name in ("focus_set", "focus_force"):
+        real = getattr(tk.Misc, name)
+        monkeypatch.setattr(tk.Misc, name,
+                            lambda self, real=real: (focused.append(self), real(self))[1])
+    if which == "ici":
+        win = _open_ici(tk_root, monkeypatch, {"cell": _ici_df()})
+        plot = win._canvas_top.get_tk_widget()
+    elif which == "capacity":
+        monkeypatch.setattr(capacity_module, "maximise_window", lambda win: win.withdraw())
+        win = CapacityWindow(tk_root, {"operando": build_cycling_df()})
+        pump(win, 300)
+        plot = win._canvas.get_tk_widget()
+    else:
+        monkeypatch.setattr(heatmap_module, "maximise_window", lambda win: win.withdraw())
+        win = HeatmapWindow(tk_root, build_hm_scans(), oned_arrays=build_oned_arrays())
+        pump(win, 300)
+        plot = win._canvas.get_tk_widget()
     try:
-        assert win._primary_canvas_frame in focused, focused
+        assert focused[-1] is plot, focused
     finally:
         win.destroy()
 

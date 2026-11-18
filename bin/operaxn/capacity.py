@@ -208,8 +208,8 @@ class CapacityWindow(tk.Toplevel):
         self._toggle_all_cycles(replot=False)
         self._replot()
         watch_figure_sync(self, (self._canvas,))
+        # No focus_force(): the plot keeps the keyboard focus, so its panel is outlined
         self.lift()
-        self.focus_force()
 
     # ------------------------------------------------------------------
     # Layout

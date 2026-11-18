@@ -963,14 +963,11 @@ class ICIWindow(tk.Toplevel):
 
         # Top figure (Overview + Pulse zoom)
         top_frame = _canvas_frame(left)
-        self._primary_canvas_frame = top_frame
         top_frame.grid(row=0, column=0, sticky='nsew', padx=_PAD_S, pady=(_PAD_S, 2))
         top_frame.pack_propagate(False)
         self._fig_top = Figure(facecolor=PLOT_BG, dpi=FIGURE_DPI)
         self._build_top_axes()
         self._canvas_top = embed_figure(self._fig_top, top_frame)
-        self._canvas_top.get_tk_widget().bind(
-            '<Button-1>', lambda _event: top_frame.focus_set(), add='+')
 
         # Selector strip
         strip_wrapper = tk.Frame(left, bg=BG2,
@@ -1009,9 +1006,10 @@ class ICIWindow(tk.Toplevel):
                                   self.rk_axis_bar.winfo_reqwidth() + 4 * _PAD_S))
 
     def _focus_primary_panel(self) -> None:
-        """Focus the overview/pulse panel as the starting plot region."""
+        """Focus the overview/pulse plot as the starting plot region; its panel is outlined."""
         self._focus_job = None
-        self._primary_canvas_frame.focus_set()
+        # Each canvas takes the focus as it is built: without this the last one built keeps it
+        self._canvas_top.get_tk_widget().focus_set()
 
     def _cancel_pending(self, event) -> None:
         """Cancel ICI's queued jobs on close, as their callbacks go with the window."""

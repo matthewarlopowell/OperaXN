@@ -809,6 +809,33 @@ def test_failed_plot_update_leaves_drawing_switched_on():
     assert calls == ["draw"], "one draw per successful update"
 
 
+@pytest.mark.display
+@pytest.mark.parametrize("neutron", [False, True], ids=["xray", "neutron"])
+def test_main_figure_x_labels_stay_inside_a_short_window(tk_root, neutron):
+    """At the plot height a small screen leaves (300 px), the bottom row's x labels are not cut."""
+    fig, axes = operaxn.create_figure_layout(not neutron, not neutron, True, neutron)
+    win = tk.Toplevel(tk_root)
+    win.withdraw()
+    try:
+        x = np.linspace(0.5, 4.0, 200)
+        if neutron:
+            bank = {"d": {"x": x, "y": np.arange(200.0)}}
+            operaxn.plot_neutron_data(axes, {str(n): bank for n in range(1, 6)},
+                                      {"show_neutron_dspacing": True, "use_cache": False})
+        else:
+            operaxn.plot_oned_data(axes["oned"], x, np.arange(200.0),
+                                   {"show_dspacing": True, "use_cache": False})
+        canvas = gui_module.FigureCanvasTkAgg(fig, master=win)  # as the main window embeds it
+        canvas.resize(SimpleNamespace(width=1060, height=300))  # as Tk does
+        canvas.draw()
+        renderer = canvas.get_renderer()
+        lowest = min(ax.get_tightbbox(renderer).y0 for ax in fig.axes)
+        assert lowest >= 2, f"x labels cut off: {lowest:.1f} px above the figure's edge"
+    finally:
+        plt.close(fig)
+        win.destroy()
+
+
 @pytest.mark.parametrize("twod, written", [(np.ones(50), False), (np.ones((8, 8)), True)],
                          ids=["drawing-error", "written"])
 def test_failed_single_scan_export_closes_its_figure(tmp_path, twod, written):

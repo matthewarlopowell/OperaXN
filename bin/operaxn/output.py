@@ -872,6 +872,9 @@ class FigureLayoutManager:
         LayoutType.EMPTY: FigureLayout(figure_size=(10, 8))
     }
 
+    # Bottom margin: 8% of the figure, but at least room for the x tick labels and x label
+    X_LABEL_ROOM_IN = 0.6
+
     def create_layout(self, has_oned: bool, has_twod: bool, has_echem: bool,
                       has_neutron: bool = False, figure_dpi: int = FIGURE_DPI,
                       scan_num: int = 1, echem_value: Optional[float] = None,
@@ -891,11 +894,20 @@ class FigureLayoutManager:
         fig.suptitle(title, fontsize=TITLE_FONT_SIZE, fontweight="bold")
 
         if layout_type == LayoutType.NEUTRON_GRID:
-            fig.subplots_adjust(top=0.92, bottom=0.08, left=0.06, right=0.94)
+            fig.subplots_adjust(top=0.92, left=0.06, right=0.94)
         else:
-            fig.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92)
+            fig.subplots_adjust(top=0.92, left=0.08, right=0.92)
+        # The main window resizes its figure: refit the bottom margin each time
+        self._fit_bottom(fig)
+        fig.canvas.mpl_connect('resize_event',
+                               lambda event: self._fit_bottom(event.canvas.figure))
 
         return fig, axes
+
+    @classmethod
+    def _fit_bottom(cls, fig: plt.Figure) -> None:
+        """Set the bottom margin to 8%, or X_LABEL_ROOM_IN where 8% would cut the x labels."""
+        fig.subplots_adjust(bottom=max(0.08, cls.X_LABEL_ROOM_IN / fig.get_figheight()))
 
     def _determine_layout_type(self, has_oned: bool, has_twod: bool,
                                has_echem: bool, has_neutron: bool) -> LayoutType:
